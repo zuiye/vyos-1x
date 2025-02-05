@@ -247,6 +247,7 @@ Depends:
 # End "service monitoring telegraf"
 # For "service monitoring zabbix-agent"
   zabbix-agent2,
+  zabbix-proxy-sqlite3,
 # End "service monitoring zabbix-agent"
 # For "service tftp-server"
   tftpd-hpa,
