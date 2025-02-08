@@ -1,0 +1,32 @@
+targets:
+{% if target is defined %}
+{%     for target_ip, target_config in target.items() %}
+  - {{ target_ip }}:
+{%         if target_config.label is defined %}
+{%             for label_name, label_config in target_config.label.items() %}
+      {{ label_name }}: {{ label_config.value }}
+{%             endfor %}
+{%         endif %}
+{%     endfor %}
+
+{% endif %}
+dns:
+  refresh: 2m15s
+  nameserver: 1.1.1.1
+
+ping:
+{% if interval is defined %}
+  interval: {{ interval }}s
+{% endif %}
+{% if timeout is defined %}
+  timeout: {{ timeout }}s
+{% endif %}
+{% if history_size is defined %}
+  history-size: {{ history_size }}
+{% endif %}
+{% if ping_size is defined %}
+  payload-size: {{ ping_size }}
+{% endif %}
+
+options:
+  disableIPv6: false

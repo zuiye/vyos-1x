@@ -125,6 +125,7 @@
                   </node>
                 </children>
               </node>
+              #include <include/monitoring/ping-exporter.xml.i>
             </children>
           </node>
         </children>

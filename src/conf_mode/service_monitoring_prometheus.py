@@ -25,6 +25,7 @@ from vyos.template import render
 from vyos.utils.process import call
 from vyos import ConfigError
 from vyos import airbag
+from vyos.utils.process import process_named_running
 
 airbag.enable()
 
@@ -37,6 +38,9 @@ frr_exporter_systemd_service = 'frr_exporter.service'
 
 blackbox_exporter_service_file = '/etc/systemd/system/blackbox_exporter.service'
 blackbox_exporter_systemd_service = 'blackbox_exporter.service'
+
+ping_exporter_service_file = '/etc/systemd/system/ping_exporter.service'
+ping_exporter_systemd_service = 'ping_exporter.service'
 
 
 def get_config(config=None):
@@ -66,6 +70,13 @@ def get_config(config=None):
     if tmp:
         monitoring.update({'blackbox_exporter_restart_required': {}})
 
+    if is_node_changed(conf, base + ['ping-exporter']):
+        monitoring.update({'ping_exporter_restart_required': {}})
+
+    for node in ["node-exporter", "blackbox-exporter", "frr-exporter", "ping-exporter"]:
+        if not conf.exists(base + [node]):
+            monitoring.pop(node.replace("-","_"),None)
+
     return monitoring
 
 
@@ -94,6 +105,23 @@ def verify(monitoring):
                     raise ConfigError(
                         f'query name not specified in dns module {mod_name}'
                     )
+    if "ping_exporter" in monitoring:
+        if "target" in monitoring["ping_exporter"]:
+            for target, target_config in monitoring["ping_exporter"]["target"].items():
+                if "label" in target_config:
+                    for label_name, label_config in target_config["label"].items():
+                        if "value" not in label_config:
+                            raise ConfigError(
+                                f'label value not specified in ping-exporter target {taget} label {mod_name}'
+                            )
+                else:
+                    raise ConfigError(
+                        f'label name not specified in ping-exporter target {taget}'
+                    )
+        else:
+            raise ConfigError(
+                f'target not specified in ping-exporter'
+            )
 
     return None
 
@@ -113,6 +141,12 @@ def generate(monitoring):
         # Delete systemd files
         if os.path.isfile(blackbox_exporter_service_file):
             os.unlink(blackbox_exporter_service_file)
+
+    if not monitoring or 'ping_exporter' not in monitoring:
+        # Delete systemd files
+        if os.path.isfile(ping_exporter_service_file):
+            os.unlink(ping_exporter_service_file)
+
 
     if not monitoring:
         return None
@@ -154,18 +188,34 @@ def generate(monitoring):
             monitoring['blackbox_exporter'],
         )
 
+    if "ping_exporter" in monitoring:
+        # Render ping_exporter service_file
+        render(
+            ping_exporter_service_file,
+            'prometheus/ping_exporter.service.j2',
+            monitoring['ping_exporter'],
+        )
+        # Render ping_exporter config file
+        render(
+            '/run/ping_exporter/config.yml',
+            'prometheus/ping_exporter.yml.j2',
+            monitoring['ping_exporter'],
+        )
+
     return None
 
 
 def apply(monitoring):
     # Reload systemd manager configuration
     call('systemctl daemon-reload')
-    if not monitoring or 'node_exporter' not in monitoring:
+    if (not monitoring or 'node_exporter' not in monitoring) and process_named_running("node_exporter"):
         call(f'systemctl stop {node_exporter_systemd_service}')
-    if not monitoring or 'frr_exporter' not in monitoring:
+    if (not monitoring or 'frr_exporter' not in monitoring) and process_named_running("frr_exporter"):
         call(f'systemctl stop {frr_exporter_systemd_service}')
-    if not monitoring or 'blackbox_exporter' not in monitoring:
+    if (not monitoring or 'blackbox_exporter' not in monitoring) and process_named_running("blackbox_exporter"):
         call(f'systemctl stop {blackbox_exporter_systemd_service}')
+    if (not monitoring or 'ping_exporter' not in monitoring) and process_named_running("ping_exporter"):
+        call(f'systemctl stop {ping_exporter_systemd_service}')
 
     if not monitoring:
         return
@@ -193,6 +243,14 @@ def apply(monitoring):
             systemd_action = 'restart'
 
         call(f'systemctl {systemd_action} {blackbox_exporter_systemd_service}')
+
+    if 'ping_exporter' in monitoring:
+        # we need to restart the service if e.g. the VRF name changed
+        systemd_action = 'reload-or-restart'
+        if 'ping_exporter_restart_required' in monitoring:
+            systemd_action = 'restart'
+
+        call(f'systemctl {systemd_action} {ping_exporter_systemd_service}')
 
 
 if __name__ == '__main__':
