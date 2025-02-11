@@ -42,6 +42,9 @@ blackbox_exporter_systemd_service = 'blackbox_exporter.service'
 ping_exporter_service_file = '/etc/systemd/system/ping_exporter.service'
 ping_exporter_systemd_service = 'ping_exporter.service'
 
+snmp_exporter_service_file = '/etc/systemd/system/snmp_exporter.service'
+snmp_exporter_systemd_service = 'snmp_exporter.service'
+
 
 def get_config(config=None):
     if config:
@@ -73,7 +76,10 @@ def get_config(config=None):
     if is_node_changed(conf, base + ['ping-exporter']):
         monitoring.update({'ping_exporter_restart_required': {}})
 
-    for node in ["node-exporter", "blackbox-exporter", "frr-exporter", "ping-exporter"]:
+    if is_node_changed(conf, base + ['snmp-exporter']):
+        monitoring.update({'snmp_exporter_restart_required': {}})
+
+    for node in ["node-exporter", "blackbox-exporter", "frr-exporter", "ping-exporter", "snmp-exporter"]:
         if not conf.exists(base + [node]):
             monitoring.pop(node.replace("-","_"),None)
 
@@ -147,6 +153,11 @@ def generate(monitoring):
         if os.path.isfile(ping_exporter_service_file):
             os.unlink(ping_exporter_service_file)
 
+    if not monitoring or 'snmp_exporter' not in monitoring:
+        # Delete systemd files
+        if os.path.isfile(snmp_exporter_service_file):
+            os.unlink(snmp_exporter_service_file)
+
 
     if not monitoring:
         return None
@@ -202,6 +213,20 @@ def generate(monitoring):
             monitoring['ping_exporter'],
         )
 
+    if "snmp_exporter" in monitoring:
+        # Render snmp_exporter service_file
+        render(
+            snmp_exporter_service_file,
+            'prometheus/snmp_exporter.service.j2',
+            monitoring['snmp_exporter'],
+        )
+        # # Render snmp_exporter config file
+        # render(
+        #     '/run/snmp_exporter/snmp.yml',
+        #     'prometheus/snmp_exporter.yml.j2',
+        #     monitoring['snmp_exporter'],
+        # )
+
     return None
 
 
@@ -216,6 +241,8 @@ def apply(monitoring):
         call(f'systemctl stop {blackbox_exporter_systemd_service}')
     if (not monitoring or 'ping_exporter' not in monitoring) and process_named_running("ping_exporter"):
         call(f'systemctl stop {ping_exporter_systemd_service}')
+    if (not monitoring or 'snmp_exporter' not in monitoring) and process_named_running("snmp_exporter"):
+        call(f'systemctl stop {snmp_exporter_systemd_service}')
 
     if not monitoring:
         return
@@ -251,6 +278,14 @@ def apply(monitoring):
             systemd_action = 'restart'
 
         call(f'systemctl {systemd_action} {ping_exporter_systemd_service}')
+
+    if 'snmp_exporter' in monitoring:
+        # we need to restart the service if e.g. the VRF name changed
+        systemd_action = 'reload-or-restart'
+        if 'snmp_exporter_restart_required' in monitoring:
+            systemd_action = 'restart'
+
+        call(f'systemctl {systemd_action} {snmp_exporter_systemd_service}')
 
 
 if __name__ == '__main__':

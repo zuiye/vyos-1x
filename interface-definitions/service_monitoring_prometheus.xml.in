@@ -126,6 +126,7 @@
                 </children>
               </node>
               #include <include/monitoring/ping-exporter.xml.i>
+              #include <include/monitoring/snmp-exporter.xml.i>
             </children>
           </node>
         </children>
