@@ -1,0 +1,120 @@
+<?xml version="1.0"?>
+<interfaceDefinition>
+  <node name="service">
+    <children>
+      <node name="monitoring">
+        <children>
+          <node name="vmagent" owner="${vyos_conf_scripts_dir}/service_monitoring_vmagent.py">
+            <properties>
+              <help>Vmagent for VictoriaMetrics to collect metrics</help>
+              <priority>1280</priority>
+            </properties>
+            <children>
+              #include <include/listen-address.xml.i>
+              #include <include/port-number.xml.i>
+              <leafNode name="port">
+                <defaultValue>8429</defaultValue>
+              </leafNode>
+              <leafNode name="remote-write">
+                <properties>
+                  <help>Vmagent remote-write to Victorimetrics API.</help>
+                  <valueHelp>
+                    <format>url</format>
+                    <description>URL for Vmagent remote-write to Victorimetrics.</description>
+                  </valueHelp>
+                  <multi/>
+                </properties>
+              </leafNode>
+              <node name="job">
+                <properties>
+                  <help>The job name assigned to scraped metrics.</help>
+                </properties>
+                <children>
+                  <node name="ping">
+                    <properties>
+                      <help>The job for ping-exporter assigned to scraped metrics.</help>
+                    </properties>
+                    <children>
+                      <leafNode name="url">
+                        <properties>
+                          <help>URL for ping-exporter metrics.</help>
+                          <valueHelp>
+                            <format>xx.xx.xx.xx:xx</format>
+                            <description>URL for ping-exporter metrics.</description>
+                          </valueHelp>
+                        </properties>
+                        <defaultValue>127.0.0.1:9427</defaultValue>
+                      </leafNode>
+                    </children>
+                  </node>
+                  <node name="snmp">
+                    <properties>
+                      <help>The job for ping-exporter assigned to scraped metrics.</help>
+                    </properties>
+                    <children>
+                      <leafNode name="url">
+                        <properties>
+                          <help>URL for ping-exporter metrics.</help>
+                          <valueHelp>
+                            <format>xx.xx.xx.xx:xx</format>
+                            <description>URL for ping-exporter metrics.</description>
+                          </valueHelp>
+                        </properties>
+                        <defaultValue>127.0.0.1:9427</defaultValue>
+                      </leafNode>
+                      <tagNode name="target">
+                        <properties>
+                          <help>snmp-exporter target IP.</help>
+                          <valueHelp>
+                            <format>ipv4</format>
+                            <description>IPv4 address</description>
+                          </valueHelp>
+                          <valueHelp>
+                            <format>ipv6</format>
+                            <description>IPv6 address</description>
+                          </valueHelp>
+                          <constraint>
+                            <validator name="ip-address"/>
+                          </constraint>
+                        </properties>
+                        <children>
+                          <tagNode name="label">
+                            <properties>
+                              <help>Label name to Ping-exporter target IP</help>
+                            </properties>
+                            <children>
+                              <leafNode name="value">
+                                <properties>
+                                  <help>The value for Label name to Ping-exporter target IP.</help>
+                                </properties>
+                              </leafNode>
+                            </children>
+                          </tagNode>
+                          <leafNode name="auth">
+                            <properties>
+                              <help>auth name for community to snmp-exporter.</help>
+                            </properties>
+                            <defaultValue>pubilc_v2</defaultValue>
+                          </leafNode>
+                          <leafNode name="module">
+                            <properties>
+                              <help>module name for snmp-exporter mib.</help>
+                              <completionHelp>
+                                <list>if_mib huawei juniper cisco mikrotik</list>
+                              </completionHelp>
+                            </properties>
+                            <defaultValue>if_mib</defaultValue>
+                          </leafNode>
+                        </children>
+                      </tagNode>
+                    </children>
+                  </node>
+                </children>
+              </node>
+            </children>
+          </node>
+        </children>
+      </node>
+    </children>
+  </node>
+</interfaceDefinition>

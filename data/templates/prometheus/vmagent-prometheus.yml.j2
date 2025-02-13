@@ -1,0 +1,32 @@
+global:
+  scrape_interval: 15s
+  scrape_timeout: 15s
+
+
+scrape_configs:
+{% if ping is defined %}
+  # ping-exporter
+  - job_name: "ping-exporter"
+    static_configs:
+      - targets: ["{{ ping.url }}"]
+{% endif %}
+
+  # snmp-exporter
+  - job_name: "snmp-exporter"
+    scrape_interval: 60s
+    scrape_timeout: 60s
+    metrics_path: /snmp
+    file_sd_configs:
+    - files:
+      - "/run/vmagent/*-file_sd_config.yml"
+    relabel_configs:
+      - source_labels: [module]
+        target_label: __param_module
+      - source_labels: [auth]
+        target_label: __param_auth
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: 127.0.0.1:9116

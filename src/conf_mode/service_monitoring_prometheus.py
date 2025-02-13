@@ -220,12 +220,12 @@ def generate(monitoring):
             'prometheus/snmp_exporter.service.j2',
             monitoring['snmp_exporter'],
         )
-        # # Render snmp_exporter config file
-        # render(
-        #     '/run/snmp_exporter/snmp.yml',
-        #     'prometheus/snmp_exporter.yml.j2',
-        #     monitoring['snmp_exporter'],
-        # )
+        # Render snmp_exporter config file
+        render(
+            '/run/snmp_exporter/snmp.yml',
+            'prometheus/snmp.yml.j2',
+            monitoring['snmp_exporter'],
+        )
 
     return None
 

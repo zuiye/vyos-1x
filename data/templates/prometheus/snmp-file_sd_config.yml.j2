@@ -1,0 +1,18 @@
+{% if target is defined %}
+{%     for target_name, target_config in target.items() %}
+
+- targets: ["{{ target_name }}"]
+{%         if target_config.label is defined %}
+{%             for label_name, label_config in target_config.label.items() %}
+  labels:
+    {{ label_name }}: {{ label_config.value }}
+{%             endfor %}
+{%         endif %}
+{%         if target_config.module is defined %}
+    module: {{ target_config.module }}
+{%         endif %}
+{%         if target_config.auth is defined %}
+    auth: {{ target_config.auth }}
+    {%         endif %}
+{%     endfor %}
+{% endif %}

@@ -11,9 +11,9 @@ ExecStart=/usr/bin/snmp_exporter  \
         --web.listen-address={{ address }}:{{ port }} \
 {%     endfor %}
 {% else %}
-        --web.listen-address=:{{ port }} \
+        --web.listen-address=127.0.0.1:{{ port }} \
 {% endif %}
-        --config.file=/etc/prometheus/snmp.yml
+        --config.file=/run/snmp_exporter/snmp.yml
 
 ExecReload=/bin/kill -HUP $MAINPID
 

@@ -1,0 +1,23 @@
+[Unit]
+Description=VictoriaMetrics Vmagent
+Documentation=https://docs.victoriametrics.com/vmagent/#configuration-update
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vmagent \
+{% if listen_address is vyos_defined %}
+{%     for address in listen_address %}
+        --httpListenAddr={{ address }}:{{ port }} \
+{%     endfor %}
+{% else %}
+        --httpListenAddr=:{{ port }} \
+{% endif %}
+{% if remote_write is defined %}
+{%     for remote_write_url in remote_write %}
+        --remoteWrite.url={{ remote_write_url }} \
+{%     endfor %}
+{% endif %}
+        --promscrape.config=/run/vmagent/prometheus.yml
+[Install]
+WantedBy=multi-user.target

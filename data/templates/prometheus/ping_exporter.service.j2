@@ -1,6 +1,6 @@
 [Unit]
-Description=Blackbox Exporter
-Documentation=https://github.com/prometheus/blackbox_exporter
+Description=Ping Exporter
+Documentation=https://github.com/czerwonk/ping_exporter
 After=network.target
 
 [Service]
@@ -11,7 +11,7 @@ ExecStart=/usr/bin/ping_exporter \
         --web.listen-address={{ address }}:{{ port }} \
 {%     endfor %}
 {% else %}
-        --web.listen-address=:{{ port }} \
+        --web.listen-address=127.0.0.1:{{ port }} \
 {% endif %}
         --config.path=/run/ping_exporter/config.yml
 [Install]
