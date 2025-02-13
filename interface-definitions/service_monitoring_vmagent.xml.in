@@ -111,6 +111,18 @@
                   </node>
                 </children>
               </node>
+              <tagNode name="global-label">
+                <properties>
+                  <help>Global Label name to add to any time series when this Vmagent remote-wrote to VictoriaMetrics.</help>
+                </properties>
+                <children>
+                  <leafNode name="value">
+                    <properties>
+                      <help>The value for Global Label name to add to any time series.</help>
+                    </properties>
+                  </leafNode>
+                </children>
+              </tagNode>
             </children>
           </node>
         </children>

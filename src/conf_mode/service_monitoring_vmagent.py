@@ -53,8 +53,6 @@ def get_config(config=None):
     if is_node_changed(conf, base):
         vmagent.update({'vmagent_restart_required': {}})
 
-    print(vmagent)
-
     return vmagent
 
 
@@ -108,7 +106,7 @@ def generate(vmagent):
         render(
             '/run/vmagent/prometheus.yml',
             'prometheus/vmagent-prometheus.yml.j2',
-            vmagent['job'],
+            vmagent,
         )
 
         if "snmp" in vmagent["job"]:
@@ -130,14 +128,14 @@ def apply(vmagent):
     if not vmagent:
         return
 
-    # systemd_action = 'reload-or-restart'
-    # if 'vmagent_restart_required' in vmagent:
-    #     systemd_action = 'restart'
-
-    # call(f'systemctl {systemd_action} {vmagent_systemd_service}')
-
-    url = f'http://192.168.43.139:8429/-/reload'
-    r = requests.get(url)
+    if process_named_running("vmagent"):
+        url = f'http://127.0.0.1:8429/-/reload'
+        r = requests.get(url)
+    else:
+        systemd_action = 'reload-or-restart'
+        if 'vmagent_restart_required' in vmagent:
+            systemd_action = 'restart'
+        call(f'systemctl {systemd_action} {vmagent_systemd_service}')
 
 
 if __name__ == '__main__':

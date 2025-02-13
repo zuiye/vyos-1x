@@ -1,14 +1,20 @@
 global:
   scrape_interval: 15s
   scrape_timeout: 15s
+{% if global_label is defined %}
+  external_labels:
+{%     for label_name, label_config in global_label.items() %}
+    {{ label_name }}: {{ label_config.value }}
+{%     endfor %}
+{% endif %}
 
 
 scrape_configs:
-{% if ping is defined %}
+{% if job.ping is defined %}
   # ping-exporter
   - job_name: "ping-exporter"
     static_configs:
-      - targets: ["{{ ping.url }}"]
+      - targets: ["{{ job.ping.url }}"]
 {% endif %}
 
   # snmp-exporter
