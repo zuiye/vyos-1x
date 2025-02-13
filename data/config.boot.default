@@ -35,7 +35,7 @@ system {
     login {
         user vyos {
             authentication {
-                encrypted-password "$6$QxPS.uk6mfo$9QBSo8u1FkH16gMyAVhus6fU3LOzvLR9Z9.82m3tiHFAxTtIkhaZSWssSgzt4v4dGAL8rhVQxTg0oAG9/q11h/"
+                encrypted-password "$6$rounds=656000$uJPcDC2mun8bkcqF$oJ8V6c4IiRUWyXhHlPuywNJFf0PlVAoDsuZC7ZLF00h2EKyUsKFw9xNjFhzLe/TeCpWHKtrJY0CIijLgCISxW1"
                 plaintext-password ""
             }
         }
