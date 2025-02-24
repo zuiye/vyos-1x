@@ -10,15 +10,22 @@ global:
 
 
 scrape_configs:
-{% if job.ping is defined %}
-  # ping-exporter
-  - job_name: "ping-exporter"
+{% if job.node_exporter is defined %}
+  # vyos node-exporter
+  - job_name: "vyos-node-exporter"
     static_configs:
-      - targets: ["{{ job.ping.url }}"]
+      - targets: ["{{ job.node_exporter.url }}"]
 {% endif %}
 
-  # snmp-exporter
-  - job_name: "snmp-exporter"
+{% if job.ping_exporter is defined %}
+  # vyos ping-exporter
+  - job_name: "vyos-ping-exporter"
+    static_configs:
+      - targets: ["{{ job.ping_exporter.url }}"]
+{% endif %}
+
+  # vyos snmp-exporter
+  - job_name: "vyos-snmp-exporter"
     scrape_interval: 60s
     scrape_timeout: 60s
     metrics_path: /snmp

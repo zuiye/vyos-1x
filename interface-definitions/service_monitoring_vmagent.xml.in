@@ -30,7 +30,24 @@
                   <help>The job name assigned to scraped metrics.</help>
                 </properties>
                 <children>
-                  <node name="ping">
+                  <node name="node-exporter">
+                    <properties>
+                      <help>The job for node-exporter assigned to scraped metrics.</help>
+                    </properties>
+                    <children>
+                      <leafNode name="url">
+                        <properties>
+                          <help>URL for node-exporter metrics.</help>
+                          <valueHelp>
+                            <format>xx.xx.xx.xx:xx</format>
+                            <description>URL for node-exporter metrics.</description>
+                          </valueHelp>
+                        </properties>
+                        <defaultValue>127.0.0.1:9100</defaultValue>
+                      </leafNode>
+                    </children>
+                  </node>
+                  <node name="ping-exporter">
                     <properties>
                       <help>The job for ping-exporter assigned to scraped metrics.</help>
                     </properties>
@@ -47,7 +64,7 @@
                       </leafNode>
                     </children>
                   </node>
-                  <node name="snmp">
+                  <node name="snmp-exporter">
                     <properties>
                       <help>The job for ping-exporter assigned to scraped metrics.</help>
                     </properties>

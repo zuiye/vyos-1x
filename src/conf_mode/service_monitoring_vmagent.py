@@ -66,9 +66,9 @@ def verify(vmagent):
         )
 
     if 'job' in vmagent:
-        if "snmp" in vmagent:
-            if "target" in vmagent["snmp"]:
-                for target, target_config in vmagent["snmp"]["target"].items():
+        if "snmp_exporter" in vmagent:
+            if "target" in vmagent["snmp_exporter"]:
+                for target, target_config in vmagent["snmp_exporter"]["target"].items():
                     if "label" in target_config:
                         for label_name, label_config in target_config["label"].items():
                             if "value" not in label_config:
@@ -109,11 +109,11 @@ def generate(vmagent):
             vmagent,
         )
 
-        if "snmp" in vmagent["job"]:
+        if "snmp_exporter" in vmagent["job"]:
             render(
             '/run/vmagent/snmp-file_sd_config.yml',
             'prometheus/snmp-file_sd_config.yml.j2',
-            vmagent['job']["snmp"],
+            vmagent['job']["snmp_exporter"],
         )
 
     return None
