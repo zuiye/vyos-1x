@@ -832,8 +832,9 @@ def install_image() -> None:
         chmod_2775(target_config_dir)
         # copy config
         copy(default_config, f'{target_config_dir}/config.boot')
-        configure_authentication(f'{target_config_dir}/config.boot',
-                                 user_password)
+        # not use vyos user and passwd
+        # configure_authentication(f'{target_config_dir}/config.boot',
+        #                          user_password)
         Path(f'{target_config_dir}/.vyatta_config').touch()
 
         # create a persistence.conf
