@@ -1,4 +1,4 @@
-# Copyright 2019-2023 VyOS maintainers and contributors <maintainers@vyos.io>
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This library is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -48,7 +48,7 @@ class L2TPv3If(Interface):
     definition = {
         **Interface.definition,
         **{
-            'section': 'l2tpeth',
+            'section': 'l2tpv3',
             'prefixes': ['l2tpeth', ],
             'bridgeable': True,
         }

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2020-2024 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -52,7 +52,7 @@ def verify_vrf_as_import(search_vrf_name: str, afi_name: str, vrfs_config: dict)
     :type afi_name: str
     :param vrfs_config: configuration dependents vrfs
     :type vrfs_config: dict
-    :return: if vrf in import list retrun true else false
+    :return: if vrf in import list return true else false
     :rtype: bool
     """
     for vrf_name, vrf_config in vrfs_config.items():
@@ -155,7 +155,7 @@ def verify_remote_as(peer_config, bgp_config):
     return None
 
 def verify_afi(peer_config, bgp_config):
-    # If address_family configured under neighboor
+    # If address_family configured under neighbor
     if 'address_family' in peer_config:
         return True
 
@@ -183,8 +183,9 @@ def verify(config_dict):
     if 'vrf_context' in config_dict:
         vrf = config_dict['vrf_context']
 
-    # eqivalent of the C foo ? 'a' : 'b' statement
-    bgp = vrf and config_dict['vrf']['name'][vrf]['protocols']['bgp'] or config_dict['bgp']
+    # equivalent of the C foo ? 'a' : 'b' statement
+    bgp = vrf and dict_search(f'vrf.name.{vrf}.protocols.bgp',
+                              config_dict) or config_dict['bgp']
     bgp['policy'] = config_dict['policy']
 
     if 'deleted' in bgp:
@@ -276,7 +277,7 @@ def verify(config_dict):
                     raise ConfigError(f'Only one local-as number can be specified for peer "{peer}"!')
 
                 # Neighbor local-as override can not be the same as the local-as
-                # we use for this BGP instane!
+                # we use for this BGP instance!
                 asn = list(peer_config['local_as'].keys())[0]
                 if asn == bgp['system_as']:
                     raise ConfigError('Cannot have local-as same as system-as number')
@@ -286,11 +287,11 @@ def verify(config_dict):
                      raise ConfigError(f'Neighbor "{peer}" has local-as specified which is '\
                                         'the same as remote-as, this is not allowed!')
 
-            # ttl-security and ebgp-multihop can't be used in the same configration
+            # ttl-security and ebgp-multihop can't be used in the same configuration
             if 'ebgp_multihop' in peer_config and 'ttl_security' in peer_config:
                 raise ConfigError('You can not set both ebgp-multihop and ttl-security hops')
 
-            # interface and ebgp-multihop can't be used in the same configration
+            # interface and ebgp-multihop can't be used in the same configuration
             if 'ebgp_multihop' in peer_config and 'interface' in peer_config:
                 raise ConfigError(f'Ebgp-multihop can not be used with directly connected '\
                                   f'neighbor "{peer}"')
@@ -316,6 +317,7 @@ def verify(config_dict):
                     Warning(f'BGP neighbor "{peer}" requires address-family!')
 
                 # Peer-group member cannot override remote-as of peer-group
+                peer_group = None
                 if 'peer_group' in peer_config:
                     peer_group = peer_config['peer_group']
                     if 'remote_as' in peer_config and 'remote_as' in bgp['peer_group'][peer_group]:
@@ -330,6 +332,27 @@ def verify(config_dict):
                             peer_group = peer_config['interface']['v6only']['peer_group']
                             if 'remote_as' in peer_config['interface']['v6only'] and 'remote_as' in bgp['peer_group'][peer_group]:
                                 raise ConfigError(f'Peer-group member "{peer}" cannot override remote-as of peer-group "{peer_group}"!')
+
+                for afi in ['ipv4_unicast', 'ipv4_multicast', 'ipv4_labeled_unicast', 'ipv4_flowspec',
+                            'ipv6_unicast', 'ipv6_multicast', 'ipv6_labeled_unicast', 'ipv6_flowspec',
+                            'l2vpn_evpn']:
+                    if dict_search(
+                        f'address_family.{afi}.route_reflector_client',
+                        peer_config,
+                    ) == {} or (
+                        peer_group
+                        and dict_search(
+                            f'peer_group.{peer_group}.address_family.{afi}.route_reflector_client',
+                            bgp,
+                        )
+                        == {}
+                    ):
+                        peer_as = verify_remote_as(peer_config, bgp)
+                        if peer_as != 'internal' and peer_as != bgp['system_as']:
+                            raise ConfigError('route-reflector-client only supported for iBGP peers')
+                    else:
+                        # It doesn’t make sense to check the remote-as of a peer group.
+                        pass
 
                 # Only checks for ipv4 and ipv6 neighbors
                 # Check if neighbor address is assigned as system interface address
@@ -372,13 +395,13 @@ def verify(config_dict):
 
                 if 'conditionally_advertise' in afi_config:
                     if 'advertise_map' not in afi_config['conditionally_advertise']:
-                        raise ConfigError('Must speficy advertise-map when conditionally-advertise is in use!')
+                        raise ConfigError('Must specify advertise-map when conditionally-advertise is in use!')
                     # Verify advertise-map (which is a route-map) exists
                     verify_route_map(afi_config['conditionally_advertise']['advertise_map'], bgp)
 
                     if ('exist_map' not in afi_config['conditionally_advertise'] and
                         'non_exist_map' not in afi_config['conditionally_advertise']):
-                        raise ConfigError('Must either speficy exist-map or non-exist-map when ' \
+                        raise ConfigError('Must either specify exist-map or non-exist-map when ' \
                                           'conditionally-advertise is in use!')
 
                     if {'exist_map', 'non_exist_map'} <= set(afi_config['conditionally_advertise']):
@@ -394,7 +417,7 @@ def verify(config_dict):
                 # T4332: bgp deterministic-med cannot be disabled while addpath-tx-bestpath-per-AS is in use
                 if 'addpath_tx_per_as' in afi_config:
                     if dict_search('parameters.deterministic_med', bgp) == None:
-                        raise ConfigError('addpath-tx-per-as requires BGP deterministic-med paramtere to be set!')
+                        raise ConfigError('addpath-tx-per-as requires BGP deterministic-med parameter to be set!')
 
                 # Validate if configured Prefix list exists
                 if 'prefix_list' in afi_config:
@@ -412,16 +435,7 @@ def verify(config_dict):
                         if tmp in afi_config['route_map']:
                             verify_route_map(afi_config['route_map'][tmp], bgp)
 
-                if 'route_reflector_client' in afi_config:
-                    peer_group_as = peer_config.get('remote_as')
-
-                    if peer_group_as is None or (peer_group_as != 'internal' and peer_group_as != bgp['system_as']):
-                        raise ConfigError('route-reflector-client only supported for iBGP peers')
-                    else:
-                        if 'peer_group' in peer_config:
-                            peer_group_as = dict_search(f'peer_group.{peer_group}.remote_as', bgp)
-                            if peer_group_as is None or (peer_group_as != 'internal' and peer_group_as != bgp['system_as']):
-                                raise ConfigError('route-reflector-client only supported for iBGP peers')
+                # route-reflector-client verification has been moved to neighbor-only part
 
             # T5833 not all AFIs are supported for VRF
             if 'vrf' in bgp and 'address_family' in peer_config:
@@ -463,6 +477,20 @@ def verify(config_dict):
     if dict_search('parameters.tcp_keepalive', bgp) != None:
         if not {'idle', 'interval', 'probes'} <= set(bgp['parameters']['tcp_keepalive']):
             raise ConfigError('TCP keepalive incomplete - idle, keepalive and probes must be set')
+
+    # Validate BGP update-delay: 'establish-wait' requires 'max-delay' and must not exceed it
+    if dict_search('parameters.update_delay', bgp) != None:
+        update_delay = dict_search('parameters.update_delay.max_delay', bgp)
+        establish_wait = dict_search('parameters.update_delay.establish_wait', bgp)
+        if establish_wait is not None:
+            if update_delay is None:
+                raise ConfigError(
+                    'BGP update-delay establish-wait requires max-delay to be set!'
+                )
+            if int(establish_wait) > int(update_delay):
+                raise ConfigError(
+                    'BGP update-delay establish-wait cannot be greater than max-delay!'
+                )
 
     # Address Family specific validation
     if 'address_family' in bgp:
@@ -523,10 +551,22 @@ def verify(config_dict):
                         raise ConfigError(
                             'Please unconfigure import vrf commands before using vpn commands in dependent VRFs!')
 
+                # Verify if the route-map exists
+                if dict_search('route_map.vrf.import', afi_config) is not None:
+                    verify_route_map(afi_config['route_map']['vrf']['import'], bgp)
+
+                if (dict_search('route_map.vrf.import', afi_config) is not None
+                        or  dict_search('import.vrf', afi_config) is not None):
                     # FRR error: please unconfigure vpn to vrf commands before
                     # using import vrf commands
-                    if 'vpn' in afi_config['import'] or dict_search('export.vpn', afi_config) != None:
+                    if (dict_search('import.vpn', afi_config) is not None
+                            or dict_search('export.vpn', afi_config) is not None):
                         raise ConfigError('Please unconfigure VPN to VRF commands before '\
+                                          'using "import vrf" commands!')
+
+                    if (dict_search('route_map.vpn.import', afi_config) is not None
+                            or dict_search('route_map.vpn.export', afi_config) is not None) :
+                        raise ConfigError('Please unconfigure route-map VPN to VRF commands before '\
                                           'using "import vrf" commands!')
 
                 # Verify that the export/import route-maps do exist

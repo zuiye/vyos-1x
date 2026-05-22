@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2020-2022 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -20,14 +20,18 @@ from sys import exit
 from time import sleep
 
 from vyos.config import Config
+from vyos.configdep import set_dependents
+from vyos.configdep import call_dependents
 from vyos.configdict import get_interface_dict
 from vyos.configdict import is_node_changed
 from vyos.configverify import verify_authentication
 from vyos.configverify import verify_interface_exists
 from vyos.configverify import verify_mirror_redirect
 from vyos.configverify import verify_vrf
+from vyos.configverify import verify_mtu_ipv6
 from vyos.ifconfig import WWANIf
 from vyos.utils.dict import dict_search
+from vyos.utils.network import is_wwan_connected
 from vyos.utils.process import cmd
 from vyos.utils.process import call
 from vyos.utils.process import DEVNULL
@@ -42,7 +46,7 @@ cron_script = '/etc/cron.d/vyos-wwan'
 
 def get_config(config=None):
     """
-    Retrive CLI config as dictionary. Dictionary can never be empty, as at least the
+    Retrieve CLI config as dictionary. Dictionary can never be empty, as at least the
     interface name will be added or a deleted flag
     """
     if config:
@@ -85,6 +89,10 @@ def get_config(config=None):
     if len(wwan['other_interfaces']) == 0:
         del wwan['other_interfaces']
 
+    # Protocols static arp dependency
+    if 'static_arp' in wwan:
+        set_dependents('static_arp', conf)
+
     return wwan
 
 def verify(wwan):
@@ -98,6 +106,7 @@ def verify(wwan):
     verify_interface_exists(wwan, ifname)
     verify_authentication(wwan)
     verify_vrf(wwan)
+    verify_mtu_ipv6(wwan)
     verify_mirror_redirect(wwan)
 
     return None
@@ -135,7 +144,7 @@ def apply(wwan):
                 break
             sleep(0.250)
 
-    if 'shutdown_required' in wwan:
+    if 'shutdown_required' in wwan or (not is_wwan_connected(wwan['ifname'])):
         # we only need the modem number. wwan0 -> 0, wwan1 -> 1
         modem = wwan['ifname'].lstrip('wwan')
         base_cmd = f'mmcli --modem {modem}'
@@ -157,7 +166,7 @@ def apply(wwan):
 
         return None
 
-    if 'shutdown_required' in wwan:
+    if 'shutdown_required' in wwan or (not is_wwan_connected(wwan['ifname'])):
         ip_type = 'ipv4'
         slaac = dict_search('ipv6.address.autoconf', wwan) != None
         if 'address' in wwan:
@@ -176,6 +185,10 @@ def apply(wwan):
         call(command, stdout=DEVNULL)
 
     w.update(wwan)
+
+    if 'static_arp' in wwan:
+        call_dependents()
+
     return None
 
 if __name__ == '__main__':

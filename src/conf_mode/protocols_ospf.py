@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2021-2024 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -17,6 +17,7 @@
 from sys import exit
 from sys import argv
 
+from vyos.base import Warning
 from vyos.config import Config
 from vyos.configverify import verify_common_route_maps
 from vyos.configverify import verify_route_map
@@ -48,8 +49,9 @@ def verify(config_dict):
     if 'vrf_context' in config_dict:
         vrf = config_dict['vrf_context']
 
-    # eqivalent of the C foo ? 'a' : 'b' statement
-    ospf = vrf and config_dict['vrf']['name'][vrf]['protocols']['ospf'] or config_dict['ospf']
+    # equivalent of the C foo ? 'a' : 'b' statement
+    ospf = vrf and dict_search(f'vrf.name.{vrf}.protocols.ospf',
+                                 config_dict) or config_dict['ospf']
     ospf['policy'] = config_dict['policy']
 
     verify_common_route_maps(ospf)
@@ -60,20 +62,30 @@ def verify(config_dict):
 
     # Validate if configured Access-list exists
     if 'area' in ospf:
-          networks = []
-          for area, area_config in ospf['area'].items():
-              if 'import_list' in area_config:
-                  acl_import = area_config['import_list']
-                  if acl_import: verify_access_list(acl_import, ospf)
-              if 'export_list' in area_config:
-                  acl_export = area_config['export_list']
-                  if acl_export: verify_access_list(acl_export, ospf)
+        networks = []
+        for area, area_config in ospf['area'].items():
+            # Implemented as warning to not break existing configurations
+            if area == '0' and dict_search('area_type.nssa', area_config) != None:
+                Warning('You cannot configure NSSA to backbone!')
+            # Implemented as warning to not break existing configurations
+            if area == '0' and dict_search('area_type.stub', area_config) != None:
+                Warning('You cannot configure STUB to backbone!')
+            # Implemented as warning to not break existing configurations
+            if len(area_config['area_type']) > 1:
+                Warning(f'Only one area-type is supported for area "{area}"!')
 
-              if 'network' in area_config:
-                  for network in area_config['network']:
-                      if network in networks:
-                          raise ConfigError(f'Network "{network}" already defined in different area!')
-                      networks.append(network)
+            if 'import_list' in area_config:
+                if acl_import := area_config['import_list']:
+                    verify_access_list(acl_import, ospf)
+            if 'export_list' in area_config:
+                if acl_export := area_config['export_list']:
+                    verify_access_list(acl_export, ospf)
+
+            if 'network' in area_config:
+                for network in area_config['network']:
+                    if network in networks:
+                        raise ConfigError(f'Network "{network}" already defined in different area!')
+                    networks.append(network)
 
     if 'interface' in ospf:
         for interface, interface_config in ospf['interface'].items():
@@ -90,8 +102,17 @@ def verify(config_dict):
             if 'area' in ospf and 'area' in interface_config:
                 for area, area_config in ospf['area'].items():
                     if 'network' in area_config:
-                        raise ConfigError('Can not use OSPF interface area and area ' \
-                                          'network configuration at the same time!')
+                        raise ConfigError('Can not use OSPF "interface area" and ' \
+                                          '"area network" configuration at the same time!')
+
+            # FRR only allows a single authentication mode (MD5, NULL or plaintext)
+            # at a time. Prevent users from defining more than one authentication mode.
+            if 'authentication' in interface_config:
+                auth_keys = set(interface_config['authentication'])
+                exclusive_auth_keys = {'md5', 'null', 'plaintext_password'}
+                if len(auth_keys & exclusive_auth_keys) >= 2:
+                    raise ConfigError('Can not use multiple authentication modes '
+                                      f'simultaneously for interface "{interface}"!')
 
             # If interface specific options are set, we must ensure that the
             # interface is bound to our requesting VRF. Due to the VyOS

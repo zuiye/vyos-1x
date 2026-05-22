@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2025 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -732,7 +732,7 @@ class RouteFormatter(BaseMSGFormatter):
             message += self._format_rta_pref(msg.get_attr("RTA_PREF"))
 
         if msg.get_attr('RTA_TTL_PROPAGATE') is not None:
-            message += f' ttl-propogate {"enabled" if msg.get_attr("RTA_TTL_PROPAGATE") else "disabled"}'
+            message += f' ttl-propagate {"enabled" if msg.get_attr("RTA_TTL_PROPAGATE") else "disabled"}'
 
         if msg.get_attr('RTA_MULTIPATH') is not None:
             _tmp = self._format_rta_multipath(

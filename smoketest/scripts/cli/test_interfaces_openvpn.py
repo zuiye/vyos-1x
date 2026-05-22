@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2020-2024 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -19,7 +19,7 @@ import unittest
 
 from glob import glob
 from ipaddress import IPv4Network
-from netifaces import interfaces
+from netifaces import interfaces # pylint: disable = no-name-in-module
 
 from base_vyostest_shim import VyOSUnitTestSHIM
 
@@ -117,6 +117,9 @@ class TestInterfacesOpenVPN(VyOSUnitTestSHIM.TestCase):
     def tearDown(self):
         self.cli_delete(base_path)
         self.cli_commit()
+
+        # always forward to base class
+        super().tearDown()
 
     def test_openvpn_client_verify(self):
         # Create OpenVPN client interface and test verify() steps.
@@ -287,7 +290,7 @@ class TestInterfacesOpenVPN(VyOSUnitTestSHIM.TestCase):
         self.assertIn(f'remote {remote_host}', config)
         self.assertIn(f'persist-tun', config)
 
-        # IPv4 only: client usees udp4 protocol
+        # IPv4 only: client uses udp4 protocol
         self.cli_set(path + ['ip-version', 'ipv4'])
         self.cli_commit()
 
@@ -316,7 +319,7 @@ class TestInterfacesOpenVPN(VyOSUnitTestSHIM.TestCase):
         interface = 'vtun5000'
         path = base_path + [interface]
 
-        # check validate() - must speciy operating mode
+        # check validate() - must specify operating mode
         self.cli_set(path)
         with self.assertRaises(ConfigSessionError):
             self.cli_commit()
@@ -556,7 +559,7 @@ class TestInterfacesOpenVPN(VyOSUnitTestSHIM.TestCase):
         self.assertIn(f'lport {port}', config)
         self.assertIn(f'push "redirect-gateway def1"', config)
 
-        # IPv4 only: server usees udp4 protocol
+        # IPv4 only: server uses udp4 protocol
         self.cli_set(path + ['ip-version', 'ipv4'])
         self.cli_commit()
 
@@ -638,6 +641,12 @@ class TestInterfacesOpenVPN(VyOSUnitTestSHIM.TestCase):
         with self.assertRaises(ConfigSessionError):
             self.cli_commit()
         self.cli_set(path + ['shared-secret-key', 'ovpn_test'])
+
+        # check validate() - Must define "encryption cipher" or "encryption
+        # data-ciphers-fallback" for site-to-site encryption
+        with self.assertRaises(ConfigSessionError):
+            self.cli_commit()
+        self.cli_set(path + ['encryption', 'cipher', '3des'])
 
         self.cli_commit()
 
@@ -790,7 +799,7 @@ class TestInterfacesOpenVPN(VyOSUnitTestSHIM.TestCase):
         self.assertIn(f'lport {port}', config)
         self.assertIn(f'rport {port}', config)
 
-        # IPv4 only: server usees udp4 protocol
+        # IPv4 only: server uses udp4 protocol
         self.cli_set(path + ['ip-version', 'ipv4'])
         self.cli_commit()
 
@@ -813,6 +822,30 @@ class TestInterfacesOpenVPN(VyOSUnitTestSHIM.TestCase):
         self.cli_delete(base_path)
         self.cli_commit()
 
+    def test_site2site_data_ciphers_fallback(self):
+        vtun_if = 'vtun2010'
+        path = ['interfaces', 'openvpn', vtun_if]
+
+        # Configure a minimal site-to-site tunnel with data-ciphers-fallback
+        self.cli_set(path + ['mode', 'site-to-site'])
+        self.cli_set(path + ['encryption', 'data-ciphers-fallback', 'aes192'])
+        self.cli_set(path + ['local-address', '10.0.1.1'])
+        self.cli_set(path + ['remote-address', '10.0.1.2'])
+        self.cli_set(path + ['shared-secret-key', 'ovpn_test'])
+
+        self.cli_commit()
+
+        config_file = f'/run/openvpn/{vtun_if}.conf'
+        config = read_file(config_file)
+
+        # Validate correct OpenVPN configuration rendering
+        self.assertIn(f'dev {vtun_if}', config)
+        self.assertIn('data-ciphers-fallback AES-192-CBC', config)
+
+        # Ensure no other directives are rendered
+        self.assertNotIn('cipher ', config)
+        self.assertNotIn('data-ciphers ', config)
+
     def test_openvpn_server_server_bridge(self):
         # Create OpenVPN server interface using bridge.
         # Validate configuration afterwards.
@@ -826,7 +859,6 @@ class TestInterfacesOpenVPN(VyOSUnitTestSHIM.TestCase):
         gw_subnet = "192.168.0.1"
 
         self.cli_set(['interfaces', 'bridge', br_if, 'member', 'interface', vtun_if])
-        self.cli_set(path + ['device-type', 'tap'])
         self.cli_set(path + ['encryption', 'data-ciphers', 'aes192'])
         self.cli_set(path + ['hash', auth_hash])
         self.cli_set(path + ['mode', 'server'])
@@ -840,6 +872,10 @@ class TestInterfacesOpenVPN(VyOSUnitTestSHIM.TestCase):
         self.cli_set(path + ['tls', 'certificate', 'ovpn_test'])
         self.cli_set(path + ['tls', 'dh-params', 'ovpn_test'])
 
+        with self.assertRaises(ConfigSessionError):
+            self.cli_commit()
+
+        self.cli_set(path + ['device-type', 'tap'])
         self.cli_commit()
 
         config_file = f'/run/openvpn/{vtun_if}.conf'
@@ -865,4 +901,4 @@ class TestInterfacesOpenVPN(VyOSUnitTestSHIM.TestCase):
         self.cli_commit()
 
 if __name__ == '__main__':
-    unittest.main(verbosity=2)
+    unittest.main(verbosity=2, failfast=VyOSUnitTestSHIM.TestCase.debug_on())

@@ -1,6 +1,6 @@
 #! /usr/bin/env python3
 
-# Copyright (C) 2023 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -97,7 +97,7 @@ options = {
     'no-loopback': {
         'ping': '{command} -L',
         'type': 'noarg',
-        'help': 'Supress loopback of multicast pings'
+        'help': 'Suppress loopback of multicast pings'
     },
     'pattern': {
         'ping': '{command} -p {value}',

@@ -1,4 +1,4 @@
-# Copyright (C) 2020-2024 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -26,6 +26,11 @@ from vyos.utils.process import cmd
 
 class BasicAccelPPPTest:
     class TestCase(VyOSUnitTestSHIM.TestCase):
+        _base_path = None
+        _config_file = None
+        _chap_secrets = None
+        _protocol_section = None
+
         @classmethod
         def setUpClass(cls):
             cls._process_name = "accel-pppd"
@@ -41,6 +46,8 @@ class BasicAccelPPPTest:
             # ensure we can also run this test on a live system - so lets clean
             # out the current configuration :)
             self.cli_delete(self._base_path)
+            # always forward to base class
+            super().setUp()
 
         def tearDown(self):
             # Check for running process
@@ -51,6 +58,8 @@ class BasicAccelPPPTest:
 
             # Check for running process
             self.assertFalse(process_named_running(self._process_name))
+            # always forward to base class
+            super().tearDown()
 
         def set(self, path):
             self.cli_set(self._base_path + path)
@@ -61,7 +70,7 @@ class BasicAccelPPPTest:
         def basic_protocol_specific_config(self):
             """
             An astract method.
-            Initialize protocol scpecific configureations.
+            Initialize protocol specific configurations.
             """
             self.assertFalse(True, msg="Function must be defined")
 
@@ -117,7 +126,7 @@ class BasicAccelPPPTest:
             """
             Return part of configuration from line
             where the first injection of start keyword to the line
-            where the first injection of end keyowrd
+            where the first injection of end keyword
             :param start: start keyword
             :type start: str
             :param end: end keyword

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2021-2025 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -54,6 +54,7 @@ from vyos.utils.vti_updown_db import vti_updown_db_exists
 from vyos.utils.vti_updown_db import open_vti_updown_db_for_create_or_update
 from vyos.utils.vti_updown_db import remove_vti_updown_db
 from vyos import ConfigError
+from vyos.base import Warning
 from vyos import airbag
 airbag.enable()
 
@@ -64,6 +65,7 @@ swanctl_dir        = '/etc/swanctl'
 charon_conf        = '/etc/strongswan.d/charon.conf'
 charon_dhcp_conf   = '/etc/strongswan.d/charon/dhcp.conf'
 charon_radius_conf = '/etc/strongswan.d/charon/eap-radius.conf'
+charon_systemd_conf = '/etc/strongswan.d/charon-systemd.conf'
 interface_conf     = '/etc/strongswan.d/interfaces_use.conf'
 swanctl_conf       = f'{swanctl_dir}/swanctl.conf'
 
@@ -78,6 +80,57 @@ CA_PATH     = f'{swanctl_dir}/x509ca/'
 CRL_PATH    = f'{swanctl_dir}/x509crl/'
 
 DHCP_HOOK_IFLIST = '/tmp/ipsec_dhcp_interfaces'
+
+
+def _cleanup_default_prefixes(ipsec: dict, default_values: dict):
+    """
+    Remove default local/remote prefixes from tunnels
+    that use 'transport' mode ESP and do not have explicit prefix definitions
+    """
+    site_to_site = dict_search_args(ipsec, 'site_to_site', 'peer') or {}
+
+    for peer, peer_conf in site_to_site.items():
+        tunnels = peer_conf.get('tunnel') or {}
+        default_esp_group = peer_conf.get('default_esp_group')
+
+        for tunnel, tunnel_conf in tunnels.items():
+            # Determine ESP group name - prefer specific over default
+            tunnel_esp_group = tunnel_conf.get('esp_group')
+            esp_group_name = tunnel_esp_group or default_esp_group
+
+            # Get default values for the tunnel
+            tunnel_defaults = dict_search_args(
+                default_values, 'site_to_site', 'peer', peer, 'tunnel', tunnel
+            )
+
+            # Skip if no defaults found or ESP group defined
+            # Yes, this can happen because of user misconfiguration
+            if tunnel_defaults is None or esp_group_name is None:
+                continue
+
+            # Fetch ESP group details
+            esp_group_mode = dict_search_args(
+                ipsec, 'esp_group', esp_group_name, 'mode'
+            )
+
+            # Only act if ESP group is in transport mode
+            if esp_group_mode == 'transport':
+
+                # Look for local and remote prefixes
+                local_prefixes = dict_search_args(tunnel_conf, 'local', 'prefix')
+                remote_prefixes = dict_search_args(tunnel_conf, 'remote', 'prefix')
+
+                # Safely remove missing prefixes from defaults
+                # if user has not defined them but they are in defaults
+                if not local_prefixes:
+                    prefix = dict_search_args(tunnel_defaults, 'local', 'prefix')
+                    if prefix is not None:
+                        del tunnel_defaults['local']['prefix']
+
+                if not remote_prefixes:
+                    prefix = dict_search_args(tunnel_defaults, 'remote', 'prefix')
+                    if prefix is not None:
+                        del tunnel_defaults['remote']['prefix']
 
 def get_config(config=None):
     if config:
@@ -113,6 +166,9 @@ def get_config(config=None):
             if 'dead_peer_detection' not in ike:
                 del default_values['ike_group'][name]['dead_peer_detection']
 
+    # Clean up default prefixes for ESP transport-mode tunnels
+    _cleanup_default_prefixes(ipsec, default_values)
+
     ipsec = config_dict_merge(default_values, ipsec)
 
     ipsec['dhcp_interfaces'] = set()
@@ -134,7 +190,7 @@ def get_config(config=None):
         ipsec['l2tp_ike_default'] = 'aes256-sha1-modp1024,3des-sha1-modp1024'
         ipsec['l2tp_esp_default'] = 'aes256-sha1,3des-sha1'
 
-    # Collect the interface dicts for any refernced VTI interfaces in
+    # Collect the interface dicts for any referenced VTI interfaces in
     # case we need to bring the interface up
     ipsec['vti_interface_dicts'] = {}
 
@@ -155,6 +211,8 @@ def get_config(config=None):
                     if vti_interface not in ipsec['vti_interface_dicts']:
                         _, vti = get_interface_dict(conf, ['interfaces', 'vti'], vti_interface)
                         ipsec['vti_interface_dicts'][vti_interface] = vti
+
+    ipsec['vpp_ipsec_exists'] = conf.exists(['vpp', 'settings', 'ipsec'])
 
     return ipsec
 
@@ -204,11 +262,29 @@ def verify(ipsec):
     if not ipsec or 'deleted' in ipsec:
         return
 
+    # T8136 PPK support; keep a list of PPK IDs
+    ppk_ids = []
+
     if 'authentication' in ipsec:
         if 'psk' in ipsec['authentication']:
             for psk, psk_config in ipsec['authentication']['psk'].items():
                 if 'id' not in psk_config or 'secret' not in psk_config:
-                    raise ConfigError(f'Authentication psk "{psk}" missing "id" or "secret"')
+                    raise ConfigError(
+                        f'Authentication psk "{psk}" missing "id" or "secret"'
+                    )
+        # T8136 PPK Support; Check that PPK has an ID and secret defined, and ID is unique
+        if 'ppk' in ipsec['authentication']:
+            for ppk, ppk_config in ipsec['authentication']['ppk'].items():
+                if 'id' not in ppk_config:
+                    raise ConfigError(f'Authentication PPK "{ppk}" missing "id"')
+                if 'secret' not in ppk_config:
+                    raise ConfigError(f'Authentication PPK "{ppk}" missing "secret"')
+                for ppk_id in ppk_config['id']:
+                    if ppk_id in ppk_ids:
+                        raise ConfigError(
+                            f'Authentication PPK "{ppk}" has duplicate ID "{ppk_id}" from another PPK. IDs should be unique.'
+                        )
+                    ppk_ids.append(ppk_id)
 
     if 'interface' in ipsec:
         tmp = re.compile(dynamic_interface_pattern)
@@ -388,6 +464,25 @@ def verify(ipsec):
                         elif 'pool' not in ipsec['remote_access'] or pool not in ipsec['remote_access']['pool']:
                             raise ConfigError(f'Requested pool "{pool}" does not exist!')
 
+                # T8136 IPSEC PPK Support
+                # PPKs and Childless only works with IKEv2. Check that ike-group is v2 if either option is enabled. Check that PPK ID was actually defined in authentication. Recommend use of childless when using PPKs if not already configured.
+                if 'ppk' in ra_conf['authentication']:
+                    ike = ra_conf['ike_group']
+                    if dict_search(f'ike_group.{ike}.key_exchange', ipsec) != 'ikev2':
+                        raise ConfigError(
+                            f'Incorrect configuration in IKE group "{ike}": post-quantum pre-shared keys require explicit IKEv2 usage.'
+                        )
+                    if 'childless' not in ra_conf:
+                        Warning(
+                            'It is recommended to use childless IKE SAs when using PPKs'
+                        )
+                if 'childless' in ra_conf:
+                    ike = ra_conf['ike_group']
+                    if dict_search(f'ike_group.{ike}.key_exchange', ipsec) != 'ikev2':
+                        raise ConfigError(
+                            f'Incorrect configuration in IKE group "{ike}": childless IKE SAs can only be used with IKEv2.'
+                        )
+
         if 'pool' in ipsec['remote_access']:
             pool_networks = []
             for pool, pool_config in ipsec['remote_access']['pool'].items():
@@ -484,6 +579,17 @@ def verify(ipsec):
             else:
                 raise ConfigError(f"Missing ike-group on site-to-site peer {peer}")
 
+            # verify encryption algorithm compatibility for IKE with VPP
+            if ipsec['vpp_ipsec_exists']:
+                ike_group = ipsec['ike_group'][peer_conf['ike_group']]
+                for proposal, proposal_config in ike_group.get('proposal', {}).items():
+                    algs = ['gmac', 'serpent', 'twofish']
+                    if any(alg in proposal_config['encryption'] for alg in algs):
+                        raise ConfigError(
+                            f'Encryption algorithm {proposal_config["encryption"]} cannot be used '
+                            f'for IKE proposal {proposal} for site-to-site peer {peer} with VPP'
+                        )
+
             if 'authentication' not in peer_conf or 'mode' not in peer_conf['authentication']:
                 raise ConfigError(f"Missing authentication on site-to-site peer {peer}")
 
@@ -562,7 +668,7 @@ def verify(ipsec):
 
                     esp_group_name = tunnel_conf['esp_group'] if 'esp_group' in tunnel_conf else peer_conf['default_esp_group']
 
-                    if esp_group_name not in ipsec['esp_group']:
+                    if esp_group_name not in ipsec.get('esp_group'):
                         raise ConfigError(f"Invalid esp-group on tunnel {tunnel} for site-to-site peer {peer}")
 
                     esp_group = ipsec['esp_group'][esp_group_name]
@@ -573,6 +679,37 @@ def verify(ipsec):
 
                         if ('local' in tunnel_conf and 'prefix' in tunnel_conf['local']) or ('remote' in tunnel_conf and 'prefix' in tunnel_conf['remote']):
                             raise ConfigError(f"Local/remote prefix cannot be used with ESP transport mode on tunnel {tunnel} for site-to-site peer {peer}")
+
+                    # verify ESP encryption algorithm compatibility with VPP
+                    # because Marvel plugin for VPP doesn't support all algorithms that Strongswan does
+                    if ipsec['vpp_ipsec_exists']:
+                        for proposal, proposal_config in esp_group.get('proposal', {}).items():
+                            algs = ['aes128', 'aes192', 'aes256', 'aes128gcm128', 'aes192gcm128', 'aes256gcm128']
+                            if proposal_config['encryption'] not in algs:
+                                raise ConfigError(
+                                    f'Encryption algorithm {proposal_config["encryption"]} cannot be used '
+                                    f'for ESP proposal {proposal} on tunnel {tunnel} for site-to-site peer {peer} with VPP'
+                                )
+
+            # T8136 IPSEC PPK Support
+            # PPKs and Childless only works with IKEv2. Check that ike-group is v2 if either option is enabled. Check that PPK ID was actually defined in authentication. Recommend use of childless when using PPKs if not already configured.
+            if 'ppk' in peer_conf['authentication']:
+                ike = peer_conf['ike_group']
+                if dict_search(f'ike_group.{ike}.key_exchange', ipsec) != 'ikev2':
+                    raise ConfigError(
+                        f'Post-quantum preshared keys must be used with IKEv2! Please configure IKEv2 key-exchange in ike-group "{ike}".'
+                    )
+                if 'childless' not in peer_conf:
+                    Warning(
+                        'It is recommended to use childless IKE SAs when using PPKs'
+                    )
+            if 'childless' in peer_conf:
+                ike = peer_conf['ike_group']
+                if dict_search(f'ike_group.{ike}.key_exchange', ipsec) != 'ikev2':
+                    raise ConfigError(
+                        f'Childless IKE SAs be used with IKEv2! Please configure IKEv2 key-exchange in ike-group "{ike}".'
+                    )
+
 
 def cleanup_pki_files():
     for path in [CERT_PATH, CA_PATH, CRL_PATH, KEY_PATH, PUBKEY_PATH]:
@@ -670,6 +807,8 @@ def generate(ipsec):
                 generate_pki_files_x509(ipsec['pki'], rw_conf['authentication']['x509'])
 
     if 'site_to_site' in ipsec and 'peer' in ipsec['site_to_site']:
+        DEFAULT_TS_PREFIX = 'dynamic'
+
         for peer, peer_conf in ipsec['site_to_site']['peer'].items():
             if f'peer_{peer}' in ipsec['dhcp_no_address']:
                 continue
@@ -698,10 +837,16 @@ def generate(ipsec):
                     passthrough = None
 
                     for local_prefix in local_prefixes:
+                        if local_prefix == DEFAULT_TS_PREFIX:
+                            continue
+
                         for remote_prefix in remote_prefixes:
+                            if remote_prefix == DEFAULT_TS_PREFIX:
+                                continue
+
                             local_net = ipaddress.ip_network(local_prefix)
                             remote_net = ipaddress.ip_network(remote_prefix)
-                            if local_net.overlaps(remote_net):
+                            if local_net.subnet_of(remote_net):
                                 if passthrough is None:
                                     passthrough = []
                                 passthrough.append(local_prefix)
@@ -720,6 +865,7 @@ def generate(ipsec):
     render(charon_conf, 'ipsec/charon.j2', ipsec)
     render(charon_dhcp_conf, 'ipsec/charon/dhcp.conf.j2', ipsec)
     render(charon_radius_conf, 'ipsec/charon/eap-radius.conf.j2', ipsec)
+    render(charon_systemd_conf, 'ipsec/charon_systemd.conf.j2', ipsec)
     render(interface_conf, 'ipsec/interfaces_use.conf.j2', ipsec)
     render(swanctl_conf, 'ipsec/swanctl.conf.j2', ipsec)
 

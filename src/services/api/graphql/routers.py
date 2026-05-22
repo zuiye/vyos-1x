@@ -1,4 +1,4 @@
-# Copyright 2024 VyOS maintainers and contributors <maintainers@vyos.io>
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This library is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -32,7 +32,7 @@ def graphql_init(app: 'FastAPI'):
 
     state = SessionState()
 
-    # import after initializaion of state
+    # import after initialization of state
     from .bindings import generate_schema
 
     schema = generate_schema()

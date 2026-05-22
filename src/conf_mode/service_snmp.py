@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2018-2024 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -72,7 +72,7 @@ def get_config(config=None):
     snmp['vyos_user_pass'] = random(16)
 
     # We have gathered the dict representation of the CLI, but there are default
-    # options which we need to update into the dictionary retrived.
+    # options which we need to update into the dictionary retrieved.
     snmp = conf.merge_defaults(snmp, recursive=True)
 
     if 'listen_address' in snmp:
@@ -147,6 +147,9 @@ def verify(snmp):
         return None
 
     if 'user' in snmp['v3']:
+        if 'engineid' not in snmp['v3']:
+            raise ConfigError(f'EngineID must be configured for SNMPv3!')
+
         for user, user_config in snmp['v3']['user'].items():
             if 'group' not in user_config:
                 raise ConfigError(f'Group membership required for user "{user}"!')

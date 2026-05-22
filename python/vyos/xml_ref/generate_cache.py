@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2023-2024 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -52,7 +52,7 @@ def non_trivial(s):
     return s
 
 def main():
-    parser = ArgumentParser(description='generate and save dict from xml defintions')
+    parser = ArgumentParser(description='generate and save dict from xml definitions')
     parser.add_argument('--xml-dir', type=str, required=True,
                         help='transcluded xml interface-definition directory')
     parser.add_argument('--internal-cache', type=str, required=True,

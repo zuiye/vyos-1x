@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2021-2024 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -35,27 +35,29 @@ class TestSystemIPv6(VyOSUnitTestSHIM.TestCase):
     def tearDown(self):
         self.cli_delete(base_path)
         self.cli_commit()
+        # always forward to base class
+        super().tearDown()
 
     def test_system_ipv6_forwarding(self):
         # Test if IPv6 forwarding can be disabled globally, default is '1'
         # which means forwearding enabled
-        self.assertEqual(sysctl_read('net.ipv6.conf.all.forwarding'), '1')
+        self.assertEqual(sysctl_read(['net', 'ipv6', 'conf', 'all', 'forwarding']), '1')
 
         self.cli_set(base_path + ['disable-forwarding'])
         self.cli_commit()
-        self.assertEqual(sysctl_read('net.ipv6.conf.all.forwarding'), '0')
-        frrconfig = self.getFRRconfig('', end='')
+        self.assertEqual(sysctl_read(['net', 'ipv6', 'conf', 'all', 'forwarding']), '0')
+        frrconfig = self.getFRRconfig()
         self.assertIn('no ipv6 forwarding', frrconfig)
 
         self.cli_delete(base_path + ['disable-forwarding'])
         self.cli_commit()
-        self.assertEqual(sysctl_read('net.ipv6.conf.all.forwarding'), '1')
-        frrconfig = self.getFRRconfig('', end='')
+        self.assertEqual(sysctl_read(['net', 'ipv6', 'conf', 'all', 'forwarding']), '1')
+        frrconfig = self.getFRRconfig()
         self.assertNotIn('no ipv6 forwarding', frrconfig)
 
     def test_system_ipv6_strict_dad(self):
         # This defaults to 1
-        self.assertEqual(sysctl_read('net.ipv6.conf.all.accept_dad'), '1')
+        self.assertEqual(sysctl_read(['net', 'ipv6', 'conf', 'all', 'accept_dad']), '1')
 
         # Do not assign any IPv6 address on interfaces, this requires a reboot
         # which can not be tested, but we can read the config file :)
@@ -63,11 +65,11 @@ class TestSystemIPv6(VyOSUnitTestSHIM.TestCase):
         self.cli_commit()
 
         # Verify configuration file
-        self.assertEqual(sysctl_read('net.ipv6.conf.all.accept_dad'), '2')
+        self.assertEqual(sysctl_read(['net', 'ipv6', 'conf', 'all', 'accept_dad']), '2')
 
     def test_system_ipv6_multipath(self):
         # This defaults to 0
-        self.assertEqual(sysctl_read('net.ipv6.fib_multipath_hash_policy'), '0')
+        self.assertEqual(sysctl_read(['net', 'ipv6', 'fib_multipath_hash_policy']), '0')
 
         # Do not assign any IPv6 address on interfaces, this requires a reboot
         # which can not be tested, but we can read the config file :)
@@ -75,7 +77,7 @@ class TestSystemIPv6(VyOSUnitTestSHIM.TestCase):
         self.cli_commit()
 
         # Verify configuration file
-        self.assertEqual(sysctl_read('net.ipv6.fib_multipath_hash_policy'), '1')
+        self.assertEqual(sysctl_read(['net', 'ipv6', 'fib_multipath_hash_policy']), '1')
 
     def test_system_ipv6_neighbor_table_size(self):
         # Maximum number of entries to keep in the ARP cache, the
@@ -83,9 +85,9 @@ class TestSystemIPv6(VyOSUnitTestSHIM.TestCase):
         cli_default = int(default_value(base_path + ['neighbor', 'table-size']))
 
         def _verify_gc_thres(table_size):
-            self.assertEqual(sysctl_read('net.ipv6.neigh.default.gc_thresh3'), str(table_size))
-            self.assertEqual(sysctl_read('net.ipv6.neigh.default.gc_thresh2'), str(table_size // 2))
-            self.assertEqual(sysctl_read('net.ipv6.neigh.default.gc_thresh1'), str(table_size // 8))
+            self.assertEqual(sysctl_read(['net', 'ipv6', 'neigh', 'default', 'gc_thresh3']), str(table_size))
+            self.assertEqual(sysctl_read(['net', 'ipv6', 'neigh', 'default', 'gc_thresh2']), str(table_size // 2))
+            self.assertEqual(sysctl_read(['net', 'ipv6', 'neigh', 'default', 'gc_thresh1']), str(table_size // 8))
 
         _verify_gc_thres(cli_default)
 
@@ -95,8 +97,7 @@ class TestSystemIPv6(VyOSUnitTestSHIM.TestCase):
             _verify_gc_thres(size)
 
     def test_system_ipv6_protocol_route_map(self):
-        protocols = ['any', 'babel', 'bgp', 'connected', 'isis',
-                     'kernel', 'ospfv3', 'ripng', 'static', 'table']
+        protocols = ['any', 'babel', 'bgp', 'isis', 'ospfv3', 'ripng', 'static']
 
         for protocol in protocols:
             route_map = 'route-map-' + protocol.replace('ospfv3', 'ospf6')
@@ -107,7 +108,7 @@ class TestSystemIPv6(VyOSUnitTestSHIM.TestCase):
         self.cli_commit()
 
         # Verify route-map properly applied to FRR
-        frrconfig = self.getFRRconfig('ipv6 protocol', end='')
+        frrconfig = self.getFRRconfig('ipv6 protocol', end_marker='', stop_section='^end')
         for protocol in protocols:
             # VyOS and FRR use a different name for OSPFv3 (IPv6)
             if protocol == 'ospfv3':
@@ -121,7 +122,7 @@ class TestSystemIPv6(VyOSUnitTestSHIM.TestCase):
         self.cli_commit()
 
         # Verify route-map properly applied to FRR
-        frrconfig = self.getFRRconfig('ipv6 protocol', end='')
+        frrconfig = self.getFRRconfig('ipv6 protocol', stop_section='^end')
         self.assertNotIn(f'ipv6 protocol', frrconfig)
 
     def test_system_ipv6_protocol_non_existing_route_map(self):
@@ -140,14 +141,14 @@ class TestSystemIPv6(VyOSUnitTestSHIM.TestCase):
         self.cli_set(base_path + ['nht', 'no-resolve-via-default'])
         self.cli_commit()
         # Verify CLI config applied to FRR
-        frrconfig = self.getFRRconfig('', end='')
+        frrconfig = self.getFRRconfig()
         self.assertIn(f'no ipv6 nht resolve-via-default', frrconfig)
 
         self.cli_delete(base_path + ['nht', 'no-resolve-via-default'])
         self.cli_commit()
         # Verify CLI config removed to FRR
-        frrconfig = self.getFRRconfig('', end='')
+        frrconfig = self.getFRRconfig()
         self.assertNotIn(f'no ipv6 nht resolve-via-default', frrconfig)
 
 if __name__ == '__main__':
-    unittest.main(verbosity=2)
+    unittest.main(verbosity=2, failfast=VyOSUnitTestSHIM.TestCase.debug_on())

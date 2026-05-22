@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2020-2024 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -20,24 +20,29 @@ import unittest
 from glob import glob
 from json import loads
 
-from netifaces import AF_INET
-from netifaces import AF_INET6
-from netifaces import ifaddresses
+from socket import AF_INET
+from socket import AF_INET6
+from netifaces import ifaddresses # pylint: disable = no-name-in-module
 
 from base_interfaces_test import BasicInterfaceTest
+from base_vyostest_shim import VyOSUnitTestSHIM
+
 from vyos.configsession import ConfigSessionError
+from vyos.ethtool import Ethtool
+from vyos.netlink import coalesce
+from vyos.frrender import mgmt_daemon
 from vyos.ifconfig import Section
 from vyos.utils.file import read_file
 from vyos.utils.network import is_intf_addr_assigned
 from vyos.utils.network import is_ipv6_link_local
 from vyos.utils.process import cmd
+from vyos.utils.process import process_named_running
 from vyos.utils.process import popen
 
 class EthernetInterfaceTest(BasicInterfaceTest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls._base_path = ['interfaces', 'ethernet']
-        cls._mirror_interfaces = ['dum21354']
 
         # We only test on physical interfaces and not VLAN (sub-)interfaces
         if 'TEST_ETH' in os.environ:
@@ -84,6 +89,9 @@ class EthernetInterfaceTest(BasicInterfaceTest.TestCase):
                 if x.startswith(f'{interface}.')
             ]
             self.assertListEqual(tmp, [])
+
+        # check process health and continuity
+        self.assertEqual(self.mgmt_daemon_pid, process_named_running(mgmt_daemon))
 
     def test_offloading_rps(self):
         # enable RPS on all available CPUs, RPS works with a CPU bitmask,
@@ -147,16 +155,18 @@ class EthernetInterfaceTest(BasicInterfaceTest.TestCase):
                 self.assertEqual(int(tmp), 0)
 
     def test_non_existing_interface(self):
-        unknonw_interface = self._base_path + ['eth667']
-        self.cli_set(unknonw_interface)
+        unknonw_interface = 'eth667'
+        self.cli_set(self._base_path + [unknonw_interface])
 
         # check validate() - interface does not exist
-        with self.assertRaises(ConfigSessionError):
+        with self.assertRaises(ConfigSessionError) as cm:
             self.cli_commit()
+            self.assertIn(f'Interface "{unknonw_interface}" does not exist!',
+                          str(cm.exception))
 
         # we need to remove this wrong interface from the configuration
         # manually, else tearDown() will have problem in commit()
-        self.cli_delete(unknonw_interface)
+        self.cli_delete(self._base_path + [unknonw_interface])
 
     def test_speed_duplex_verify(self):
         for interface in self._interfaces:
@@ -196,6 +206,85 @@ class EthernetInterfaceTest(BasicInterfaceTest.TestCase):
             self.assertEqual(max_rx, rx)
             self.assertEqual(max_tx, tx)
 
+    def test_ethtool_coalesce(self):
+        """
+        Verify that coalesce configuration is correctly applied to the interface using netlink
+        """
+
+        for interface in self._interfaces:
+            base_path = self._base_path + [interface, 'interrupt-coalescing']
+            ethtool = Ethtool(interface)
+            is_virtio = ethtool.get_driver_name() == 'virtio_net'
+
+            with self.subTest(interface=interface):
+                # Verify coalesce support on the NIC before check
+                supported = ethtool.check_coalesce()
+
+                # If ethtool reports completely unsupported feature, then the CLI commit
+                # should correctly raise a ConfigSessionError during commit
+                if not supported:
+                    self.cli_set(base_path + ['rx-usecs', '32'])
+                    self.cli_set(base_path + ['tx-usecs', '32'])
+
+                    msg = 'Driver does not fully support coalesce configuration'
+                    with self.assertRaisesRegex(ConfigSessionError, msg):
+                        self.cli_commit()
+                    continue
+
+                # To find out the supported features
+                supported_rx_usecs = ethtool.check_coalesce('rx_usecs')
+                supported_tx_usecs = ethtool.check_coalesce('tx_usecs')
+                supported_adaptive_rx = ethtool.check_coalesce('adaptive_rx') and not is_virtio
+                supported_adaptive_tx = ethtool.check_coalesce('adaptive_tx') and not is_virtio
+
+                # Disabled adaptive modes and set custom values
+                if supported_rx_usecs:
+                    self.cli_set(base_path + ['rx-usecs', '64'])
+                if supported_tx_usecs:
+                    self.cli_set(base_path + ['tx-usecs', '64'])
+
+                # Force adaptive to be disabled if it is already enabled
+                params = coalesce.get_coalesce(interface)
+                if supported_rx_usecs and params['adaptive_rx']:
+                    cmd(f'sudo ethtool --coalesce {interface} adaptive-rx off')
+                if supported_tx_usecs and params['adaptive_tx']:
+                    cmd(f'sudo ethtool --coalesce {interface} adaptive-tx off')
+
+                # Commit CLI configuration to apply coalescing
+                self.cli_commit()
+
+                # Query coalesce parameters after applying
+                params = coalesce.get_coalesce(interface)
+
+                # Assertions: all should reflect configured values
+                if supported_rx_usecs:
+                    # `virtio-net` doesn't correctly work with this parameter
+                    self.assertEqual(params['rx_usecs'], 0 if is_virtio else 64)
+                if supported_tx_usecs:
+                    # `virtio-net` doesn't correctly work with this parameter
+                    self.assertEqual(params['tx_usecs'], 0 if is_virtio else 64)
+
+                # Not all parameters are adjustable for some of NIC (`virtio-net`)
+                if supported_adaptive_rx:
+                    # Now test enabling RX adaptive coalescing modes
+                    self.cli_delete(base_path + ['rx-usecs'])
+                    self.cli_set(base_path + ['adaptive-rx'])
+
+                if supported_adaptive_tx:
+                    # Now test enabling TX adaptive coalescing modes
+                    self.cli_delete(base_path + ['tx-usecs'])
+                    self.cli_set(base_path + ['adaptive-tx'])
+
+                self.cli_commit()
+
+                # Verify that adaptive modes turned on correctly
+                params = coalesce.get_coalesce(interface)
+                if supported_adaptive_rx:
+                    self.assertTrue(params['adaptive_rx'])
+
+                if supported_adaptive_tx:
+                    self.assertTrue(params['adaptive_tx'])
+
     def test_ethtool_flow_control(self):
         for interface in self._interfaces:
             # Disable flow-control
@@ -227,7 +316,7 @@ class EthernetInterfaceTest(BasicInterfaceTest.TestCase):
         self.cli_commit()
 
         for interface in self._interfaces:
-            frrconfig = self.getFRRconfig(f'interface {interface}', endsection='^exit')
+            frrconfig = self.getFRRconfig(f'interface {interface}', stop_section='^exit')
             self.assertIn(' evpn mh uplink', frrconfig)
 
     def test_switchdev(self):
@@ -240,4 +329,4 @@ class EthernetInterfaceTest(BasicInterfaceTest.TestCase):
         self.cli_delete(self._base_path + [interface, 'switchdev'])
 
 if __name__ == '__main__':
-    unittest.main(verbosity=2)
+    unittest.main(verbosity=2, failfast=VyOSUnitTestSHIM.TestCase.debug_on())

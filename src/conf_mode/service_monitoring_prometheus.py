@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2024 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -23,6 +23,7 @@ from vyos.configdict import is_node_changed
 from vyos.configverify import verify_vrf
 from vyos.template import render
 from vyos.utils.process import call
+from vyos.utils.process import is_systemd_service_active
 from vyos import ConfigError
 from vyos import airbag
 from vyos.utils.process import process_named_running
@@ -55,9 +56,21 @@ def get_config(config=None):
     if not conf.exists(base):
         return None
 
-    monitoring = conf.get_config_dict(
-        base, key_mangling=('-', '_'), get_first_key=True, with_recursive_defaults=True
-    )
+    monitoring = {}
+    exporters = {
+        'node_exporter': base + ['node-exporter'],
+        'frr_exporter': base + ['frr-exporter'],
+        'blackbox_exporter': base + ['blackbox-exporter'],
+    }
+
+    for exporter_name, exporter_base in exporters.items():
+        if conf.exists(exporter_base):
+            monitoring[exporter_name] = conf.get_config_dict(
+                exporter_base,
+                key_mangling=('-', '_'),
+                get_first_key=True,
+                with_recursive_defaults=True,
+            )
 
     tmp = is_node_changed(conf, base + ['node-exporter', 'vrf'])
     if tmp:

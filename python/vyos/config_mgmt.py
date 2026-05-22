@@ -1,4 +1,4 @@
-# Copyright 2023-2024 VyOS maintainers and contributors <maintainers@vyos.io>
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This library is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -25,25 +25,32 @@ from filecmp import cmp
 from datetime import datetime
 from textwrap import dedent
 from pathlib import Path
-from tabulate import tabulate
 from shutil import copy, chown
+from subprocess import Popen
+from subprocess import DEVNULL
 from urllib.parse import urlsplit
 from urllib.parse import urlunsplit
+from tabulate import tabulate
 
 from vyos.config import Config
 from vyos.configtree import ConfigTree
 from vyos.configtree import ConfigTreeError
 from vyos.configsession import ConfigSession
 from vyos.configsession import ConfigSessionError
-from vyos.configtree import show_diff
+from vyos.configtree import diff_compare
+from vyos.configtree import DiffTree
 from vyos.load_config import load
 from vyos.load_config import LoadConfigError
 from vyos.defaults import directories
 from vyos.version import get_full_version_data
 from vyos.utils.io import ask_yes_no
+from vyos.utils.io import catch_broken_pipe
 from vyos.utils.boot import boot_configuration_complete
 from vyos.utils.process import is_systemd_service_active
 from vyos.utils.process import rc_cmd
+from vyos.defaults import DEFAULT_COMMIT_CONFIRM_MINUTES
+from vyos.component_version import append_system_version
+from vyos.utils.file import file_compare
 
 SAVE_CONFIG = '/usr/libexec/vyos/vyos-save-config.py'
 config_json = '/run/vyatta/config/config.json'
@@ -56,7 +63,6 @@ commit_hooks = {
     'commit_archive': '02vyos-commit-archive',
 }
 
-DEFAULT_TIME_MINUTES = 10
 timer_name = 'commit-confirm'
 
 config_file = os.path.join(directories['config'], 'config.boot')
@@ -94,7 +100,7 @@ def unsaved_commits(allow_missing_config=False) -> bool:
         return True
     tmp_save = '/tmp/config.running'
     save_config(tmp_save)
-    ret = not cmp(tmp_save, config_file, shallow=False)
+    ret = not file_compare(tmp_save, config_file)
     os.unlink(tmp_save)
     return ret
 
@@ -144,14 +150,16 @@ class ConfigMgmt:
             ['system', 'config-management'],
             key_mangling=('-', '_'),
             get_first_key=True,
-            with_defaults=True,
+            with_recursive_defaults=True,
         )
 
         self.max_revisions = int(d.get('commit_revisions', 0))
         self.num_revisions = 0
         self.locations = d.get('commit_archive', {}).get('location', [])
         self.source_address = d.get('commit_archive', {}).get('source_address', '')
-        self.reboot_unconfirmed = bool(d.get('commit_confirm') == 'reboot')
+        self.reboot_unconfirmed = bool(
+            d.get('commit_confirm', {}).get('action') == 'reboot'
+        )
         self.config_dict = d
 
         if config.exists(['system', 'host-name']):
@@ -165,11 +173,16 @@ class ConfigMgmt:
         # upload only on existence of effective values, notably, on boot.
         # one still needs session self.locations (above) for setting
         # post-commit hook in conf_mode script
-        path = ['system', 'config-management', 'commit-archive', 'location']
-        if config.exists_effective(path):
-            self.effective_locations = config.return_effective_values(path)
-        else:
-            self.effective_locations = []
+        base_path = ['system', 'config-management', 'commit-archive']
+        location_path = base_path + ['location']
+        self.effective_locations = None
+        if config.exists_effective(location_path):
+            self.effective_locations = config.return_effective_values(location_path)
+
+        vrf_path = base_path + ['vrf']
+        self.effective_vrf = None
+        if config.exists_effective(vrf_path):
+            self.effective_vrf = config.return_effective_value(vrf_path)
 
         # a call to compare without args is edit_level aware
         edit_level = os.getenv('VYATTA_EDIT_LEVEL', '')
@@ -181,7 +194,7 @@ class ConfigMgmt:
     # Console script functions
     #
     def commit_confirm(
-        self, minutes: int = DEFAULT_TIME_MINUTES, no_prompt: bool = False
+        self, minutes: int = DEFAULT_COMMIT_CONFIRM_MINUTES, no_prompt: bool = False
     ) -> Tuple[str, int]:
         """Commit with reload/reboot to saved config in 'minutes' minutes if
         'confirm' call is not issued.
@@ -229,7 +242,14 @@ Proceed ?"""
         else:
             cmd = f'sudo -b /usr/libexec/vyos/commit-confirm-notify.py {minutes}'
 
-        os.system(cmd)
+        Popen(
+            cmd.split(),
+            stdout=DEVNULL,
+            stderr=DEVNULL,
+            stdin=DEVNULL,
+            close_fds=True,
+            preexec_fn=os.setsid,
+        )
 
         if self.reboot_unconfirmed:
             msg = f'Initialized commit-confirm; {minutes} minutes to confirm before reboot'
@@ -287,7 +307,7 @@ Proceed ?"""
 
         # commits under commit-confirm are not added to revision list unless
         # confirmed, hence a soft revert is to revision 0
-        revert_ct = self._get_config_tree_revision(0)
+        revert_ct = self.get_config_tree_revision(0)
 
         message = '[commit-confirm] Reverting to previous config now'
         os.system('wall -n ' + message)
@@ -296,7 +316,11 @@ Proceed ?"""
         session = ConfigSession(os.getpid(), app='config-mgmt')
 
         try:
-            session.load_explicit(revert_ct)
+            if session.vyconf_backend():
+                session.load_config_obj(revert_ct)
+            else:
+                session.load_explicit(revert_ct)
+
             session.commit()
         except ConfigSessionError as e:
             raise ConfigMgmtError(e) from e
@@ -351,7 +375,7 @@ Proceed ?"""
             )
             return msg, 1
 
-        rollback_ct = self._get_config_tree_revision(rev)
+        rollback_ct = self.get_config_tree_revision(rev)
         try:
             load(rollback_ct, switch='explicit')
             print('Rollback diff has been applied.')
@@ -382,7 +406,7 @@ Proceed ?"""
         if rev1 is not None:
             if not self._check_revision_number(rev1):
                 return f'Invalid revision number {rev1}', 1
-            ct1 = self._get_config_tree_revision(rev1)
+            ct1 = self.get_config_tree_revision(rev1)
             ct2 = self.working_config
             msg = f'No changes between working and revision {rev1} configurations.\n'
         if rev2 is not None:
@@ -390,16 +414,16 @@ Proceed ?"""
                 return f'Invalid revision number {rev2}', 1
             # compare older to newer
             ct2 = ct1
-            ct1 = self._get_config_tree_revision(rev2)
+            ct1 = self.get_config_tree_revision(rev2)
             msg = f'No changes between revisions {rev2} and {rev1} configurations.\n'
 
         out = ''
         path = [] if commands else self.edit_path
         try:
             if commands:
-                out = show_diff(ct1, ct2, path=path, commands=True)
+                out = diff_compare(ct1, ct2, path=path, commands=True)
             else:
-                out = show_diff(ct1, ct2, path=path)
+                out = diff_compare(ct1, ct2, path=path)
         except ConfigTreeError as e:
             return e, 1
 
@@ -427,6 +451,80 @@ Proceed ?"""
             r2 = int(options[1])
 
         return self.compare(commands=cmnds, rev1=r1, rev2=r2)
+
+    def _format_remote_diff(self, diff_tree: DiffTree, path: list, commands: bool):
+        add_tree = diff_tree.add
+        del_tree = diff_tree.delete
+        command_prefix = ' '.join(path)
+
+        result_lines = []
+        if commands:
+            # Process the deleted elements into command format and filter based on prefix (path)
+            for line in del_tree.to_commands(op='delete').splitlines():
+                if line.startswith(f'delete {command_prefix}'):
+                    result_lines.append(line)
+
+            # Process the added elements into command format and filter based on prefix (path)
+            for line in add_tree.to_commands(op='set').splitlines():
+                if line.startswith(f'set {command_prefix}'):
+                    result_lines.append(line)
+        else:
+            with_node = len(path) > 1
+            # Retrieve subtrees for the specified path from both added and deleted trees
+            del_tree = del_tree.get_subtree(path, with_node=with_node)
+            add_tree = add_tree.get_subtree(path, with_node=with_node)
+
+            # Convert the subtrees to string lines for further processing
+            del_tree_lines = str(del_tree).splitlines()
+            add_tree_lines = str(add_tree).splitlines()
+
+            # Format the lines with a prefix ('-', '+') and filter out empty lines
+            del_lines = [f'- {l}' for l in del_tree_lines if l.strip()]
+            add_lines = [f'+ {l}' for l in add_tree_lines if l.strip()]
+
+            if del_lines or add_lines:
+                # Adjust command prefix if a node is present in the path
+                command_prefix = ' '.join(path[:-1]) if with_node else command_prefix
+                if command_prefix:
+                    result_lines.append(f'[{command_prefix}]')
+
+                # Combine both deleted and added lines and process them
+                result_lines.extend(del_lines + add_lines)
+
+        # Join the result lines into a single string, excluding empty lines
+        return '\n'.join((line for line in result_lines if line.strip()))
+
+    def remote_compare(
+        self,
+        source: str,
+        remote_tree: ConfigTree,
+        path: Optional[list] = None,
+        commands: bool = False,
+    ) -> str:
+        """
+        Compares a local configuration tree with a remote
+        configuration tree based on the specified source ('running', 'candidate', 'saved').
+        """
+        path = path or []
+
+        # Determine the correct local configuration tree based on the 'source' parameter
+        if source == 'running':
+            local_tree = self.active_config
+        elif source == 'candidate':
+            local_tree = self.working_config
+        elif source == 'saved':
+            local_tree = self._get_saved_config_tree()
+        else:
+            raise ConfigMgmtError(
+                'Invalid source, must be one of: running, candidate, saved'
+            )
+
+        try:
+            diff_tree = DiffTree(remote_tree, local_tree)
+        except ConfigTreeError as e:
+            raise ConfigMgmtError(e) from e
+
+        return self._format_remote_diff(diff_tree, path, commands)
 
     # Initialization and post-commit hooks for conf-mode
     #
@@ -481,16 +579,13 @@ Proceed ?"""
 
         if self.effective_locations:
             print('Archiving config...')
-        for location in self.effective_locations:
-            url = urlsplit(location)
-            _, _, netloc = url.netloc.rpartition('@')
-            redacted_location = urlunsplit(url._replace(netloc=netloc))
-            print(f'  {redacted_location}', end=' ', flush=True)
-            upload(
-                archive_config_file,
-                f'{location}/{remote_file}',
-                source_host=source_address,
-            )
+            for location in self.effective_locations:
+                url = urlsplit(location)
+                _, _, netloc = url.netloc.rpartition('@')
+                redacted_location = urlunsplit(url._replace(netloc=netloc))
+                print(f'  {redacted_location}', end=' ', flush=True)
+                upload(archive_config_file, f'{location}/{remote_file}',
+                       source_host=source_address, vrf=self.effective_vrf)
 
     # op-mode functions
     #
@@ -543,6 +638,7 @@ Proceed ?"""
         ret = tabulate(res_l, tablefmt='plain')
         return ret
 
+    @catch_broken_pipe
     def show_commit_diff(
         self, rev: int, rev2: Optional[int] = None, commands: bool = False
     ) -> str:
@@ -575,7 +671,7 @@ Proceed ?"""
             r = f.read().decode()
         return r
 
-    def _get_config_tree_revision(self, rev: int):
+    def get_config_tree_revision(self, rev: int):
         c = self._get_file_revision(rev)
         return ConfigTree(c)
 
@@ -594,14 +690,16 @@ Proceed ?"""
         conf_file.chmod(0o644)
 
     def _archive_active_config(self) -> bool:
-        save_to_tmp = boot_configuration_complete() or not os.path.isfile(
-            archive_config_file
-        )
+        # on first boot/fresh install, add baseline archive_config_file
+        if not os.path.exists(archive_config_file):
+            append_system_version(archive_config_file)
+
         mask = os.umask(0o113)
 
         ext = os.getpid()
         cmp_saved = f'/tmp/config.boot.{ext}'
-        if save_to_tmp:
+
+        if boot_configuration_complete():
             save_config(cmp_saved, json_out=config_json)
         else:
             copy(config_file, cmp_saved)
@@ -781,6 +879,7 @@ Proceed ?"""
 
 # entry_point for console script
 #
+@catch_broken_pipe
 def run():
     from argparse import ArgumentParser, REMAINDER
 
@@ -805,7 +904,7 @@ def run():
         '-t',
         dest='minutes',
         type=int,
-        default=DEFAULT_TIME_MINUTES,
+        default=DEFAULT_COMMIT_CONFIRM_MINUTES,
         help="Minutes until reboot, unless 'confirm'",
     )
     commit_confirm.add_argument(
@@ -819,7 +918,7 @@ def run():
     rollback = subparsers.add_parser('rollback', help='Rollback to earlier config')
     rollback.add_argument('--rev', type=int, help='Revision number for rollback')
     rollback.add_argument(
-        '-y', dest='no_prompt', action='store_true', help='Excute without prompt'
+        '-y', dest='no_prompt', action='store_true', help='Execute without prompt'
     )
 
     rollback_soft = subparsers.add_parser(

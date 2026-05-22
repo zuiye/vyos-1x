@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2018-2025 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -119,7 +119,7 @@ def verify(hosts):
                 raise ConfigError(f'Invalid alias "{a}" in static-host-mapping "{host}"')
 
     for interface, interface_config in hosts['nameservers_dhcp_interfaces'].items():
-        # Warnin user if interface does not have DHCP or DHCPv6 configured
+        # Warning user if interface does not have DHCP or DHCPv6 configured
         if not set(interface_config).intersection(['dhcp', 'dhcpv6']):
             Warning(f'"{interface}" is not a DHCP interface but uses DHCP name-server option!')
 
@@ -175,7 +175,7 @@ def apply(config):
 
     # Restart services that use the hostname
     if hostname_new != hostname_old:
-        tmp = systemd_services['rsyslog']
+        tmp = systemd_services['syslog']
         call(f'systemctl restart {tmp}')
 
     # If SNMP is running, restart it too

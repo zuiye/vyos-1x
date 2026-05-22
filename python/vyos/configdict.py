@@ -1,4 +1,4 @@
-# Copyright 2019-2024 VyOS maintainers and contributors <maintainers@vyos.io>
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This library is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -355,47 +355,48 @@ def is_source_interface(conf, interface, intftype=None):
 
 def get_dhcp_interfaces(conf, vrf=None):
     """ Common helper functions to retrieve all interfaces from current CLI
-    sessions that have DHCP configured. """
+    sessions that have DHCP configured. Only DHCP interfaces in the defined VRF
+    will be returned. If vrf is None - the default VRF interfaces will be
+    returned """
+
     dhcp_interfaces = {}
-    dict = conf.get_config_dict(['interfaces'], get_first_key=True)
-    if not dict:
+    interface_dict = conf.get_config_dict(['interfaces'], get_first_key=True)
+    if not interface_dict:
         return dhcp_interfaces
 
-    def check_dhcp(config):
-        ifname = config['ifname']
+    def check_dhcp(if_config: dict, vrf=None) -> dict:
+        ifname = if_config['ifname']
         tmp = {}
-        if 'address' in config and 'dhcp' in config['address']:
+        if 'address' in if_config and 'dhcp' in if_config['address']:
             options = {}
-            if dict_search('dhcp_options.default_route_distance', config) != None:
-                options.update({'dhcp_options' : config['dhcp_options']})
-            if 'vrf' in config:
-                if vrf == config['vrf']: tmp.update({ifname : options})
+            if dict_search('dhcp_options.default_route_distance', if_config) != None:
+                options.update({'dhcp_options' : if_config['dhcp_options']})
+            if 'vrf' in if_config:
+                if vrf == if_config['vrf']: tmp.update({ifname : options})
             else:
                 if vrf is None: tmp.update({ifname : options})
 
         return tmp
 
-    for section, interface in dict.items():
+    for section, interface in interface_dict.items():
         for ifname in interface:
-            # always reset config level, as get_interface_dict() will alter it
-            conf.set_level([])
             # we already have a dict representation of the config from get_config_dict(),
             # but with the extended information from get_interface_dict() we also
             # get the DHCP client default-route-distance default option if not specified.
             _, ifconfig = get_interface_dict(conf, ['interfaces', section], ifname)
 
-            tmp = check_dhcp(ifconfig)
+            tmp = check_dhcp(ifconfig, vrf=vrf)
             dhcp_interfaces.update(tmp)
             # check per VLAN interfaces
             for vif, vif_config in ifconfig.get('vif', {}).items():
-                tmp = check_dhcp(vif_config)
+                tmp = check_dhcp(vif_config, vrf=vrf)
                 dhcp_interfaces.update(tmp)
             # check QinQ VLAN interfaces
             for vif_s, vif_s_config in ifconfig.get('vif_s', {}).items():
-                tmp = check_dhcp(vif_s_config)
+                tmp = check_dhcp(vif_s_config, vrf=vrf)
                 dhcp_interfaces.update(tmp)
                 for vif_c, vif_c_config in vif_s_config.get('vif_c', {}).items():
-                    tmp = check_dhcp(vif_c_config)
+                    tmp = check_dhcp(vif_c_config, vrf=vrf)
                     dhcp_interfaces.update(tmp)
 
     return dhcp_interfaces
@@ -404,7 +405,7 @@ def get_pppoe_interfaces(conf, vrf=None):
     """ Common helper functions to retrieve all interfaces from current CLI
     sessions that have DHCP configured. """
     pppoe_interfaces = {}
-    conf.set_level([])
+    conf.set_level([]) # required for list_nodes()
     for ifname in conf.list_nodes(['interfaces', 'pppoe']):
         # always reset config level, as get_interface_dict() will alter it
         conf.set_level([])
@@ -429,7 +430,7 @@ def get_interface_dict(config, base, ifname='', recursive_defaults=True, with_pk
     """
     Common utility function to retrieve and mangle the interfaces configuration
     from the CLI input nodes. All interfaces have a common base where value
-    retrival is identical. This function must be used whenever possible when
+    retrieval is identical. This function must be used whenever possible when
     working on the interfaces node!
 
     Return a dictionary with the necessary interface config keys.
@@ -471,7 +472,7 @@ def get_interface_dict(config, base, ifname='', recursive_defaults=True, with_pk
 
     # Check if QoS policy applied on this interface - See ifconfig.interface.set_mirror_redirect()
     if config.exists(['qos', 'interface', ifname]):
-        dict.update({'traffic_policy': {}})
+        dict.update({'qos': {}})
 
     address = leaf_node_changed(config, base + [ifname, 'address'])
     if address: dict.update({'address_old' : address})
@@ -488,14 +489,14 @@ def get_interface_dict(config, base, ifname='', recursive_defaults=True, with_pk
     bond = is_member(config, ifname, 'bonding')
     if bond: dict.update({'is_bond_member' : bond})
 
-    # Check if any DHCP options changed which require a client restat
+    # Check if any DHCP options changed which require a client restart
     dhcp = is_node_changed(config, base + [ifname, 'dhcp-options'])
     if dhcp: dict.update({'dhcp_options_changed' : {}})
     dhcpv6 = is_node_changed(config, base + [ifname, 'dhcpv6-options'])
     if dhcpv6: dict.update({'dhcpv6_options_changed' : {}})
 
     # Some interfaces come with a source_interface which must also not be part
-    # of any other bond or bridge interface as it is exclusivly assigned as the
+    # of any other bond or bridge interface as it is exclusively assigned as the
     # Kernels "lower" interface to this new "virtual/upper" interface.
     if 'source_interface' in dict:
         # Check if source interface is member of another bridge
@@ -517,12 +518,20 @@ def get_interface_dict(config, base, ifname='', recursive_defaults=True, with_pk
         else:
             dict['ipv6']['address'].update({'eui64_old': eui64})
 
+    interface_identifier = leaf_node_changed(config, base + [ifname, 'ipv6', 'address', 'interface-identifier'])
+    if interface_identifier:
+        tmp = dict_search('ipv6.address', dict)
+        if not tmp:
+            dict.update({'ipv6': {'address': {'interface_identifier_old': interface_identifier}}})
+        else:
+            dict['ipv6']['address'].update({'interface_identifier_old': interface_identifier})
+
     for vif, vif_config in dict.get('vif', {}).items():
         # Add subinterface name to dictionary
         dict['vif'][vif].update({'ifname' : f'{ifname}.{vif}'})
 
         if config.exists(['qos', 'interface', f'{ifname}.{vif}']):
-            dict['vif'][vif].update({'traffic_policy': {}})
+            dict['vif'][vif].update({'qos': {}})
 
         if 'deleted' not in dict:
             address = leaf_node_changed(config, base + [ifname, 'vif', vif, 'address'])
@@ -549,7 +558,7 @@ def get_interface_dict(config, base, ifname='', recursive_defaults=True, with_pk
         dict['vif_s'][vif_s].update({'ifname' : f'{ifname}.{vif_s}'})
 
         if config.exists(['qos', 'interface', f'{ifname}.{vif_s}']):
-            dict['vif_s'][vif_s].update({'traffic_policy': {}})
+            dict['vif_s'][vif_s].update({'qos': {}})
 
         if 'deleted' not in dict:
             address = leaf_node_changed(config, base + [ifname, 'vif-s', vif_s, 'address'])
@@ -577,7 +586,7 @@ def get_interface_dict(config, base, ifname='', recursive_defaults=True, with_pk
             dict['vif_s'][vif_s]['vif_c'][vif_c].update({'ifname' : f'{ifname}.{vif_s}.{vif_c}'})
 
             if config.exists(['qos', 'interface', f'{ifname}.{vif_s}.{vif_c}']):
-                dict['vif_s'][vif_s]['vif_c'][vif_c].update({'traffic_policy': {}})
+                dict['vif_s'][vif_s]['vif_c'][vif_c].update({'qos': {}})
 
             if 'deleted' not in dict:
                 address = leaf_node_changed(config, base + [ifname, 'vif-s', vif_s, 'vif-c', vif_c, 'address'])
@@ -604,6 +613,16 @@ def get_interface_dict(config, base, ifname='', recursive_defaults=True, with_pk
 
     # Check vif, vif-s/vif-c VLAN interfaces for removal
     dict = get_removed_vlans(config, base + [ifname], dict)
+
+    # Checks for the presence of static ARP entries on a given interface or VLAN
+    static_arp = config.get_config_dict(
+        ['protocols', 'static', 'arp', 'interface'],
+        key_mangling=('-', '_'),
+        get_first_key=True,
+    )
+    if any(key == ifname or key.startswith(f'{ifname}.') for key in static_arp.keys()):
+        dict.update({'static_arp': {}})
+
     return ifname, dict
 
 def get_vlan_ids(interface):
@@ -626,16 +645,34 @@ def get_vlan_ids(interface):
 
     return vlan_ids
 
+def get_vlans_ids_and_range(interface):
+    vlan_ids = set()
+
+    vlan_filter_status = json.loads(cmd(f'bridge -j -d vlan show dev {interface}'))
+
+    if vlan_filter_status is not None:
+        for interface_status in vlan_filter_status:
+            for vlan_entry in interface_status.get("vlans", []):
+                start = vlan_entry["vlan"]
+                end = vlan_entry.get("vlanEnd")
+                if end:
+                    vlan_ids.add(f"{start}-{end}")
+                else:
+                    vlan_ids.add(str(start))
+
+    return vlan_ids
+
 def get_accel_dict(config, base, chap_secrets, with_pki=False):
     """
     Common utility function to retrieve and mangle the Accel-PPP configuration
     from different CLI input nodes. All Accel-PPP services have a common base
-    where value retrival is identical. This function must be used whenever
+    where value retrieval is identical. This function must be used whenever
     possible when working with Accel-PPP services!
 
     Return a dictionary with the necessary interface config keys.
     """
     from vyos.utils.cpu import get_core_count
+    from vyos.utils.cpu import get_half_cpus
     from vyos.template import is_ipv4
 
     dict = config.get_config_dict(base, key_mangling=('-', '_'),
@@ -645,7 +682,16 @@ def get_accel_dict(config, base, chap_secrets, with_pki=False):
                                   with_pki=with_pki)
 
     # set CPUs cores to process requests
-    dict.update({'thread_count' : get_core_count()})
+    match dict.get('thread_count'):
+        case 'all':
+            dict['thread_count'] = get_core_count()
+        case 'half':
+            dict['thread_count'] = get_half_cpus()
+        case str(x) if x.isdigit():
+            dict['thread_count'] = int(x)
+        case _:
+            dict['thread_count'] = get_core_count()
+
     # we need to store the path to the secrets file
     dict.update({'chap_secrets_file' : chap_secrets})
 
@@ -668,3 +714,18 @@ def get_accel_dict(config, base, chap_secrets, with_pki=False):
             dict['authentication']['radius']['server'][server]['acct_port'] = '0'
 
     return dict
+
+def get_flowtable_interfaces(config):
+    """
+    Return all interfaces used in flowtables
+    """
+    ft_base = ['firewall', 'flowtable']
+
+    if not config.exists(ft_base):
+        return []
+
+    ifaces = []
+    for ft_name in config.list_nodes(ft_base):
+        ifaces += config.return_values(ft_base + [ft_name, 'interface'])
+
+    return ifaces

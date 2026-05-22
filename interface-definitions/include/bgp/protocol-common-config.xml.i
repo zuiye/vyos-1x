@@ -119,6 +119,7 @@
         </tagNode>
         #include <include/bgp/afi-rd.xml.i>
         #include <include/bgp/afi-route-map-vpn.xml.i>
+        #include <include/bgp/afi-route-map-vrf.xml.i>
         #include <include/bgp/afi-route-target-vpn.xml.i>
         #include <include/bgp/afi-nexthop-vpn-export.xml.i>
         <node name="redistribute">
@@ -126,30 +127,7 @@
             <help>Redistribute routes from other protocols into BGP</help>
           </properties>
           <children>
-            <node name="connected">
-              <properties>
-                <help>Redistribute connected routes into BGP</help>
-              </properties>
-              <children>
-                #include <include/bgp/afi-redistribute-metric-route-map.xml.i>
-              </children>
-            </node>
-            <node name="isis">
-              <properties>
-                <help>Redistribute IS-IS routes into BGP</help>
-              </properties>
-              <children>
-                #include <include/bgp/afi-redistribute-metric-route-map.xml.i>
-              </children>
-            </node>
-            <node name="kernel">
-              <properties>
-                <help>Redistribute kernel routes into BGP</help>
-              </properties>
-              <children>
-                #include <include/bgp/afi-redistribute-metric-route-map.xml.i>
-              </children>
-            </node>
+            #include <include/bgp/afi-redistribute-common-protocols.xml.i>
             <node name="ospf">
               <properties>
                 <help>Redistribute OSPF routes into BGP</help>
@@ -166,27 +144,6 @@
                 #include <include/bgp/afi-redistribute-metric-route-map.xml.i>
               </children>
             </node>
-            <node name="babel">
-              <properties>
-                <help>Redistribute Babel routes into BGP</help>
-              </properties>
-              <children>
-                #include <include/bgp/afi-redistribute-metric-route-map.xml.i>
-              </children>
-            </node>
-            <node name="static">
-              <properties>
-                <help>Redistribute static routes into BGP</help>
-              </properties>
-              <children>
-                #include <include/bgp/afi-redistribute-metric-route-map.xml.i>
-              </children>
-            </node>
-            <leafNode name="table">
-              <properties>
-                <help>Redistribute non-main Kernel Routing Table</help>
-              </properties>
-            </leafNode>
           </children>
         </node>
         #include <include/bgp/afi-sid.xml.i>
@@ -503,22 +460,7 @@
             <help>Redistribute routes from other protocols into BGP</help>
           </properties>
           <children>
-            <node name="connected">
-              <properties>
-                <help>Redistribute connected routes into BGP</help>
-              </properties>
-              <children>
-                #include <include/bgp/afi-redistribute-metric-route-map.xml.i>
-              </children>
-            </node>
-            <node name="kernel">
-              <properties>
-                <help>Redistribute kernel routes into BGP</help>
-              </properties>
-              <children>
-                #include <include/bgp/afi-redistribute-metric-route-map.xml.i>
-              </children>
-            </node>
+            #include <include/bgp/afi-redistribute-common-protocols.xml.i>
             <node name="ospfv3">
               <properties>
                 <help>Redistribute OSPFv3 routes into BGP</help>
@@ -535,27 +477,6 @@
                 #include <include/bgp/afi-redistribute-metric-route-map.xml.i>
               </children>
             </node>
-            <node name="babel">
-              <properties>
-                <help>Redistribute Babel routes into BGP</help>
-              </properties>
-              <children>
-                #include <include/bgp/afi-redistribute-metric-route-map.xml.i>
-              </children>
-            </node>
-            <node name="static">
-              <properties>
-                <help>Redistribute static routes into BGP</help>
-              </properties>
-              <children>
-                #include <include/bgp/afi-redistribute-metric-route-map.xml.i>
-              </children>
-            </node>
-            <leafNode name="table">
-              <properties>
-                <help>Redistribute non-main Kernel Routing Table</help>
-              </properties>
-            </leafNode>
           </children>
         </node>
         #include <include/bgp/afi-sid.xml.i>
@@ -1115,6 +1036,8 @@
       <validator name="ip-address"/>
       #include <include/constraint/interface-name.xml.i>
     </constraint>
+    <constraintSilenceOutput/>
+    <constraintErrorMessage>BGP neighbor must be one of: IP address, IPv6 address, or interface name</constraintErrorMessage>
   </properties>
   <children>
     <node name="address-family">
@@ -1133,6 +1056,7 @@
         #include <include/bgp/neighbor-afi-ipv4-multicast.xml.i>
         #include <include/bgp/neighbor-afi-ipv6-multicast.xml.i>
         #include <include/bgp/neighbor-afi-l2vpn-evpn.xml.i>
+        #include <include/bgp/neighbor-afi-link-state.xml.i>
       </children>
     </node>
     <leafNode name="advertisement-interval">
@@ -1182,12 +1106,7 @@
     #include <include/bgp/peer-group.xml.i>
     #include <include/bgp/remote-as.xml.i>
     #include <include/bgp/neighbor-shutdown.xml.i>
-    <leafNode name="solo">
-      <properties>
-        <help>Do not send back prefixes learned from the neighbor</help>
-        <valueless/>
-      </properties>
-    </leafNode>
+    #include <include/bgp/solo.xml.i>
     <leafNode name="enforce-first-as">
       <properties>
         <help>Ensure the first AS in the AS path matches the peer AS</help>
@@ -1235,6 +1154,25 @@
     <help>BGP parameters</help>
   </properties>
   <children>
+    <leafNode name="as-notation">
+      <properties>
+        <help>BGP AS-notation output format</help>
+        <completionHelp>
+          <list>asdot asdot+</list>
+        </completionHelp>
+        <valueHelp>
+          <format>asdot</format>
+          <description>Use asdot notation only for 4 byte AS numbers</description>
+        </valueHelp>
+        <valueHelp>
+          <format>asdot+</format>
+          <description>Use asdot notation for all AS numbers</description>
+        </valueHelp>
+        <constraint>
+          <regex>(asdot\+|asdot)</regex>
+        </constraint>
+      </properties>
+    </leafNode>
     <leafNode name="allow-martian-nexthop">
       <properties>
         <help>Allow Martian nexthops to be received in the NLRI from a peer</help>
@@ -1675,6 +1613,12 @@
         <valueless/>
       </properties>
     </leafNode>
+    <leafNode name="no-ipv6-auto-ra">
+      <properties>
+        <help>Disable IPv6 automatic router advertisement</help>
+        <valueless/>
+      </properties>
+    </leafNode>
     <leafNode name="no-suppress-duplicates">
       <properties>
         <help>Disable suppress duplicate updates if the route actually not changed</help>
@@ -1743,6 +1687,41 @@
         </leafNode>
       </children>
     </node>
+    <node name="update-delay">
+      <properties>
+        <help>BGP update-delay read-only mode</help>
+      </properties>
+      <children>
+        <leafNode name="max-delay">
+          <properties>
+            <help>Maximum delay before exiting read-only mode</help>
+            <valueHelp>
+              <format>u32:0</format>
+              <description>Disable feature</description>
+            </valueHelp>
+            <valueHelp>
+              <format>u32:1-3600</format>
+              <description>Delay in seconds</description>
+            </valueHelp>
+            <constraint>
+              <validator name="numeric" argument="--range 0-3600"/>
+            </constraint>
+          </properties>
+        </leafNode>
+        <leafNode name="establish-wait">
+          <properties>
+            <help>Time to wait for peers to reach Established state before determining expected peers</help>
+            <valueHelp>
+              <format>u32:1-3600</format>
+              <description>Wait time in seconds</description>
+            </valueHelp>
+            <constraint>
+              <validator name="numeric" argument="--range 1-3600"/>
+            </constraint>
+          </properties>
+        </leafNode>
+      </children>
+    </node>
   </children>
 </node>
 <tagNode name="peer-group">
@@ -1765,6 +1744,7 @@
         #include <include/bgp/neighbor-afi-ipv6-labeled-unicast.xml.i>
         #include <include/bgp/neighbor-afi-ipv6-vpn.xml.i>
         #include <include/bgp/neighbor-afi-l2vpn-evpn.xml.i>
+        #include <include/bgp/neighbor-afi-link-state.xml.i>
       </children>
     </node>
     #include <include/generic-description.xml.i>
@@ -1773,7 +1753,6 @@
     #include <include/bgp/neighbor-disable-capability-negotiation.xml.i>
     #include <include/bgp/neighbor-disable-connected-check.xml.i>
     #include <include/bgp/neighbor-ebgp-multihop.xml.i>
-    #include <include/bgp/neighbor-graceful-restart.xml.i>
     #include <include/bgp/neighbor-graceful-restart.xml.i>
     #include <include/bgp/neighbor-local-as.xml.i>
     #include <include/bgp/neighbor-local-role.xml.i>
@@ -1786,6 +1765,7 @@
     #include <include/bgp/neighbor-update-source.xml.i>
     #include <include/bgp/remote-as.xml.i>
     #include <include/port-number.xml.i>
+    #include <include/bgp/solo.xml.i>
   </children>
 </tagNode>
 <node name="srv6">

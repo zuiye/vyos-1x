@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2019-2024 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -20,8 +20,11 @@ from sys import exit
 
 from vyos.base import Warning
 from vyos.config import Config
+from vyos.configdep import set_dependents
+from vyos.configdep import call_dependents
 from vyos.configdict import get_interface_dict
 from vyos.configdict import is_node_changed
+from vyos.configdict import get_flowtable_interfaces
 from vyos.configverify import verify_address
 from vyos.configverify import verify_dhcpv6
 from vyos.configverify import verify_interface_exists
@@ -33,6 +36,7 @@ from vyos.configverify import verify_vrf
 from vyos.configverify import verify_bond_bridge_member
 from vyos.configverify import verify_eapol
 from vyos.ethtool import Ethtool
+from vyos.netlink import coalesce
 from vyos.frrender import FRRender
 from vyos.frrender import get_frrender_dict
 from vyos.ifconfig import EthernetIf
@@ -42,6 +46,8 @@ from vyos.utils.dict import dict_to_paths_values
 from vyos.utils.dict import dict_set
 from vyos.utils.dict import dict_delete
 from vyos.utils.process import is_systemd_service_running
+from vyos.vpp.config_verify import verify_vpp_remove_interface
+from vyos.vpp.control_vpp import VPPControl
 from vyos import ConfigError
 from vyos import airbag
 airbag.enable()
@@ -132,7 +138,7 @@ def update_bond_options(conf: Config, eth_conf: dict) -> list:
 
 def get_config(config=None):
     """
-    Retrive CLI config as dictionary. Dictionary can never be empty, as at least the
+    Retrieve CLI config as dictionary. Dictionary can never be empty, as at least the
     interface name will be added or a deleted flag
     """
     if config:
@@ -168,6 +174,27 @@ def get_config(config=None):
     tmp = is_node_changed(conf, base + [ifname, 'evpn'])
     if tmp: ethernet.update({'frr_dict' : get_frrender_dict(conf)})
 
+    ethernet['flowtable_interfaces'] = get_flowtable_interfaces(conf)
+
+    vpp_config = conf.get_config_dict(
+        ['vpp'],
+        key_mangling=('-', '_'),
+        get_first_key=True,
+        no_tag_node_value_mangle=True,
+    )
+    if vpp_config:
+        ethernet['vpp'] = vpp_config
+        ethernet['vpp']['interfaces_vpp'] = conf.get_config_dict(
+            ['interfaces', 'vpp'],
+            key_mangling=('-', '_'),
+            get_first_key=True,
+            no_tag_node_value_mangle=True,
+        )
+
+    # Protocols static arp dependency
+    if 'static_arp' in ethernet:
+        set_dependents('static_arp', conf)
+
     return ethernet
 
 def verify_speed_duplex(ethernet: dict, ethtool: Ethtool):
@@ -181,11 +208,11 @@ def verify_speed_duplex(ethernet: dict, ethtool: Ethtool):
     if ((ethernet['speed'] == 'auto' and ethernet['duplex'] != 'auto') or
             (ethernet['speed'] != 'auto' and ethernet['duplex'] == 'auto')):
         raise ConfigError(
-            'Speed/Duplex missmatch. Must be both auto or manually configured')
+            'Speed/Duplex mismatch. Must be both auto or manually configured')
 
     if ethernet['speed'] != 'auto' and ethernet['duplex'] != 'auto':
         # We need to verify if the requested speed and duplex setting is
-        # supported by the underlaying NIC.
+        # supported by the underlying NIC.
         speed = ethernet['speed']
         duplex = ethernet['duplex']
         if not ethtool.check_speed_duplex(speed, duplex):
@@ -238,6 +265,26 @@ def verify_ring_buffer(ethernet: dict, ethtool: Ethtool):
                               f'size of "{max_tx}" bytes!')
 
 
+def verify_coalesce(ethernet: dict, ethtool: Ethtool):
+    """
+    Verify coalesce settings
+    :param ethernet: dictionary which is received from get_interface_dict
+    :type ethernet: dict
+    :param ethtool: Ethernet object
+    :type ethtool: Ethtool
+    """
+    if 'interrupt_coalescing' in ethernet:
+        if not ethtool.check_coalesce():
+            raise ConfigError('Driver does not fully support coalesce configuration!')
+
+        for param in coalesce.get_all_params():
+            if param in ethernet['interrupt_coalescing']:
+                if not ethtool.check_coalesce(param):
+                    param_name = param.replace('_', '-')
+                    msg = f'Driver does not support "{param_name}" coalesce setting!'
+                    raise ConfigError(msg)
+
+
 def verify_offload(ethernet: dict, ethtool: Ethtool):
     """
      Verify offloading capabilities
@@ -248,7 +295,7 @@ def verify_offload(ethernet: dict, ethtool: Ethtool):
     """
     if dict_search('offload.rps', ethernet) != None:
         if not os.path.exists(f'/sys/class/net/{ethernet["ifname"]}/queues/rx-0/rps_cpus'):
-            raise ConfigError('Interface does not suport RPS!')
+            raise ConfigError('Interface does not support RPS!')
     driver = ethtool.get_driver_name()
     # T3342 - Xen driver requires special treatment
     if driver == 'vif':
@@ -256,6 +303,20 @@ def verify_offload(ethernet: dict, ethtool: Ethtool):
             raise ConfigError('Xen netback drivers requires scatter-gatter offloading '\
                               'for MTU size larger then 1500 bytes')
 
+def verify_mac_change(ethernet: dict, ethtool: Ethtool):
+    """
+     Verify if ethernet card driver supports changing the interface MAC address.
+     AWS ENA driver has no support for MAC address changes.
+
+    :param ethernet: dictionary which is received from get_interface_dict
+    :type ethernet: dict
+    :param ethtool: Ethernet object
+    :type ethtool: Ethtool
+    """
+    if 'mac' not in ethernet:
+        return None
+    if not ethtool.check_mac_change():
+        raise ConfigError(f'Driver does not support changing MAC address!')
 
 def verify_allowedbond_changes(ethernet: dict):
     """
@@ -269,54 +330,99 @@ def verify_allowedbond_changes(ethernet: dict):
                               f' on interface "{ethernet["ifname"]}".' \
                               f' Interface is a bond member')
 
+def verify_flowtable(ethernet: dict):
+    ifname = ethernet['ifname']
+
+    if 'deleted' in ethernet and ifname in ethernet['flowtable_interfaces']:
+        raise ConfigError(f'Cannot delete interface "{ifname}", still referenced on a flowtable')
+
+    if 'vif_remove' in ethernet:
+        for vif in ethernet['vif_remove']:
+            vifname = f'{ifname}.{vif}'
+
+            if vifname in ethernet['flowtable_interfaces']:
+                raise ConfigError(f'Cannot delete interface "{vifname}", still referenced on a flowtable')
+
+    if 'vif_s_remove' in ethernet:
+        for vifs in ethernet['vif_s_remove']:
+            vifsname = f'{ifname}.{vifs}'
+
+            if vifsname in ethernet['flowtable_interfaces']:
+                raise ConfigError(f'Cannot delete interface "{vifsname}", still referenced on a flowtable')
+
+    if 'vif_s' in ethernet:
+        for vifs, vifs_conf in ethernet['vif_s'].items():
+            if 'vif_c_delete' in vifs_conf:
+                for vifc in vifs_conf['vif_c_delete']:
+                    vifcname = f'{ifname}.{vifs}.{vifc}'
+
+                    if vifcname in ethernet['flowtable_interfaces']:
+                        raise ConfigError(f'Cannot delete interface "{vifcname}", still referenced on a flowtable')
+
+def verify_vpp_remove_vif(ethernet: dict):
+    """Ensure that VIF interfaces being removed are not used by VPP features"""
+    ifname = ethernet['ifname']
+    vpp_config = ethernet.get('vpp')
+
+    if not vpp_config:
+        return
+
+    vlan_names = [
+        f'{ifname}.{vif_id}'
+        for vif_group in ['vif_remove', 'vif_s_remove']
+        for vif_id in ethernet.get(vif_group, [])
+    ]
+
+    for vlan in vlan_names:
+        verify_vpp_remove_interface(vlan, vpp_config)
+
 def verify(ethernet):
+    verify_flowtable(ethernet)
+    verify_vpp_remove_vif(ethernet)
+
     if 'deleted' in ethernet:
         return None
-    if 'is_bond_member' in ethernet:
-        verify_bond_member(ethernet)
-    else:
-        verify_ethernet(ethernet)
 
-
-def verify_bond_member(ethernet):
-    """
-     Verification function for ethernet interface which is in bonding
-    :param ethernet: dictionary which is received from get_interface_dict
-    :type ethernet: dict
-    """
     ifname = ethernet['ifname']
-    verify_interface_exists(ethernet, ifname)
+    verify_interface_exists(ethernet, ifname, state_required=True)
     verify_eapol(ethernet)
     verify_mirror_redirect(ethernet)
+    # No need to check speed and duplex keys as both have default values
     ethtool = Ethtool(ifname)
     verify_speed_duplex(ethernet, ethtool)
     verify_flow_control(ethernet, ethtool)
     verify_ring_buffer(ethernet, ethtool)
     verify_offload(ethernet, ethtool)
-    verify_allowedbond_changes(ethernet)
+    verify_mac_change(ethernet, ethtool)
+    verify_coalesce(ethernet, ethtool)
 
-def verify_ethernet(ethernet):
+    if 'is_bond_member' in ethernet:
+        verify_bond_member(ethernet, ethtool)
+    else:
+        verify_ethernet(ethernet, ethtool)
+
+
+def verify_bond_member(ethernet: dict, ethtool: Ethtool) -> None:
+    """
+     Verification function for ethernet interface which is in bonding
+    :param ethernet: dictionary which is received from get_interface_dict
+    :type ethernet: dict
+    """
+    verify_allowedbond_changes(ethernet)
+    return None
+
+def verify_ethernet(ethernet: dict, ethtool: Ethtool) -> None:
     """
      Verification function for simple ethernet interface
     :param ethernet: dictionary which is received from get_interface_dict
     :type ethernet: dict
     """
-    ifname = ethernet['ifname']
-    verify_interface_exists(ethernet, ifname)
     verify_mtu(ethernet)
     verify_mtu_ipv6(ethernet)
     verify_dhcpv6(ethernet)
     verify_address(ethernet)
     verify_vrf(ethernet)
     verify_bond_bridge_member(ethernet)
-    verify_eapol(ethernet)
-    verify_mirror_redirect(ethernet)
-    ethtool = Ethtool(ifname)
-    # No need to check speed and duplex keys as both have default values.
-    verify_speed_duplex(ethernet, ethtool)
-    verify_flow_control(ethernet, ethtool)
-    verify_ring_buffer(ethernet, ethtool)
-    verify_offload(ethernet, ethtool)
     # use common function to verify VLAN configuration
     verify_vlan_config(ethernet)
     return None
@@ -329,11 +435,44 @@ def generate(ethernet):
 def apply(ethernet):
     if 'frr_dict' in ethernet and not is_systemd_service_running('vyos-configd.service'):
         FRRender().apply()
-    e = EthernetIf(ethernet['ifname'])
+    ifname = ethernet['ifname']
+    e = EthernetIf(ifname)
     if 'deleted' in ethernet:
         e.remove()
     else:
         e.update(ethernet)
+    if 'static_arp' in ethernet:
+        call_dependents()
+
+    vpp_iface_config = dict_search(f'vpp.settings.interface.{ifname}', ethernet)
+    if vpp_iface_config is not None and is_systemd_service_running('vpp.service'):
+        vpp_api = VPPControl()
+
+        # Enable ip4-dhcp-client-detect feature for DHCP-configured interfaces.
+        # This feature is required for VPP to process DHCP packets and assign addresses.
+        if 'dhcp' in ethernet.get('address', []):
+            vpp_api.enable_dhcp_client(ifname)
+        else:
+            vpp_api.disable_dhcp_client(ifname)
+
+        # Enable ip6-icmp-ra-punt feature for DHCPv6-configured interfaces.
+        if 'dhcpv6' in ethernet.get('address', []) or (
+            'autoconf' in ethernet.get('ipv6', {}).get('address', {})
+        ):
+            vpp_api.enable_icmpv6_ra_punt(ifname)
+        else:
+            vpp_api.disable_icmpv6_ra_punt(ifname)
+
+        # If the interface is managed by the VPP DPDK driver, synchronize runtime
+        # parameters between Linux and the corresponding VPP LCP interface
+        # Find LCP pair
+        lcp_pair = vpp_api.lcp_pair_find(vpp_name_hw=ifname)
+        # Sync MTU to VPP LCP pair interface
+        if lcp_pair:
+            lcp_name = lcp_pair.get('vpp_name_kernel')
+            mtu = e.get_mtu()
+            vpp_api.set_iface_mtu(lcp_name, mtu)
+
     return None
 
 if __name__ == '__main__':

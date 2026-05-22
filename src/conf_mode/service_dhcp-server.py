@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2018-2025 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -15,23 +15,28 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import os
+import re
+
+from sys import exit
+from sys import argv
 
 from glob import glob
 from ipaddress import ip_address
 from ipaddress import ip_network
 from netaddr import IPRange
-from sys import exit
 
 from vyos.config import Config
+from vyos.kea import kea_test_config
 from vyos.pki import wrap_certificate
 from vyos.pki import wrap_private_key
 from vyos.template import render
 from vyos.utils.dict import dict_search
 from vyos.utils.dict import dict_search_args
+from vyos.utils.dict import dict_search_recursive
 from vyos.utils.file import chmod_775
-from vyos.utils.file import chown
 from vyos.utils.file import makedir
 from vyos.utils.file import write_file
+from vyos.utils.permission import chown
 from vyos.utils.process import call
 from vyos.utils.network import interface_exists
 from vyos.utils.network import is_subnet_connected
@@ -41,16 +46,53 @@ from vyos import airbag
 
 airbag.enable()
 
-ctrl_config_file = '/run/kea/kea-ctrl-agent.conf'
-ctrl_socket = '/run/kea/dhcp4-ctrl-socket'
-config_file = '/run/kea/kea-dhcp4.conf'
-lease_file = '/config/dhcp/dhcp4-leases.csv'
-lease_file_glob = '/config/dhcp/dhcp4-leases*'
+ctrl_socket = ''
+config_file = ''
+config_file_d2 = ''
+lease_file = ''
+lease_file_glob = ''
+
+ca_cert_file = ''
+cert_file = ''
+cert_key_file = ''
+
 user_group = '_kea'
 
-ca_cert_file = '/run/kea/kea-failover-ca.pem'
-cert_file = '/run/kea/kea-failover.pem'
-cert_key_file = '/run/kea/kea-failover-key.pem'
+
+def _override_for_vrf(vrf_name):
+    """
+    This function is intended to override global vars when vrf is enabled
+    """
+    global ctrl_socket, config_file, config_file_d2, lease_file, lease_file_glob
+    global ca_cert_file, cert_file, cert_key_file
+
+    ctrl_socket = f'/run/kea/dhcp4-{vrf_name}-ctrl-socket'
+    config_file = f'/run/kea/kea-{vrf_name}-dhcp4.conf'
+    config_file_d2 = f'/run/kea/kea-{vrf_name}-dhcp-ddns.conf'
+    lease_file = f'/config/dhcp/dhcp4-{vrf_name}-leases.csv'
+    lease_file_glob = f'/config/dhcp/dhcp4-{vrf_name}-leases*'
+
+    ca_cert_file = f'/run/kea/kea-{vrf_name}-failover-ca.pem'
+    cert_file = f'/run/kea/kea-{vrf_name}-failover.pem'
+    cert_key_file = f'/run/kea/kea-{vrf_name}-failover-key.pem'
+
+
+def _reset_vars():
+    """
+    This function is intended to reset global vars when vrf is not enabled
+    """
+    global ctrl_socket, config_file, config_file_d2, lease_file, lease_file_glob
+    global ca_cert_file, cert_file, cert_key_file
+
+    ctrl_socket = '/run/kea/dhcp4-ctrl-socket'
+    config_file = '/run/kea/kea-dhcp4.conf'
+    config_file_d2 = '/run/kea/kea-dhcp-ddns.conf'
+    lease_file = '/config/dhcp/dhcp4-leases.csv'
+    lease_file_glob = '/config/dhcp/dhcp4-leases*'
+
+    ca_cert_file = '/run/kea/kea-failover-ca.pem'
+    cert_file = '/run/kea/kea-failover.pem'
+    cert_key_file = '/run/kea/kea-failover-key.pem'
 
 
 def dhcp_slice_range(exclude_list, range_dict):
@@ -125,7 +167,19 @@ def get_config(config=None):
         conf = config
     else:
         conf = Config()
-    base = ['service', 'dhcp-server']
+
+    # if running in vrf, set base differently
+    if argv and len(argv) > 1:
+        vrf_name = argv[1]
+        base = ['vrf', 'name', vrf_name, 'service', 'dhcp-server']
+
+        # vrf is defined, override other vars aswell
+        _override_for_vrf(vrf_name)
+    else:
+        base = ['service', 'dhcp-server']
+
+        # vrf is not defined reset vars
+        _reset_vars()
     if not conf.exists(base):
         return None
 
@@ -136,6 +190,10 @@ def get_config(config=None):
         get_first_key=True,
         with_recursive_defaults=True,
     )
+
+    # add vrf context if present
+    if argv and len(argv) > 1:
+        dhcp['vrf_context'] = argv[1]
 
     if 'shared_network_name' in dhcp:
         for network, network_config in dhcp['shared_network_name'].items():
@@ -169,8 +227,20 @@ def get_config(config=None):
                 no_tag_node_value_mangle=True,
             )
 
+    if bool(list(dict_search_recursive(dhcp, 'ping_check'))):
+        dhcp['any_ping_check'] = True
+
     return dhcp
 
+def verify_ddns_domain_servers(domain_type, domain):
+    if 'dns_server' in domain:
+        invalid_servers = []
+        for server_no, server_config in domain['dns_server'].items():
+            if 'address' not in server_config:
+                invalid_servers.append(server_no)
+        if len(invalid_servers) > 0:
+            raise ConfigError(f'{domain_type} DNS servers {", ".join(invalid_servers)} in DDNS configuration need to have an IP address')
+    return None
 
 def verify(dhcp):
     # bail out early - looks like removal from running config
@@ -222,6 +292,12 @@ def verify(dhcp):
                             f'DHCP static-route "{route}" requires router to be defined!'
                         )
 
+            # If a client class has been specified then it must exist
+            if 'client_class' in subnet_config:
+                client_class = subnet_config['client_class']
+                if client_class not in dhcp.get('client_class', {}):
+                    raise ConfigError(f'Client class "{client_class}" set in subnet "{subnet}" but does not exist')
+
             # Check if DHCP address range is inside configured subnet declaration
             if 'range' in subnet_config:
                 networks = []
@@ -230,6 +306,12 @@ def verify(dhcp):
                         raise ConfigError(
                             f'DHCP range "{range}" start and stop address must be defined!'
                         )
+
+                    # If a client class has been specified then it must exist
+                    if 'client_class' in range_config:
+                        client_class = range_config['client_class']
+                        if client_class not in dhcp.get('client_class', {}):
+                            raise ConfigError(f'Client class "{client_class}" set in range "{range}" but does not exist')
 
                     # Start/Stop address must be inside network
                     for key in ['start', 'stop']:
@@ -423,6 +505,42 @@ def verify(dhcp):
         if not interface_exists(interface):
             raise ConfigError(f'listen-interface "{interface}" does not exist')
 
+    if 'dynamic_dns_update' in dhcp:
+        ddns = dhcp['dynamic_dns_update']
+        if 'tsig_key' in ddns:
+            invalid_keys = []
+            for tsig_key_name, tsig_key_config in ddns['tsig_key'].items():
+                if not ('algorithm' in tsig_key_config and 'secret' in tsig_key_config):
+                    invalid_keys.append(tsig_key_name)
+            if len(invalid_keys) > 0:
+                raise ConfigError(f'Both algorithm and secret need to be set for TSIG keys: {", ".join(invalid_keys)}')
+
+        if 'forward_domain' in ddns:
+            verify_ddns_domain_servers('Forward', ddns['forward_domain'])
+
+        if 'reverse_domain' in ddns:
+            verify_ddns_domain_servers('Reverse', ddns['reverse_domain'])
+
+    if 'client_class' in dhcp:
+        # Check client class values are valid
+        for class_name, class_config in dhcp['client_class'].items():
+            if 'relay_agent_information' in class_config:
+                relay_agent_information_config = class_config['relay_agent_information']
+                # Compile a regex that will scan for valid inputs. Input can be
+                # either hex in the form 0x0123456789ABCDEF or a string that
+                # does *not* start with 0x. i.e. 0xHELLOWORLD is bad
+                pattern = re.compile(r'^(?:0x[0-9A-Fa-f]+|(?!0x).+)$')
+
+                if 'circuit_id' in relay_agent_information_config:
+                    circuit_id = relay_agent_information_config['circuit_id']
+                    if not pattern.match(circuit_id):
+                        raise ConfigError(f'Invalid circuit-id "{circuit_id}" must be either text literal or hex string starting with 0x')
+
+                if 'remote_id' in relay_agent_information_config:
+                    remote_id = relay_agent_information_config['remote_id']
+                    if not pattern.match(remote_id):
+                        raise ConfigError(f'Invalid remote-id "{remote_id}" must be either text literal or hex string starting with 0x')
+
     return None
 
 
@@ -480,25 +598,31 @@ def generate(dhcp):
             dhcp['high_availability']['ca_cert_file'] = ca_cert_file
 
     render(
-        ctrl_config_file,
-        'dhcp-server/kea-ctrl-agent.conf.j2',
-        dhcp,
-        user=user_group,
-        group=user_group,
-    )
-    render(
         config_file,
         'dhcp-server/kea-dhcp4.conf.j2',
         dhcp,
         user=user_group,
         group=user_group,
     )
+    if 'dynamic_dns_update' in dhcp:
+        render(
+            config_file_d2,
+            'dhcp-server/kea-dhcp-ddns.conf.j2',
+            dhcp,
+            user=user_group,
+            group=user_group
+        )
 
     return None
 
 
 def apply(dhcp):
-    services = ['kea-ctrl-agent', 'kea-dhcp4-server', 'kea-dhcp-ddns-server']
+    # if running in vrf, set base differently
+    if argv and len(argv) > 1:
+        vrf_name = argv[1]
+        services = [f'isc-kea-dhcp4-server@{vrf_name}', f'isc-kea-dhcp-ddns-server@{vrf_name}']
+    else:
+        services = ['isc-kea-dhcp4-server', 'isc-kea-dhcp-ddns-server']
 
     if not dhcp or 'disable' in dhcp:
         for service in services:
@@ -509,13 +633,14 @@ def apply(dhcp):
 
         return None
 
+    result, output = kea_test_config('kea-dhcp4', config_file)
+    if not result:
+        raise ConfigError(f'Unexpected error with Kea configuration:\n{output}')
+
     for service in services:
         action = 'restart'
 
-        if service == 'kea-dhcp-ddns-server' and 'dynamic_dns_update' not in dhcp:
-            action = 'stop'
-
-        if service == 'kea-ctrl-agent' and 'high_availability' not in dhcp:
+        if 'isc-kea-dhcp-ddns-server' in service and 'dynamic_dns_update' not in dhcp:
             action = 'stop'
 
         call(f'systemctl {action} {service}.service')

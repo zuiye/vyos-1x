@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2019-2021 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -123,10 +123,10 @@ if __name__ == '__main__':
           f'\ndata on {target_disk}.\n')
 
     if not ask_yes_no('Do you wish to proceed?'):
-        print(f'Disk drive {target_disk} will not be re-formated')
+        print(f'Disk drive {target_disk} will not be re-formatted')
         exit(0)
 
-    print(f'Re-formating disk drive {target_disk}...')
+    print(f'Re-formatting disk drive {target_disk}...')
 
     print('Making backup copy of partitions...')
     backup_partitions(target_disk)

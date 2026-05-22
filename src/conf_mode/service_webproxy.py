@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2020 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -123,7 +123,7 @@ def get_config(config=None):
     proxy = conf.get_config_dict(base, key_mangling=('-', '_'),
                                  get_first_key=True)
     # We have gathered the dict representation of the CLI, but there are default
-    # options which we need to update into the dictionary retrived.
+    # options which we need to update into the dictionary retrieved.
     default_values = conf.get_config_defaults(**proxy.kwargs,
                                               recursive=True)
 

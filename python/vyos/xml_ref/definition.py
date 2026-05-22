@@ -1,4 +1,4 @@
-# Copyright 2024 VyOS maintainers and contributors <maintainers@vyos.io>
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This library is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -104,7 +104,7 @@ class Xml:
         if self.exists(path):
             if self.is_valueless(path) or not self.is_leaf(path):
                 # It's a complete path for a valueless node
-                # or a path to an empy non-leaf node
+                # or a path to an empty non-leaf node
                 return (path, None)
             else:
                 raise ValueError(f'Path "{path}" needs a value or children')

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright 2023-2025 VyOS maintainers and contributors <maintainers@vyos.io>
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This file is part of VyOS.
 #
@@ -17,14 +17,23 @@
 # You should have received a copy of the GNU General Public License along with
 # VyOS. If not, see <https://www.gnu.org/licenses/>.
 
-from argparse import ArgumentParser, Namespace
+from argparse import ArgumentParser
+from argparse import Namespace
 from pathlib import Path
-from shutil import copy, chown, rmtree, copytree
+from shutil import copy
+from shutil import chown
+from shutil import rmtree
+from shutil import copytree
+from shutil import disk_usage
 from glob import glob
 from sys import exit
 from os import environ
 from os import readlink
-from os import getpid, getppid
+from os import getpid
+from os import getppid
+from os import sync
+from json import loads
+from json import dumps
 from typing import Union
 from urllib.parse import urlparse
 from passlib.hosts import linux_context
@@ -32,18 +41,44 @@ from errno import ENOSPC
 
 from psutil import disk_partitions
 
+from vyos.base import Warning
 from vyos.configtree import ConfigTree
+from vyos.config_mgmt import unsaved_commits
+from vyos.defaults import base_dir
+from vyos.defaults import directories
+from vyos.defaults import activation_hint
+from vyos.flavor import get_image_serial_console
 from vyos.remote import download
-from vyos.system import disk, grub, image, compat, raid, SYSTEM_CFG_VER
+from vyos.system import disk
+from vyos.system import grub
+from vyos.system import image
+from vyos.system import compat
+from vyos.system import raid
+from vyos.system import SYSTEM_CFG_VER
+from vyos.system import grub_util
 from vyos.template import render
-from vyos.utils.io import ask_input, ask_yes_no, select_entry
+from vyos.utils.auth import DEFAULT_PASSWORD
+from vyos.utils.auth import EPasswdStrength
+from vyos.utils.auth import evaluate_strength
+from vyos.utils.auth import get_local_users
+from vyos.utils.auth import get_user_home_dir
+from vyos.utils.dict import dict_search
+from vyos.utils.io import ask_input
+from vyos.utils.io import ask_yes_no
+from vyos.utils.io import select_entry
 from vyos.utils.file import chmod_2775
-from vyos.utils.process import cmd, run, rc_cmd
+from vyos.utils.file import read_file
+from vyos.utils.file import write_file
+from vyos.utils.process import cmd
+from vyos.utils.process import run
+from vyos.utils.process import rc_cmd
 from vyos.version import get_version_data
 
 # define text messages
 MSG_ERR_NOT_LIVE: str = 'The system is already installed. Please use "add system image" instead.'
 MSG_ERR_LIVE: str = 'The system is in live-boot mode. Please use "install image" instead.'
+MSG_ERR_NOT_ENOUGH_SPACE: str = 'Image upgrade requires at least 2GB of free drive space.'
+MSG_ERR_UNSAVED_COMMITS: str = 'There are unsaved changes to the configuration. Either save or revert before upgrade.'
 MSG_ERR_NO_DISK: str = 'No suitable disk was found. There must be at least one disk of 2GB or greater size.'
 MSG_ERR_IMPROPER_IMAGE: str = 'Missing sha256sum.txt.\nEither this image is corrupted, or of era 1.2.x (md5sum) and would downgrade image tools;\ndisallowed in either case.'
 MSG_ERR_INCOMPATIBLE_IMAGE: str = 'Image compatibility check failed, aborting installation.'
@@ -52,6 +87,7 @@ MSG_ERR_FLAVOR_MISMATCH: str = 'The current image flavor is "{0}", the new image
 MSG_ERR_MISSING_ARCHITECTURE: str = 'The new image version data does not specify architecture, cannot check compatibility (is it a legacy release image?)'
 MSG_ERR_MISSING_FLAVOR: str = 'The new image version data does not specify flavor, cannot check compatibility (is it a legacy release image?)'
 MSG_ERR_CORRUPT_CURRENT_IMAGE: str = 'Version data in the current image is malformed: missing flavor and/or architecture fields. Upgrade compatibility cannot be checked.'
+MSG_ERR_UNSUPPORTED_SIGNATURE_TYPE: str = 'Unsupported signature type, signature cannot be verified.'
 MSG_INFO_INSTALL_WELCOME: str = 'Welcome to VyOS installation!\nThis command will install VyOS to your permanent storage.'
 MSG_INFO_INSTALL_EXIT: str = 'Exiting from VyOS installation'
 MSG_INFO_INSTALL_SUCCESS: str = 'The image installed successfully; please reboot now.'
@@ -66,7 +102,9 @@ MSG_INFO_INSTALL_PARTITONING: str = 'Creating partition table...'
 MSG_INPUT_CONFIG_FOUND: str = 'An active configuration was found. Would you like to copy it to the new image?'
 MSG_INPUT_CONFIG_CHOICE: str = 'The following config files are available for boot:'
 MSG_INPUT_CONFIG_CHOOSE: str = 'Which file would you like as boot config?'
+MSG_INPUT_UNSAVED_COMMITS: str = 'There are unsaved changes to the configuration. They will not be copied to the new image. Continue without saving?'
 MSG_INPUT_IMAGE_NAME: str = 'What would you like to name this image?'
+MSG_INPUT_IMAGE_NAME_TAKEN: str = 'There is already an installed image by that name; please choose again'
 MSG_INPUT_IMAGE_DEFAULT: str = 'Would you like to set the new image as the default one for boot?'
 MSG_INPUT_PASSWORD: str = 'Please enter a password for the "vyos" user:'
 MSG_INPUT_PASSWORD_CONFIRM: str = 'Please confirm password for the "vyos" user:'
@@ -83,6 +121,9 @@ MSG_WARN_ROOT_SIZE_TOOBIG: str = 'The size is too big. Try again.'
 MSG_WARN_ROOT_SIZE_TOOSMALL: str = 'The size is too small. Try again'
 MSG_WARN_IMAGE_NAME_WRONG: str = 'The suggested name is unsupported!\n'\
 'It must be between 1 and 64 characters long and contains only the next characters: .+-_ a-z A-Z 0-9'
+
+MSG_WARN_CHANGE_PASSWORD: str = 'Default password used. Consider changing ' \
+    'it on next login.'
 MSG_WARN_PASSWORD_CONFIRM: str = 'The entered values did not match. Try again'
 'Installing a different image flavor may cause functionality degradation or break your system.\n' \
 'Do you want to continue with installation?'
@@ -92,6 +133,8 @@ CONST_MIN_ROOT_SIZE: int = 1610612736  # 1.5 GB
 CONST_RESERVED_SPACE: int = (2 + 1 + 256) * 1024**2
 
 # define directories and paths
+DIR_CONFIG: str = directories['config']
+DIR_DATA: str = directories['data']
 DIR_INSTALLATION: str = '/mnt/installation'
 DIR_ROOTFS_SRC: str = f'{DIR_INSTALLATION}/root_src'
 DIR_ROOTFS_DST: str = f'{DIR_INSTALLATION}/root_dst'
@@ -101,18 +144,19 @@ DIR_KERNEL_SRC: str = '/boot/'
 FILE_ROOTFS_SRC: str = '/usr/lib/live/mount/medium/live/filesystem.squashfs'
 ISO_DOWNLOAD_PATH: str = ''
 
-external_download_script = '/usr/libexec/vyos/simple-download.py'
-external_latest_image_url_script = '/usr/libexec/vyos/latest-image-url.py'
+external_download_script: str = f'{base_dir}/simple-download.py'
+external_latest_image_url_script: str = f'{base_dir}/latest-image-url.py'
+
+(flavor_sercon_type, flavor_sercon_num, flavor_sercon_speed) = get_image_serial_console()
 
 # default boot variables
 DEFAULT_BOOT_VARS: dict[str, str] = {
     'timeout': '5',
     'console_type': 'tty',
-    'console_num': '0',
-    'console_speed': '115200',
+    'console_num': flavor_sercon_num,
+    'console_speed': flavor_sercon_speed,
     'bootmode': 'normal'
 }
-
 
 def bytes_to_gb(size: int) -> float:
     """Convert Bytes to GBytes, rounded to 1 decimal number
@@ -239,12 +283,18 @@ def search_previous_installation(disks: list[str]) -> None:
     print('Searching for data from previous installations')
     image_data = []
     encrypted_configs = []
+    legacy_bind_mount = False
     for disk_name in disks:
         for partition in disk.partition_list(disk_name):
             if disk.partition_mount(partition, mnt_tmp):
                 if Path(mnt_tmp + '/boot').exists():
                     for path in Path(mnt_tmp + '/boot').iterdir():
                         if path.joinpath('rw/config/.vyatta_config').exists():
+                            legacy_bind_mount = True
+                            image_data.append((path.name, partition))
+                        elif path.joinpath(
+                            'rw/opt/vyatta/etc/config/.vyatta_config'
+                        ).exists():
                             image_data.append((path.name, partition))
                 if Path(mnt_tmp + '/luks').exists():
                     for path in Path(mnt_tmp + '/luks').iterdir():
@@ -297,7 +347,12 @@ def search_previous_installation(disks: list[str]) -> None:
     disk.partition_mount(image_drive, mnt_tmp)
 
     if not encrypted:
-        copytree(f'{mnt_tmp}/boot/{image_name}/rw/config', mnt_config)
+        if legacy_bind_mount:
+            copytree(f'{mnt_tmp}/boot/{image_name}/rw/config', mnt_config)
+        else:
+            copytree(
+                f'{mnt_tmp}/boot/{image_name}/rw/opt/vyatta/etc/config', mnt_config
+            )
     else:
         copy(f'{mnt_tmp}/luks/{image_name}', mnt_encrypted_config)
 
@@ -320,7 +375,7 @@ def copy_preserve_owner(src: str, dst: str, *, follow_symlinks=True):
 
 def copy_previous_installation_data(target_dir: str) -> None:
     if Path('/mnt/config').exists():
-        copytree('/mnt/config', f'{target_dir}/opt/vyatta/etc/config',
+        copytree('/mnt/config', f'{target_dir}{DIR_CONFIG}',
                  dirs_exist_ok=True)
     if Path('/mnt/ssh').exists():
         copytree('/mnt/ssh', f'{target_dir}/etc/ssh',
@@ -466,6 +521,77 @@ def setup_grub(root_dir: str) -> None:
     render(grub_cfg_menu, grub.TMPL_GRUB_MENU, {})
     render(grub_cfg_options, grub.TMPL_GRUB_OPTS, {})
 
+def get_cli_kernel_options(config_file: str) -> list:
+    config = ConfigTree(read_file(config_file))
+    config_dict = loads(config.to_json())
+    cmdline_options = []
+    kernel_options = dict_search('system.option.kernel', config_dict)
+    if kernel_options is None:
+        return cmdline_options
+
+    k_cpu_opts = kernel_options.get('cpu', {})
+    k_memory_opts = kernel_options.get('memory', {})
+
+    # XXX: This code path and if statements must be kept in sync with the Kernel
+    # option handling in system_options.py:generate(). This occurrence is used
+    # for having the appropriate options passed to GRUB after an image upgrade!
+    if 'disable-mitigations' in kernel_options:
+        cmdline_options.append('mitigations=off')
+    if 'disable-power-saving' in kernel_options:
+        cmdline_options.append('intel_idle.max_cstate=0 processor.max_cstate=1')
+    if 'amd-pstate-driver' in kernel_options:
+        mode = kernel_options['amd-pstate-driver']
+        cmdline_options.append(
+            f'initcall_blacklist=acpi_cpufreq_init amd_pstate={mode}')
+    if 'quiet' in kernel_options:
+        cmdline_options.append('quiet')
+
+    # Early reboot on kernel panic via kernel cmdline (must match system_option.py)
+    if dict_search('system.option.reboot-on-panic', config_dict) is not None:
+        cmdline_options.append('panic=60')
+
+    if 'disable-hpet' in kernel_options:
+        cmdline_options.append('hpet=disable')
+
+    if 'disable-mce' in kernel_options:
+        cmdline_options.append('mce=off')
+
+    if 'disable-softlockup' in kernel_options:
+        cmdline_options.append('nosoftlockup')
+
+    # CPU options
+    isol_cpus = k_cpu_opts.get('isolate-cpus')
+    if isol_cpus:
+        cmdline_options.append(f'isolcpus={isol_cpus}')
+
+    nohz_full = k_cpu_opts.get('nohz-full')
+    if nohz_full:
+        cmdline_options.append(f'nohz_full={nohz_full}')
+
+    rcu_nocbs = k_cpu_opts.get('rcu-no-cbs')
+    if rcu_nocbs:
+        cmdline_options.append(f'rcu_nocbs={rcu_nocbs}')
+
+    if 'disable-nmi-watchdog' in k_cpu_opts:
+        cmdline_options.append('nmi_watchdog=0')
+
+    # Memory options
+    if 'disable-numa-balancing' in k_memory_opts:
+        cmdline_options.append('numa_balancing=disable')
+
+    default_hp_size = k_memory_opts.get('default-hugepage-size')
+    if default_hp_size:
+        cmdline_options.append(f'default_hugepagesz={default_hp_size}')
+
+    hp_sizes = k_memory_opts.get('hugepage-size')
+    if hp_sizes:
+        for size, settings in hp_sizes.items():
+            cmdline_options.append(f'hugepagesz={size}')
+            count = settings.get('hugepage-count')
+            if count:
+                cmdline_options.append(f'hugepages={count}')
+
+    return cmdline_options
 
 def configure_authentication(config_file: str, password: str) -> None:
     """Write encrypted password to config file
@@ -480,10 +606,7 @@ def configure_authentication(config_file: str, password: str) -> None:
     plaintext exposed
     """
     encrypted_password = linux_context.hash(password)
-
-    with open(config_file) as f:
-        config_string = f.read()
-
+    config_string = read_file(config_file)
     config = ConfigTree(config_string)
     config.set([
         'system', 'login', 'user', 'vyos', 'authentication',
@@ -492,6 +615,49 @@ def configure_authentication(config_file: str, password: str) -> None:
                value=encrypted_password,
                replace=True)
     config.set_tag(['system', 'login', 'user'])
+
+    with open(config_file, 'w') as f:
+        f.write(config.to_string())
+
+def configure_serial_console(config_file: str, console_type: str) -> None:
+    """Apply serial console settings to config.boot from kernel cmdline.
+
+    This overlaps with 05-serial_console.py activation logic, but that script
+    only runs during live boot. During installation, the user may pick a
+    different source config, so serial console settings must be written to
+    the final target config explicitly.
+
+    Behavior:
+    - Reads the kernel serial console device/speed from the current boot cmdline.
+    - If the detected device is a valid tty, writes:
+        system console device <TTY> speed <rate>
+    - If "console_type == 'S'", also writes:
+        system console device <TTY> kernel
+
+    Args:
+        config_file (str): path of target config file
+        console_type (str): 'K' (KVM/tty) or 'S' (serial)
+    """
+    from vyos.utils.serial import is_tty
+    from vyos.utils.kernel import get_kernel_serial_console
+
+    # Parse current kernel cmdline and continue only for valid serial console
+    # data. Prevent writing incomplete/invalid console settings to config.boot.
+    k_console_type, k_console_num, k_console_speed = get_kernel_serial_console()
+    device = f'{k_console_type}{k_console_num}'
+    if not is_tty(device) or not k_console_speed:
+        return
+
+    base = ['system', 'console', 'device']
+    config_string = read_file(config_file)
+    config = ConfigTree(config_string)
+    config.set(base + [device, 'speed'], value=k_console_speed)
+    config.set_tag(base)
+
+    # Only mark this device as kernel boot console when console_type 'S' for
+    # serial was defined by user.
+    if console_type == 'S':
+        config.set(base + [device, 'kernel'])
 
     with open(config_file, 'w') as f:
         f.write(config.to_string())
@@ -505,7 +671,6 @@ def validate_signature(file_path: str, sign_type: str) -> None:
     """
     print('Validating signature')
     signature_valid: bool = False
-    # validate with minisig
     if sign_type == 'minisig':
         pub_key_list = glob('/usr/share/vyos/keys/*.minisign.pub')
         for pubkey in pub_key_list:
@@ -514,11 +679,8 @@ def validate_signature(file_path: str, sign_type: str) -> None:
                 signature_valid = True
                 break
         Path(f'{file_path}.minisig').unlink()
-    # validate with GPG
-    if sign_type == 'asc':
-        if run(f'gpg --verify ${file_path}.asc ${file_path}') == 0:
-            signature_valid = True
-        Path(f'{file_path}.asc').unlink()
+    else:
+        exit(MSG_ERR_UNSUPPORTED_SIGNATURE_TYPE)
 
     # warn or pass
     if not signature_valid:
@@ -528,21 +690,18 @@ def validate_signature(file_path: str, sign_type: str) -> None:
         print('Signature is valid')
 
 def download_file(local_file: str, remote_path: str, vrf: str,
-                  username: str, password: str,
                   progressbar: bool = False, check_space: bool = False):
-    environ['REMOTE_USERNAME'] = username
-    environ['REMOTE_PASSWORD'] = password
+    # Server credentials are implicitly passed in environment variables
+    # that are set by add_image
     if vrf is None:
         download(local_file, remote_path, progressbar=progressbar,
                  check_space=check_space, raise_error=True)
     else:
-        remote_auth = f'REMOTE_USERNAME={username} REMOTE_PASSWORD={password}'
         vrf_cmd = f'ip vrf exec {vrf} {external_download_script} \
                     --local-file {local_file} --remote-path {remote_path}'
-        cmd(vrf_cmd, auth=remote_auth)
+        cmd(vrf_cmd, env=environ)
 
 def image_fetch(image_path: str, vrf: str = None,
-                username: str = '', password: str = '',
                 no_prompt: bool = False) -> Path:
     """Fetch an ISO image
 
@@ -561,9 +720,8 @@ def image_fetch(image_path: str, vrf: str = None,
     if image_path == 'latest':
         command = external_latest_image_url_script
         if vrf:
-            command = f'REMOTE_USERNAME={username} REMOTE_PASSWORD={password} \
-                        ip vrf exec {vrf} ' + command
-        code, output = rc_cmd(command)
+            command = f'ip vrf exec {vrf} {command}'
+        code, output = rc_cmd(command, env=environ)
         if code:
             print(output)
             exit(MSG_INFO_INSTALL_EXIT)
@@ -572,24 +730,25 @@ def image_fetch(image_path: str, vrf: str = None,
     try:
         # check a type of path
         if urlparse(image_path).scheme:
-            # download an image
+            # Download the image file
             ISO_DOWNLOAD_PATH = os.path.join(os.path.expanduser("~"), '{0}.iso'.format(uuid4()))
             download_file(ISO_DOWNLOAD_PATH, image_path, vrf,
-                          username, password,
                           progressbar=True, check_space=True)
 
-            # download a signature
+            # Download the image signature
+            # VyOS only supports minisign signatures at the moment,
+            # but we keep the logic for multiple signatures
+            # in case we add something new in the future
             sign_file = (False, '')
-            for sign_type in ['minisig', 'asc']:
+            for sign_type in ['minisig']:
                 try:
                     download_file(f'{ISO_DOWNLOAD_PATH}.{sign_type}',
-                                  f'{image_path}.{sign_type}', vrf,
-                                  username, password)
+                                  f'{image_path}.{sign_type}', vrf)
                     sign_file = (True, sign_type)
                     break
                 except Exception:
-                    print(f'{sign_type} signature is not available')
-            # validate a signature if it is available
+                    print(f'Could not download {sign_type} signature')
+            # Validate the signature if it is available
             if sign_file[0]:
                 validate_signature(ISO_DOWNLOAD_PATH, sign_file[1])
             else:
@@ -616,7 +775,7 @@ def migrate_config() -> bool:
     Returns:
         bool: user's decision
     """
-    active_config_path: Path = Path('/opt/vyatta/etc/config/config.boot')
+    active_config_path: Path = Path(f'{DIR_CONFIG}/config.boot')
     if active_config_path.exists():
         if ask_yes_no(MSG_INPUT_CONFIG_FOUND, default=True):
             return True
@@ -634,6 +793,20 @@ def copy_ssh_host_keys() -> bool:
     return False
 
 
+def copy_ssh_known_hosts() -> bool:
+    """Ask user to copy SSH `known_hosts` files
+
+    Returns:
+        bool: user's decision
+    """
+    known_hosts_files = get_known_hosts_files()
+    msg = (
+        'Would you like to save the SSH known hosts (fingerprints) '
+        'from your current configuration?'
+    )
+    return known_hosts_files and ask_yes_no(msg, default=True)
+
+
 def console_hint() -> str:
     pid = getppid() if 'SUDO_USER' in environ else getpid()
     try:
@@ -642,11 +815,10 @@ def console_hint() -> str:
         path = '/dev/tty'
 
     name = Path(path).name
-    if name == 'ttyS0':
+    if name.startswith(('ttyS', 'ttyAMA')):
         return 'S'
     else:
         return 'K'
-
 
 def cleanup(mounts: list[str] = [], remove_items: list[str] = []) -> None:
     """Clean up after installation
@@ -774,23 +946,34 @@ def install_image() -> None:
             break
         print(MSG_WARN_IMAGE_NAME_WRONG)
 
+    failed_check_status = [EPasswdStrength.WEAK, EPasswdStrength.ERROR]
     # ask for password
     while True:
         user_password: str = ask_input(MSG_INPUT_PASSWORD, no_echo=True,
                                        non_empty=True)
+
+        if user_password == DEFAULT_PASSWORD:
+            Warning(MSG_WARN_CHANGE_PASSWORD)
+        else:
+            result = evaluate_strength(user_password)
+            if result['strength'] in failed_check_status:
+                Warning(result['error'])
+
         confirm: str = ask_input(MSG_INPUT_PASSWORD_CONFIRM, no_echo=True,
                                  non_empty=True)
+
         if user_password == confirm:
             break
+
         print(MSG_WARN_PASSWORD_CONFIRM)
 
     # ask for default console
+    console_dict: dict[str, str] = {'K': 'tty', 'S': flavor_sercon_type}
     console_type: str = ask_input(MSG_INPUT_CONSOLE_TYPE,
                                   default=console_hint(),
-                                  valid_responses=['K', 'S'])
-    console_dict: dict[str, str] = {'K': 'tty', 'S': 'ttyS'}
+                                  valid_responses=console_dict.keys())
 
-    config_boot_list = ['/opt/vyatta/etc/config/config.boot',
+    config_boot_list = [f'{DIR_CONFIG}/config.boot',
                         '/opt/vyatta/etc/config.boot.default']
     default_config = config_boot_list[0]
 
@@ -823,10 +1006,10 @@ def install_image() -> None:
             Path(f'{DIR_DST_ROOT}/boot/efi').mkdir(parents=True)
             disk.partition_mount(install_target.partition['efi'], f'{DIR_DST_ROOT}/boot/efi')
 
-        # a config dir. It is the deepest one, so the comand will
+        # a config dir. It is the deepest one, so the command will
         # create all the rest in a single step
         print('Creating a configuration file')
-        target_config_dir: str = f'{DIR_DST_ROOT}/boot/{image_name}/rw/opt/vyatta/etc/config/'
+        target_config_dir: str = f'{DIR_DST_ROOT}/boot/{image_name}/rw{DIR_CONFIG}/'
         Path(target_config_dir).mkdir(parents=True)
         chown(target_config_dir, group='vyattacfg')
         chmod_2775(target_config_dir)
@@ -859,6 +1042,14 @@ def install_image() -> None:
             write_dir: str = f'{DIR_DST_ROOT}/boot/{image_name}/rw'
             raid.update_default(write_dir)
 
+        # set activation hint
+        target_data_dir: str = f'{DIR_DST_ROOT}/boot/{image_name}/rw{DIR_DATA}/'
+        data_path = Path(target_data_dir)
+        data_path.mkdir(parents=True)
+        data_path.chmod(0o755)
+        init_hint = data_path.joinpath(Path(activation_hint).name)
+        init_hint.touch()
+
         setup_grub(DIR_DST_ROOT)
         # add information about version
         grub.create_structure()
@@ -878,8 +1069,7 @@ def install_image() -> None:
             for disk_target in l:
                 disk.partition_mount(disk_target.partition['efi'], f'{DIR_DST_ROOT}/boot/efi')
                 grub.install(disk_target.name, f'{DIR_DST_ROOT}/boot/',
-                             f'{DIR_DST_ROOT}/boot/efi',
-                             id=f'VyOS (RAID disk {l.index(disk_target) + 1})')
+                             f'{DIR_DST_ROOT}/boot/efi')
                 disk.partition_umount(disk_target.partition['efi'])
         else:
             print('Installing GRUB to the drive')
@@ -905,7 +1095,7 @@ def install_image() -> None:
 
     except Exception as err:
         print(f'Unable to install VyOS: {err}')
-        # unmount filesystems and clenup
+        # unmount filesystems and cleanup
         try:
             if install_target is not None:
                 if is_raid_install(install_target):
@@ -920,6 +1110,55 @@ def install_image() -> None:
         exit(1)
 
 
+def get_known_hosts_files(for_root=True, for_users=True) -> list:
+    """Collect all existing `known_hosts` files for root and/or users under /home"""
+
+    files = []
+
+    if for_root:
+        base_files = ('/root/.ssh/known_hosts', '/etc/ssh/ssh_known_hosts')
+        for file_path in base_files:
+            root_known_hosts = Path(file_path)
+            if root_known_hosts.exists():
+                files.append(root_known_hosts)
+
+    if for_users:  # for each non-system user
+        for user in get_local_users():
+            home_dir = Path(get_user_home_dir(user))
+            if home_dir.exists():
+                known_hosts = home_dir / '.ssh' / 'known_hosts'
+                if known_hosts.exists():
+                    files.append(known_hosts)
+
+    return files
+
+
+def migrate_known_hosts(target_dir: str):
+    """Copy `known_hosts` for root and all users to the new image directory"""
+
+    def _mkdir_and_copy_file(known_hosts_file, target_known_hosts):
+        target_known_hosts.parent.mkdir(parents=True, exist_ok=True)
+        copy(known_hosts_file, target_known_hosts)
+
+    # Copy root only files using default path
+    known_hosts_files = get_known_hosts_files(for_root=True, for_users=False)
+    for known_hosts_file in known_hosts_files:
+        target_known_hosts = Path(f'{target_dir}{known_hosts_file}')
+        _mkdir_and_copy_file(known_hosts_file, target_known_hosts)
+
+    # During image installation, backup critical user-specific files (e.g., known_hosts)
+    # from each user's home directory into /var/.users_backups/{user}. This ensures that their
+    # SSH configuration and trust relationships are preserved across system re-installations
+    # or provisioning.
+    # More details: https://github.com/vyos/vyos-1x/pull/4678#pullrequestreview-3169648265
+    known_hosts_files = get_known_hosts_files(for_root=False, for_users=True)
+    for known_hosts_file in known_hosts_files:
+        username = known_hosts_file.parent.parent.name
+        base_dir = Path(f'{target_dir}/var/.users_backups/{username}')
+        target_known_hosts = base_dir / '.ssh' / 'known_hosts'
+        _mkdir_and_copy_file(known_hosts_file, target_known_hosts)
+
+
 @compat.grub_cfg_update
 def add_image(image_path: str, vrf: str = None, username: str = '',
               password: str = '', no_prompt: bool = False, force: bool = False) -> None:
@@ -931,8 +1170,26 @@ def add_image(image_path: str, vrf: str = None, username: str = '',
     if image.is_live_boot():
         exit(MSG_ERR_LIVE)
 
+    # Trying to upgrade with insufficient space can break the system.
+    # It's better to be on the safe side:
+    # our images are a bit below 1G,
+    # so one gigabyte to download the image plus one more to install it
+    # sounds like a sensible estimate.
+    if disk_usage('/').free < (2 * 1024**3):
+        exit(MSG_ERR_NOT_ENOUGH_SPACE)
+
+    if unsaved_commits():
+        if not no_prompt:
+            if not ask_yes_no(MSG_INPUT_UNSAVED_COMMITS, default=False):
+                exit()
+        else:
+            exit(MSG_ERR_UNSAVED_COMMITS)
+
+    environ['REMOTE_USERNAME'] = username
+    environ['REMOTE_PASSWORD'] = password
+
     # fetch an image
-    iso_path: Path = image_fetch(image_path, vrf, username, password, no_prompt)
+    iso_path: Path = image_fetch(image_path, vrf, no_prompt)
     try:
         # mount an ISO
         Path(DIR_ISO_MOUNT).mkdir(mode=0o755, parents=True)
@@ -965,8 +1222,12 @@ def add_image(image_path: str, vrf: str = None, username: str = '',
                 f'Adding image would downgrade image tools to v.{cfg_ver}; disallowed')
 
         if not no_prompt:
+            versions = grub.version_list()
             while True:
                 image_name: str = ask_input(MSG_INPUT_IMAGE_NAME, version_name)
+                if image_name in versions:
+                    print(MSG_INPUT_IMAGE_NAME_TAKEN)
+                    continue
                 if image.validate_name(image_name):
                     break
                 print(MSG_WARN_IMAGE_NAME_WRONG)
@@ -978,18 +1239,45 @@ def add_image(image_path: str, vrf: str = None, username: str = '',
         # find target directory
         root_dir: str = disk.find_persistence()
 
-        # a config dir. It is the deepest one, so the comand will
+        cmdline_options = []
+
+        # a config dir. It is the deepest one, so the command will
         # create all the rest in a single step
-        target_config_dir: str = f'{root_dir}/boot/{image_name}/rw/opt/vyatta/etc/config/'
+        target_config_dir: str = f'{root_dir}/boot/{image_name}/rw{DIR_CONFIG}/'
         # copy config
         if no_prompt or migrate_config():
-            print('Copying configuration directory')
-            # copytree preserves perms but not ownership:
-            Path(target_config_dir).mkdir(parents=True)
-            chown(target_config_dir, group='vyattacfg')
-            chmod_2775(target_config_dir)
-            copytree('/opt/vyatta/etc/config/', target_config_dir,
-                     copy_function=copy_preserve_owner, dirs_exist_ok=True)
+            if Path('/dev/mapper/vyos_config').exists():
+                print('Copying encrypted configuration volume')
+
+                # Record information from which image we upgraded to the new one.
+                # This can be used for a future automatic rollback into the old image.
+                #
+                # For encrypted config, we need to copy, sync filesystems and remove from current image
+                tmp = {'previous_image' : image.get_running_image()}
+                write_file('/opt/vyatta/etc/config/first_boot', dumps(tmp))
+                sync()
+
+                # Copy encrypted volumes
+                current_name = image.get_running_image()
+                current_config_path = f'{root_dir}/luks/{current_name}'
+                target_config_path = f'{root_dir}/luks/{image_name}'
+                copy(current_config_path, target_config_path)
+
+                # Now remove from current image
+                Path('/opt/vyatta/etc/config/first_boot').unlink()
+            else:
+                print('Copying configuration directory')
+                # copytree preserves perms but not ownership:
+                Path(target_config_dir).mkdir(parents=True)
+                chown(target_config_dir, group='vyattacfg')
+                chmod_2775(target_config_dir)
+                copytree(f'{DIR_CONFIG}/', target_config_dir, symlinks=True,
+                        copy_function=copy_preserve_owner, dirs_exist_ok=True)
+
+                # Record information from which image we upgraded to the new one.
+                # This can be used for a future automatic rollback into the old image.
+                tmp = {'previous_image' : image.get_running_image()}
+                write_file(f'{target_config_dir}/first_boot', dumps(tmp))
         else:
             Path(target_config_dir).mkdir(parents=True)
             chown(target_config_dir, group='vyattacfg')
@@ -1003,6 +1291,11 @@ def add_image(image_path: str, vrf: str = None, username: str = '',
             host_keys: list[str] = glob('/etc/ssh/ssh_host*')
             for host_key in host_keys:
                 copy(host_key, target_ssh_dir)
+
+        target_ssh_known_hosts_dir: str = f'{root_dir}/boot/{image_name}/rw'
+        if no_prompt or copy_ssh_known_hosts():
+            print('Copying SSH known_hosts files')
+            migrate_known_hosts(target_ssh_known_hosts_dir)
 
         # copy system image and kernel files
         print('Copying system image files')
@@ -1020,6 +1313,13 @@ def add_image(image_path: str, vrf: str = None, username: str = '',
         grub.version_add(image_name, root_dir)
         if set_as_default:
             grub.set_default(image_name, root_dir)
+
+        if Path(f'{target_config_dir}/config.boot').exists():
+            cmdline_options = get_cli_kernel_options(
+                f'{target_config_dir}/config.boot')
+            grub_util.update_kernel_cmdline_options(' '.join(cmdline_options),
+                                                    root_dir=root_dir,
+                                                    version=image_name)
 
     except OSError as e:
         # if no space error, remove image dir and cleanup

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2018-2024 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -191,7 +191,7 @@ def _get_formatted_statistics_output(data: list) -> str:
     Prepare formatted statistics output from the given data.
 
     Args:
-        data (list): A list of dictionaries containing vrrp grop information
+        data (list): A list of dictionaries containing vrrp group information
             and statistics.
 
     Returns:
@@ -228,7 +228,7 @@ def _get_formatted_detail_output(data: list) -> str:
     Prepare formatted detail information output from the given data.
 
     Args:
-        data (list): A list of dictionaries containing vrrp grop information
+        data (list): A list of dictionaries containing vrrp group information
             and statistics.
 
     Returns:

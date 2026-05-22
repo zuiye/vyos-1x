@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2022-2023 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -23,7 +23,6 @@ from vyos.utils.process import process_named_running
 from vyos.utils.file import read_file
 from vyos.utils.process import cmd
 
-PROCESS_NAME = 'salt-minion'
 SALT_CONF = '/etc/salt/minion'
 base_path = ['service', 'salt-minion']
 
@@ -47,7 +46,7 @@ class TestServiceSALT(VyOSUnitTestSHIM.TestCase):
 
     def tearDown(self):
         # Check for running process
-        self.assertTrue(process_named_running(PROCESS_NAME))
+        self.assertTrue(process_named_running('python3.11', '/usr/bin/salt-minion'))
 
         # delete testing SALT config
         self.cli_delete(base_path)
@@ -57,7 +56,9 @@ class TestServiceSALT(VyOSUnitTestSHIM.TestCase):
         # from the CI) salt-minion process is not killed by systemd. Apparently
         # no issue on VMWare.
         if cmd('systemd-detect-virt') != 'kvm':
-            self.assertFalse(process_named_running(PROCESS_NAME))
+            self.assertFalse(process_named_running('python3.11', '/usr/bin/salt-minion'))
+        # always forward to base class
+        super().tearDown()
 
     def test_default(self):
         servers = ['192.0.2.1', '192.0.2.2']
@@ -102,4 +103,4 @@ class TestServiceSALT(VyOSUnitTestSHIM.TestCase):
         self.assertIn(f'source_interface_name: {interface}', conf)
 
 if __name__ == '__main__':
-    unittest.main(verbosity=2)
+    unittest.main(verbosity=2, failfast=VyOSUnitTestSHIM.TestCase.debug_on())

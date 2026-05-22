@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2020-2023 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -26,6 +26,7 @@ from vyos.xml_ref import default_value
 base_path = ['service', 'mdns', 'repeater']
 intf_base = ['interfaces', 'dummy']
 config_file = '/run/avahi-daemon/avahi-daemon.conf'
+PROCESS_NAME = 'avahi-daemon'
 
 class TestServiceMDNSrepeater(VyOSUnitTestSHIM.TestCase):
     @classmethod
@@ -57,13 +58,13 @@ class TestServiceMDNSrepeater(VyOSUnitTestSHIM.TestCase):
 
     def tearDown(self):
         # Check for running process
-        self.assertTrue(process_named_running('avahi-daemon'))
-
+        self.assertTrue(process_named_running(PROCESS_NAME))
         self.cli_delete(base_path)
         self.cli_commit()
-
         # Check that there is no longer a running process
-        self.assertFalse(process_named_running('avahi-daemon'))
+        self.assertFalse(process_named_running(PROCESS_NAME))
+        # always forward to base class
+        super().tearDown()
 
     def test_service_dual_stack(self):
         # mDNS browsing domains in addition to the default one (local)
@@ -101,7 +102,7 @@ class TestServiceMDNSrepeater(VyOSUnitTestSHIM.TestCase):
         self.cli_set(base_path + ['interface', 'dum10'])
         self.cli_set(base_path + ['interface', 'dum40'])
 
-        # exception is raised if partcipating interfaces do not have IPv4 address
+        # exception is raised if participating interfaces do not have IPv4 address
         with self.assertRaises(ConfigSessionError):
             self.cli_commit()
         self.cli_delete(base_path + ['interface', 'dum40'])
@@ -118,12 +119,12 @@ class TestServiceMDNSrepeater(VyOSUnitTestSHIM.TestCase):
         self.assertEqual(conf['reflector']['enable-reflector'], 'yes')
 
     def test_service_ipv6(self):
-        # partcipating interfaces should have IPv6 addresses
+        # participating interfaces should have IPv6 addresses
         self.cli_set(base_path + ['ip-version', 'ipv6'])
         self.cli_set(base_path + ['interface', 'dum10'])
         self.cli_set(base_path + ['interface', 'dum30'])
 
-        # exception is raised if partcipating interfaces do not have IPv4 address
+        # exception is raised if participating interfaces do not have IPv4 address
         with self.assertRaises(ConfigSessionError):
             self.cli_commit()
         self.cli_delete(base_path + ['interface', 'dum10'])
@@ -173,4 +174,4 @@ class TestServiceMDNSrepeater(VyOSUnitTestSHIM.TestCase):
         self.assertEqual(conf['server']['cache-entries-max'], cache_entries)
 
 if __name__ == '__main__':
-    unittest.main(verbosity=2)
+    unittest.main(verbosity=2, failfast=VyOSUnitTestSHIM.TestCase.debug_on())

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2019-2024 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -80,7 +80,7 @@ service_file = '/run/systemd/system/openvpn@{ifname}.service.d/20-override.conf'
 
 def get_config(config=None):
     """
-    Retrive CLI config as dictionary. Dictionary can never be empty, as at least the
+    Retrieve CLI config as dictionary. Dictionary can never be empty, as at least the
     interface name will be added or a deleted flag
     """
     if config:
@@ -167,6 +167,12 @@ def is_ec_private_key(pki, cert_name):
 
     key = load_private_key(pki_cert['private']['key'])
     return isinstance(key, ec.EllipticCurvePrivateKey)
+
+
+def verify_data_ciphers_fallback(openvpn):
+    if openvpn['mode'] != 'site-to-site':
+        if dict_search('encryption.data_ciphers_fallback', openvpn):
+            raise ConfigError('Cipher fallback is valid only in site-to-site mode')
 
 def verify_pki(openvpn):
     pki = openvpn['pki']
@@ -360,6 +366,11 @@ def verify(openvpn):
 
         if dict_search('encryption.data_ciphers', openvpn):
             raise ConfigError('Cipher negotiation can only be used in client or server mode')
+
+        if not dict_search('encryption.cipher', openvpn) and \
+           not dict_search('encryption.data_ciphers_fallback', openvpn):
+            raise ConfigError('Must define "encryption cipher" or "encryption ' \
+                              'data-ciphers-fallback" for site-to-site encryption!')
 
     else:
         # checks for client-server or site-to-site bridged
@@ -615,6 +626,8 @@ def verify(openvpn):
     verify_bond_bridge_member(openvpn)
     verify_mirror_redirect(openvpn)
 
+    verify_data_ciphers_fallback(openvpn)
+
     return None
 
 def generate_pki_files(openvpn):
@@ -734,7 +747,7 @@ def generate(openvpn):
     # create client config directory on demand
     makedir(ccd_dir, user, group)
 
-    # Fix file permissons for keys
+    # Fix file permissions for keys
     generate_pki_files(openvpn)
 
     # Generate User/Password authentication file
@@ -785,7 +798,7 @@ def apply(openvpn):
             VTunIf(interface).remove()
 
     # dynamically load/unload DCO Kernel extension if requested
-    dco_module = 'ovpn_dco_v2'
+    dco_module = 'ovpn'
     if 'module_load_dco' in openvpn:
         check_kmod(dco_module)
     else:

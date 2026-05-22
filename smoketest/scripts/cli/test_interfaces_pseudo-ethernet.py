@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2020-2022 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -17,8 +17,10 @@
 import os
 import unittest
 
-from vyos.ifconfig import Section
 from base_interfaces_test import BasicInterfaceTest
+from base_vyostest_shim import VyOSUnitTestSHIM
+
+from vyos.ifconfig import Section
 
 class PEthInterfaceTest(BasicInterfaceTest.TestCase):
     @classmethod
@@ -43,4 +45,4 @@ class PEthInterfaceTest(BasicInterfaceTest.TestCase):
         super(PEthInterfaceTest, cls).setUpClass()
 
 if __name__ == '__main__':
-    unittest.main(verbosity=2)
+    unittest.main(verbosity=2, failfast=VyOSUnitTestSHIM.TestCase.debug_on())

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2022-2023 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -86,6 +86,8 @@ class TestQoS(VyOSUnitTestSHIM.TestCase):
         # delete testing SSH config
         self.cli_delete(base_path)
         self.cli_commit()
+        # always forward to base class
+        super().tearDown()
 
     def test_01_cake(self):
         bandwidth = 1000000
@@ -242,7 +244,7 @@ class TestQoS(VyOSUnitTestSHIM.TestCase):
             self.assertEqual(flows, tmp['options']['flows'])
             self.assertEqual(queue_limit, tmp['options']['limit'])
 
-            # due to internal rounding we need to substract 1 from interval and target after converting to milliseconds
+            # due to internal rounding we need to subtract 1 from interval and target after converting to milliseconds
             # configuration of:
             # tc qdisc add dev eth0 root fq_codel quantum 1500 flows 512 interval 100ms limit 2048 target 5ms noecn
             # results in: tc -j qdisc show dev eth0
@@ -355,10 +357,10 @@ class TestQoS(VyOSUnitTestSHIM.TestCase):
 
             tc_details = get_tc_filter_details(interface, 'ingress')
             self.assertTrue('filter parent ffff: protocol all pref 20 u32 chain 0' in tc_details)
-            self.assertTrue('rate 1Gbit burst 15125b mtu 2Kb action drop overhead 0b linklayer ethernet' in tc_details)
+            self.assertTrue('rate 1Gbit burst 15Kb mtu 2Kb action drop overhead 0b linklayer ethernet' in tc_details)
             self.assertTrue('filter parent ffff: protocol all pref 15 u32 chain 0' in tc_details)
-            self.assertTrue('rate 3Gbit burst 102000b mtu 1600b action pipe/continue overhead 0b linklayer ethernet' in tc_details)
-            self.assertTrue('rate 500Mbit burst 204687b mtu 3000b action drop overhead 0b linklayer ethernet' in tc_details)
+            self.assertTrue('rate 3Gbit burst 100Kb mtu 1600b action pipe/continue overhead 0b linklayer ethernet' in tc_details)
+            self.assertTrue('rate 500Mbit burst 200Kb mtu 3000b action drop overhead 0b linklayer ethernet' in tc_details)
             self.assertTrue('filter parent ffff: protocol all pref 255 basic chain 0' in tc_details)
 
     def test_06_network_emulator(self):
@@ -773,7 +775,7 @@ class TestQoS(VyOSUnitTestSHIM.TestCase):
         tc_filters = cmd(f'tc filter show dev {self._interfaces[0]} ingress')
         # class 100
         self.assertIn('filter parent ffff: protocol all pref 20 fw chain 0', tc_filters)
-        self.assertIn('action order 1:  police 0x1 rate 20Gbit burst 3847500b mtu 2Kb action drop overhead 0b', tc_filters)
+        self.assertIn('action order 1:  police 0x1 rate 20Gbit burst 3760Kb mtu 2Kb action drop overhead 0b', tc_filters)
         # default
         self.assertIn('filter parent ffff: protocol all pref 255 basic chain 0', tc_filters)
         self.assertIn('action order 1:  police 0x2 rate 1Gbit burst 125000000b mtu 2Kb action drop overhead 0b', tc_filters)
@@ -884,6 +886,8 @@ class TestQoS(VyOSUnitTestSHIM.TestCase):
             base_path + ['policy', 'cake', policy_name, 'bandwidth', str(bandwidth)]
         )
         self.cli_set(base_path + ['policy', 'cake', policy_name, 'rtt', str(rtt)])
+        self.cli_set(base_path + ['policy', 'cake', policy_name, 'no-split-gso'])
+        self.cli_set(base_path + ['policy', 'cake', policy_name, 'ack-filter', 'aggressive'])
 
         # commit changes
         self.cli_commit()
@@ -899,6 +903,23 @@ class TestQoS(VyOSUnitTestSHIM.TestCase):
         self.assertFalse(tmp['options']['ingress'])
         self.assertFalse(tmp['options']['nat'])
         self.assertTrue(tmp['options']['raw'])
+        self.assertFalse(tmp['options']['split_gso'])
+        self.assertEqual(tmp['options']['ack-filter'], 'aggressive')
+
+        self.cli_delete(base_path + ['policy', 'cake', policy_name, 'ack-filter', 'aggressive'])
+        self.cli_commit()
+        tmp = get_tc_qdisc_json(interface)
+        self.assertEqual(tmp['options']['ack-filter'], 'enabled')
+
+        self.cli_delete(base_path + ['policy', 'cake', policy_name, 'ack-filter'])
+        self.cli_commit()
+        tmp = get_tc_qdisc_json(interface)
+        self.assertEqual(tmp['options']['ack-filter'], 'disabled')
+
+        self.cli_delete(base_path + ['policy', 'cake', policy_name, 'no-split-gso'])
+        self.cli_commit()
+        tmp = get_tc_qdisc_json(interface)
+        self.assertTrue(tmp['options']['split_gso'])
 
         nat = True
         for flow_isolation in [
@@ -1232,7 +1253,7 @@ class TestQoS(VyOSUnitTestSHIM.TestCase):
         # class 100
         self.assertIn('filter parent ffff: protocol all pref 20 basic chain 0', tc_filters)
         self.assertIn(f'meta(rt_iif eq {iif})', tc_filters)
-        self.assertIn('action order 1:  police 0x1 rate 20Gbit burst 3847500b mtu 2Kb action drop overhead 0b', tc_filters)
+        self.assertIn('action order 1:  police 0x1 rate 20Gbit burst 3760Kb mtu 2Kb action drop overhead 0b', tc_filters)
         # default
         self.assertIn('filter parent ffff: protocol all pref 255 basic chain 0', tc_filters)
         self.assertIn('action order 1:  police 0x2 rate 1Gbit burst 125000000b mtu 2Kb action drop overhead 0b', tc_filters)
@@ -1305,4 +1326,4 @@ class TestQoS(VyOSUnitTestSHIM.TestCase):
 
 
 if __name__ == '__main__':
-    unittest.main(verbosity=2)
+    unittest.main(verbosity=2, failfast=VyOSUnitTestSHIM.TestCase.debug_on())

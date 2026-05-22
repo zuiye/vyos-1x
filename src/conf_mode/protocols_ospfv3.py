@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2021-2024 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -48,8 +48,9 @@ def verify(config_dict):
     if 'vrf_context' in config_dict:
         vrf = config_dict['vrf_context']
 
-    # eqivalent of the C foo ? 'a' : 'b' statement
-    ospfv3 = vrf and config_dict['vrf']['name'][vrf]['protocols']['ospfv3'] or config_dict['ospfv3']
+    # equivalent of the C foo ? 'a' : 'b' statement
+    ospfv3 = vrf and dict_search(f'vrf.name.{vrf}.protocols.ospfv3',
+                                 config_dict) or config_dict['ospfv3']
     ospfv3['policy'] = config_dict['policy']
 
     verify_common_route_maps(ospfv3)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2022-2024 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -20,6 +20,7 @@ from sys import argv
 from vyos.config import Config
 from vyos.configverify import has_frr_protocol_in_dict
 from vyos.configverify import verify_vrf
+from vyos.utils.dict import dict_search
 from vyos.utils.process import is_systemd_service_running
 from vyos.frrender import FRRender
 from vyos.frrender import get_frrender_dict
@@ -43,8 +44,9 @@ def verify(config_dict):
     if 'vrf_context' in config_dict:
         vrf = config_dict['vrf_context']
 
-    # eqivalent of the C foo ? 'a' : 'b' statement
-    eigrp = vrf and config_dict['vrf']['name'][vrf]['protocols']['eigrp'] or config_dict['eigrp']
+    # equivalent of the C foo ? 'a' : 'b' statement
+    eigrp = vrf and dict_search(f'vrf.name.{vrf}.protocols.eigrp',
+                                 config_dict) or config_dict['eigrp']
     eigrp['policy'] = config_dict['policy']
 
     if 'system_as' not in eigrp:

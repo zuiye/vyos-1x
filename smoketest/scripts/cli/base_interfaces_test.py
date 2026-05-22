@@ -1,4 +1,4 @@
-# Copyright (C) 2019-2024 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -13,13 +13,15 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import re
+import jmespath
 
-from netifaces import AF_INET
-from netifaces import AF_INET6
-from netifaces import ifaddresses
+from json import loads
+from netifaces import ifaddresses # pylint: disable = no-name-in-module
+from socket import AF_INET
+from socket import AF_INET6
+from systemd import journal
 
 from base_vyostest_shim import VyOSUnitTestSHIM
-from base_vyostest_shim import CSTORE_GUARD_TIME
 
 from vyos.configsession import ConfigSessionError
 from vyos.defaults import directories
@@ -44,6 +46,8 @@ dhclient_base_dir = directories['isc_dhclient_dir']
 dhclient_process_name = 'dhclient'
 dhcp6c_base_dir = directories['dhcp6_client_dir']
 dhcp6c_process_name = 'dhcp6c'
+
+MSG_TESTCASE_UNSUPPORTED = 'unsupported on interface family'
 
 server_ca_root_cert_data = """
 MIIBcTCCARagAwIBAgIUDcAf1oIQV+6WRaW7NPcSnECQ/lUwCgYIKoZIzj0EAwIw
@@ -118,9 +122,9 @@ def get_certificate_count(interface, cert_type):
     tmp = read_file(f'/run/wpa_supplicant/{interface}_{cert_type}.pem')
     return tmp.count(CERT_BEGIN)
 
-def is_mirrored_to(interface, mirror_if, qdisc):
+def is_mirrored_to(interface, mirror_if, qdisc) -> bool:
     """
-    Ask TC if we are mirroring traffic to a discrete interface.
+    Ask tc(8) if we are mirroring traffic to a specific interface.
 
     interface: source interface
     mirror_if: destination where we mirror our data to
@@ -129,12 +133,12 @@ def is_mirrored_to(interface, mirror_if, qdisc):
     if qdisc not in ['ffff', '1']:
         raise ValueError()
 
-    ret_val = False
-    tmp = cmd(f'tc -s -p filter ls dev {interface} parent {qdisc}: | grep mirred')
-    tmp = tmp.lower()
-    if mirror_if in tmp:
-        ret_val = True
-    return ret_val
+    tmp = loads(cmd(f'tc -json filter ls dev {interface} parent {qdisc}:'))
+    # the following syntax looks odd but we need to filter out the first
+    # result sets from tc which do not have "options.actions...".
+    tmp = jmespath.search("[?options.actions[0].kind=='mirred'].options.actions[0].{mirred_action: mirred_action, to_dev: to_dev} | [0]", tmp)
+    return bool(dict_search('mirred_action', tmp) == 'mirror' and dict_search('to_dev', tmp) == mirror_if)
+
 class BasicInterfaceTest:
     class TestCase(VyOSUnitTestSHIM.TestCase):
         _test_dhcp = False
@@ -157,7 +161,7 @@ class BasicInterfaceTest:
         _test_addr = ['192.0.2.1/26', '192.0.2.255/31', '192.0.2.64/32',
                       '2001:db8:1::ffff/64', '2001:db8:101::1/112']
 
-        _mirror_interfaces = []
+        _mirror_interfaces = ['dum21354']
         # choose IPv6 minimum MTU value for tests - this must always work
         _mtu = '1280'
 
@@ -177,14 +181,12 @@ class BasicInterfaceTest:
             cls._test_ipv6_pd = cli_defined(cls._base_path + ['dhcpv6-options'], 'pd')
             cls._test_mtu = cli_defined(cls._base_path, 'mtu')
             cls._test_vrf = cli_defined(cls._base_path, 'vrf')
+            cls._test_mirror = cli_defined(cls._base_path, 'mirror')
 
             # Setup mirror interfaces for SPAN (Switch Port Analyzer)
             for span in cls._mirror_interfaces:
                 section = Section.section(span)
                 cls.cli_set(cls, ['interfaces', section, span])
-
-            # Enable CSTORE guard time required by FRR related tests
-            cls._commit_guard_time = CSTORE_GUARD_TIME
 
         @classmethod
         def tearDownClass(cls):
@@ -216,9 +218,12 @@ class BasicInterfaceTest:
                 else:
                     self.assertFalse(process_named_running(daemon))
 
+            # always forward to base class
+            super().tearDown()
+
         def test_dhcp_disable_interface(self):
             if not self._test_dhcp:
-                self.skipTest('not supported')
+                self.skipTest(MSG_TESTCASE_UNSUPPORTED)
 
             # When interface is configured as admin down, it must be admin down
             # even when dhcpc starts on the given interface
@@ -241,7 +246,7 @@ class BasicInterfaceTest:
 
         def test_dhcp_client_options(self):
             if not self._test_dhcp or not self._test_vrf:
-                self.skipTest('not supported')
+                self.skipTest(MSG_TESTCASE_UNSUPPORTED)
 
             client_id = 'VyOS-router'
             distance = '100'
@@ -281,7 +286,7 @@ class BasicInterfaceTest:
 
         def test_dhcp_vrf(self):
             if not self._test_dhcp or not self._test_vrf:
-                self.skipTest('not supported')
+                self.skipTest(MSG_TESTCASE_UNSUPPORTED)
 
             cli_default_metric = default_value(self._base_path + [self._interfaces[0],
                                                'dhcp-options', 'default-route-distance'])
@@ -338,7 +343,7 @@ class BasicInterfaceTest:
 
         def test_dhcpv6_vrf(self):
             if not self._test_ipv6_dhcpc6 or not self._test_vrf:
-                self.skipTest('not supported')
+                self.skipTest(MSG_TESTCASE_UNSUPPORTED)
 
             vrf_name = 'purple6'
             self.cli_set(['vrf', 'name', vrf_name, 'table', '65001'])
@@ -390,7 +395,7 @@ class BasicInterfaceTest:
 
         def test_move_interface_between_vrf_instances(self):
             if not self._test_vrf:
-                self.skipTest('not supported')
+                self.skipTest(MSG_TESTCASE_UNSUPPORTED)
 
             vrf1_name = 'smoketest_mgmt1'
             vrf1_table = '5424'
@@ -435,7 +440,7 @@ class BasicInterfaceTest:
 
         def test_add_to_invalid_vrf(self):
             if not self._test_vrf:
-                self.skipTest('not supported')
+                self.skipTest(MSG_TESTCASE_UNSUPPORTED)
 
             # move interface into first VRF
             for interface in self._interfaces:
@@ -452,8 +457,12 @@ class BasicInterfaceTest:
                 self.cli_set(self._base_path + [interface, 'description', 'test_add_to_invalid_vrf'])
 
         def test_span_mirror(self):
-            if not self._mirror_interfaces:
-                self.skipTest('not supported')
+            if not self._test_mirror:
+                self.skipTest(MSG_TESTCASE_UNSUPPORTED)
+
+            for interface in self._interfaces:
+                for option in self._options.get(interface, []):
+                    self.cli_set(self._base_path + [interface] + option.split())
 
             # Check the two-way mirror rules of ingress and egress
             for mirror in self._mirror_interfaces:
@@ -468,6 +477,18 @@ class BasicInterfaceTest:
                 for interface in self._interfaces:
                     self.assertTrue(is_mirrored_to(interface, mirror, 'ffff'))
                     self.assertTrue(is_mirrored_to(interface, mirror, '1'))
+
+            # delete interface mirror - check that configuration from tc is removed
+            for mirror in self._mirror_interfaces:
+                for interface in self._interfaces:
+                    self.cli_delete(self._base_path + [interface, 'mirror'])
+            self.cli_commit()
+
+            # Verify config
+            for mirror in self._mirror_interfaces:
+                for interface in self._interfaces:
+                    self.assertFalse(is_mirrored_to(interface, mirror, 'ffff'))
+                    self.assertFalse(is_mirrored_to(interface, mirror, '1'))
 
         def test_interface_disable(self):
             # Check if description can be added to interface and
@@ -560,9 +581,9 @@ class BasicInterfaceTest:
                         self.assertTrue(is_intf_addr_assigned(intf, addr['addr']))
 
         def test_ipv6_link_local_address(self):
-            # Common function for IPv6 link-local address assignemnts
+            # Common function for IPv6 link-local address assignments
             if not self._test_ipv6:
-                self.skipTest('not supported')
+                self.skipTest(MSG_TESTCASE_UNSUPPORTED)
 
             for interface in self._interfaces:
                 base = self._base_path + [interface]
@@ -593,7 +614,7 @@ class BasicInterfaceTest:
 
         def test_interface_mtu(self):
             if not self._test_mtu:
-                self.skipTest('not supported')
+                self.skipTest(MSG_TESTCASE_UNSUPPORTED)
 
             for intf in self._interfaces:
                 base = self._base_path + [intf]
@@ -612,8 +633,8 @@ class BasicInterfaceTest:
         def test_mtu_1200_no_ipv6_interface(self):
             # Testcase if MTU can be changed to 1200 on non IPv6
             # enabled interfaces
-            if not self._test_mtu:
-                self.skipTest('not supported')
+            if not self._test_mtu or not self._test_ipv6:
+                self.skipTest(MSG_TESTCASE_UNSUPPORTED)
 
             old_mtu = self._mtu
             self._mtu = '1200'
@@ -649,7 +670,7 @@ class BasicInterfaceTest:
             # which creates a wlan0 and wlan1 interface which will fail the
             # tearDown() test in the end that no interface is allowed to survive!
             if not self._test_vlan:
-                self.skipTest('not supported')
+                self.skipTest(MSG_TESTCASE_UNSUPPORTED)
 
             for interface in self._interfaces:
                 base = self._base_path + [interface]
@@ -694,24 +715,27 @@ class BasicInterfaceTest:
             # which creates a wlan0 and wlan1 interface which will fail the
             # tearDown() test in the end that no interface is allowed to survive!
             if not self._test_vlan or not self._test_mtu:
-                self.skipTest('not supported')
+                self.skipTest(MSG_TESTCASE_UNSUPPORTED)
 
-            mtu_1500 = '1500'
-            mtu_9000 = '9000'
+            # Some drivers are limited to an MTU of 1500 byte - e.g. when VyOS
+            # runs on PROXMOX with default bridge settings. We use lower values
+            # for this test which will fit for almost every NIC
+            mtu_1300 = '1300'
+            mtu_1420 = '1420'
 
             for interface in self._interfaces:
                 base = self._base_path + [interface]
-                self.cli_set(base + ['mtu', mtu_1500])
+                self.cli_set(base + ['mtu', mtu_1300])
                 for option in self._options.get(interface, []):
                     self.cli_set(base + option.split())
                     if 'source-interface' in option:
                         iface = option.split()[-1]
                         iface_type = Section.section(iface)
-                        self.cli_set(['interfaces', iface_type, iface, 'mtu', mtu_9000])
+                        self.cli_set(['interfaces', iface_type, iface, 'mtu', mtu_1420])
 
                 for vlan in self._vlan_range:
                     base = self._base_path + [interface, 'vif', vlan]
-                    self.cli_set(base + ['mtu', mtu_9000])
+                    self.cli_set(base + ['mtu', mtu_1420])
 
             # check validate() - Interface MTU "9000" too high, parent interface MTU is "1500"!
             with self.assertRaises(ConfigSessionError):
@@ -720,18 +744,18 @@ class BasicInterfaceTest:
             # Change MTU on base interface to be the same as on the VIF interface
             for interface in self._interfaces:
                 base = self._base_path + [interface]
-                self.cli_set(base + ['mtu', mtu_9000])
+                self.cli_set(base + ['mtu', mtu_1420])
 
             self.cli_commit()
 
             # Verify MTU on base and VIF interfaces
             for interface in self._interfaces:
                 tmp = get_interface_config(interface)
-                self.assertEqual(tmp['mtu'], int(mtu_9000))
+                self.assertEqual(tmp['mtu'], int(mtu_1420))
 
                 for vlan in self._vlan_range:
                     tmp = get_interface_config(f'{interface}.{vlan}')
-                    self.assertEqual(tmp['mtu'], int(mtu_9000))
+                    self.assertEqual(tmp['mtu'], int(mtu_1420))
 
 
         def test_vif_8021q_qos_change(self):
@@ -740,7 +764,7 @@ class BasicInterfaceTest:
             # which creates a wlan0 and wlan1 interface which will fail the
             # tearDown() test in the end that no interface is allowed to survive!
             if not self._test_vlan:
-                self.skipTest('not supported')
+                self.skipTest(MSG_TESTCASE_UNSUPPORTED)
 
             for interface in self._interfaces:
                 base = self._base_path + [interface]
@@ -810,7 +834,7 @@ class BasicInterfaceTest:
         def test_vif_8021q_lower_up_down(self):
             # Testcase for https://vyos.dev/T3349
             if not self._test_vlan:
-                self.skipTest('not supported')
+                self.skipTest(MSG_TESTCASE_UNSUPPORTED)
 
             for interface in self._interfaces:
                 base = self._base_path + [interface]
@@ -850,7 +874,7 @@ class BasicInterfaceTest:
             # which creates a wlan0 and wlan1 interface which will fail the
             # tearDown() test in the end that no interface is allowed to survive!
             if not self._test_qinq:
-                self.skipTest('not supported')
+                self.skipTest(MSG_TESTCASE_UNSUPPORTED)
 
             for interface in self._interfaces:
                 base = self._base_path + [interface]
@@ -917,7 +941,7 @@ class BasicInterfaceTest:
             # which creates a wlan0 and wlan1 interface which will fail the
             # tearDown() test in the end that no interface is allowed to survive!
             if not self._test_qinq:
-                self.skipTest('not supported')
+                self.skipTest(MSG_TESTCASE_UNSUPPORTED)
 
             for interface in self._interfaces:
                 base = self._base_path + [interface]
@@ -955,7 +979,7 @@ class BasicInterfaceTest:
 
         def test_interface_ip_options(self):
             if not self._test_ip:
-                self.skipTest('not supported')
+                self.skipTest(MSG_TESTCASE_UNSUPPORTED)
 
             arp_tmo = '300'
             mss = '1420'
@@ -1057,12 +1081,13 @@ class BasicInterfaceTest:
 
         def test_interface_ipv6_options(self):
             if not self._test_ipv6:
-                self.skipTest('not supported')
+                self.skipTest(MSG_TESTCASE_UNSUPPORTED)
 
             mss = '1400'
             dad_transmits = '10'
             accept_dad = '0'
             source_validation = 'strict'
+            interface_identifier = '::fffe'
 
             for interface in self._interfaces:
                 path = self._base_path + [interface]
@@ -1084,6 +1109,9 @@ class BasicInterfaceTest:
 
                 if cli_defined(self._base_path + ['ipv6'], 'source-validation'):
                     self.cli_set(path + ['ipv6', 'source-validation', source_validation])
+
+                if cli_defined(self._base_path + ['ipv6', 'address'], 'interface-identifier'):
+                    self.cli_set(path + ['ipv6', 'address', 'interface-identifier', interface_identifier])
 
             self.cli_commit()
 
@@ -1116,13 +1144,20 @@ class BasicInterfaceTest:
                             self.assertIn('fib saddr . iif oif 0', line)
                             self.assertIn('drop', line)
 
+                if cli_defined(self._base_path + ['ipv6', 'address'], 'interface-identifier'):
+                    tmp = cmd(f'ip -j token show dev {interface}')
+                    tmp = loads(tmp)[0]
+                    self.assertEqual(tmp['token'], interface_identifier)
+                    self.assertEqual(tmp['ifname'], interface)
+
+
         def test_dhcpv6_client_options(self):
             if not self._test_ipv6_dhcpc6:
-                self.skipTest('not supported')
+                self.skipTest(MSG_TESTCASE_UNSUPPORTED)
 
             duid_base = 10
             for interface in self._interfaces:
-                duid = '00:01:00:01:27:71:db:f0:00:50:00:00:00:{}'.format(duid_base)
+                duid = f'00:01:00:01:27:71:db:f0:00:50:00:00:00:{duid_base}'
                 path = self._base_path + [interface]
                 for option in self._options.get(interface, []):
                     self.cli_set(path + option.split())
@@ -1139,7 +1174,7 @@ class BasicInterfaceTest:
 
             duid_base = 10
             for interface in self._interfaces:
-                duid = '00:01:00:01:27:71:db:f0:00:50:00:00:00:{}'.format(duid_base)
+                duid = f'00:01:00:01:27:71:db:f0:00:50:00:00:00:{duid_base}'
                 dhcpc6_config = read_file(f'{dhcp6c_base_dir}/dhcp6c.{interface}.conf')
                 self.assertIn(f'interface {interface} ' + '{', dhcpc6_config)
                 self.assertIn(f'  request domain-name-servers;', dhcpc6_config)
@@ -1151,16 +1186,25 @@ class BasicInterfaceTest:
                 self.assertIn('};', dhcpc6_config)
                 duid_base += 1
 
+                # T7058: verify daemon has no problems understanding the custom DUID option
+                j = journal.Reader()
+                j.this_boot()
+                j.add_match(_SYSTEMD_UNIT=f'dhcp6c@{interface}.service')
+                for entry in j:
+                    self.assertNotIn('yyerror0', entry.get('MESSAGE', ''))
+                    self.assertNotIn('syntax error', entry.get('MESSAGE', ''))
+
                 # Better ask the process about it's commandline in the future
                 pid = process_named_running(dhcp6c_process_name, cmdline=interface, timeout=10)
                 self.assertTrue(pid)
 
+                # DHCPv6 option "no-release" requires "-n" daemon startup option
                 dhcp6c_options = read_file(f'/proc/{pid}/cmdline')
                 self.assertIn('-n', dhcp6c_options)
 
         def test_dhcpv6pd_auto_sla_id(self):
             if not self._test_ipv6_pd:
-                self.skipTest('not supported')
+                self.skipTest(MSG_TESTCASE_UNSUPPORTED)
 
             prefix_len = '56'
             sla_len = str(64 - int(prefix_len))
@@ -1203,7 +1247,6 @@ class BasicInterfaceTest:
                     self.assertIn(f'prefix-interface {delegatee}' + r' {', dhcpc6_config)
                     self.assertIn(f'ifid {address};', dhcpc6_config)
                     self.assertIn(f'sla-id {sla_id};', dhcpc6_config)
-                    self.assertIn(f'sla-len {sla_len};', dhcpc6_config)
 
                     # increment sla-id
                     sla_id = str(int(sla_id) + 1)
@@ -1221,7 +1264,7 @@ class BasicInterfaceTest:
 
         def test_dhcpv6pd_manual_sla_id(self):
             if not self._test_ipv6_pd:
-                self.skipTest('not supported')
+                self.skipTest(MSG_TESTCASE_UNSUPPORTED)
 
             prefix_len = '56'
             sla_len = str(64 - int(prefix_len))
@@ -1269,7 +1312,6 @@ class BasicInterfaceTest:
                     self.assertIn(f'prefix-interface {delegatee}' + r' {', dhcpc6_config)
                     self.assertIn(f'ifid {address};', dhcpc6_config)
                     self.assertIn(f'sla-id {sla_id};', dhcpc6_config)
-                    self.assertIn(f'sla-len {sla_len};', dhcpc6_config)
 
                     # increment sla-id
                     sla_id = str(int(sla_id) + 1)
@@ -1287,7 +1329,7 @@ class BasicInterfaceTest:
 
         def test_eapol(self):
             if not self._test_eapol:
-                self.skipTest('not supported')
+                self.skipTest(MSG_TESTCASE_UNSUPPORTED)
 
             cfg_dir = '/run/wpa_supplicant'
 

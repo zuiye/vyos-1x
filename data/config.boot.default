@@ -26,13 +26,13 @@ system {
     config-management {
         commit-revisions "100"
     }
-    console {
-        device ttyS0 {
-            speed "115200"
-        }
-    }
     host-name "vyos"
     login {
+        operator-group default {
+            command-policy {
+                allow "*"
+            }
+        }
         user gnoc {
             authentication {
                 encrypted-password "$6$rounds=656000$USF43dqigjr/iKD6$FinyoTC1e9lMEz9hLqwKTBA3VXuRcXKQ1b2wBHM4EzTTt0H/Iu20PojlBixlTAYRkPSWB5Yr9IOLUAyFqfXOd0"
@@ -40,8 +40,11 @@ system {
             }
         }
     }
+    option {
+        reboot-on-upgrade-failure 5
+    }
     syslog {
-        global {
+        local {
             facility all {
                 level "info"
             }

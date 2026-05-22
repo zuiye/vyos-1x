@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2020-2022 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -17,6 +17,7 @@
 import unittest
 
 from base_interfaces_test import BasicInterfaceTest
+from base_vyostest_shim import VyOSUnitTestSHIM
 
 from vyos.configsession import ConfigSessionError
 from vyos.utils.network import get_interface_config
@@ -345,7 +346,7 @@ class TunnelInterfaceTest(BasicInterfaceTest.TestCase):
             if 'remote' in tunnel_config:
                 self.cli_set(self._base_path + [tunnel, 'remote', tunnel_config['remote']])
 
-        # GRE key must be supplied when two or more tunnels are formed to the same desitnation
+        # GRE key must be supplied when two or more tunnels are formed to the same destination
         with self.assertRaises(ConfigSessionError):
             self.cli_commit()
         for tunnel, tunnel_config in tunnels.items():
@@ -410,4 +411,4 @@ class TunnelInterfaceTest(BasicInterfaceTest.TestCase):
         self.cli_commit()
 
 if __name__ == '__main__':
-    unittest.main(verbosity=2)
+    unittest.main(verbosity=2, failfast=VyOSUnitTestSHIM.TestCase.debug_on())

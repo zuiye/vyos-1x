@@ -1,4 +1,4 @@
-# Copyright 2023-2024 VyOS maintainers and contributors <maintainers@vyos.io>
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This library is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -102,11 +102,16 @@ def run_config_mode_script(target: str, config: 'Config'):
     mod = load_as_module(name, path)
 
     config.set_level([])
+    dry_run = config.get_bool_attr('dry_run')
     try:
         c = mod.get_config(config)
         mod.verify(c)
-        mod.generate(c)
-        mod.apply(c)
+        if not dry_run:
+            mod.generate(c)
+            mod.apply(c)
+        else:
+            if hasattr(mod, 'call_dependents'):
+                mod.call_dependents()
     except (VyOSError, ConfigError) as e:
         raise ConfigError(str(e)) from e
 
@@ -181,7 +186,7 @@ def graph_from_dependency_dict(d: dict) -> dict:
     for k in list(d):
         g[k] = set()
         # add the dependencies for every sub-case; should there be cases
-        # that are mutally exclusive in the future, the graphs will be
+        # that are mutually exclusive in the future, the graphs will be
         # distinguished
         for el in list(d[k]):
             g[k] |= set(d[k][el])

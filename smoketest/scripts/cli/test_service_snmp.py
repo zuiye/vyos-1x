@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2019-2021 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -20,13 +20,16 @@ import unittest
 from base_vyostest_shim import VyOSUnitTestSHIM
 
 from vyos.configsession import ConfigSessionError
-from vyos.template import is_ipv4
 from vyos.template import address_from_cidr
+from vyos.template import bracketize_ipv6
+from vyos.template import is_ipv4
+from vyos.template import is_ipv6
 from vyos.utils.process import call
 from vyos.utils.process import DEVNULL
 from vyos.utils.file import read_file
 from vyos.utils.process import process_named_running
 from vyos.version import get_version_data
+from vyos.xml_ref import default_value
 
 PROCESS_NAME = 'snmpd'
 SNMPD_CONF = '/etc/snmp/snmpd.conf'
@@ -58,13 +61,13 @@ class TestSNMPService(VyOSUnitTestSHIM.TestCase):
     def tearDown(self):
         # Check for running process
         self.assertTrue(process_named_running(PROCESS_NAME))
-
         # delete testing SNMP config
         self.cli_delete(base_path)
         self.cli_commit()
-
         # Check for running process
         self.assertFalse(process_named_running(PROCESS_NAME))
+        # always forward to base class
+        super().tearDown()
 
     def test_snmp_basic(self):
         dummy_if = 'dum7312'
@@ -98,7 +101,7 @@ class TestSNMPService(VyOSUnitTestSHIM.TestCase):
 
         # verify listen address, it will be returned as
         # ['unix:/run/snmpd.socket,udp:127.0.0.1:161,udp6:[::1]:161']
-        # thus we need to transfor this into a proper list
+        # thus we need to transform this into a proper list
         config = get_config_value('agentaddress')
         expected = 'unix:/run/snmpd.socket'
         self.assertIn(expected, config)
@@ -199,7 +202,7 @@ class TestSNMPService(VyOSUnitTestSHIM.TestCase):
         self.cli_set(base_path + ['v3', 'user', 'vyos', 'group', snmpv3_group])
 
         self.cli_set(base_path + ['v3', 'group', snmpv3_group, 'mode', 'ro'])
-        # check validate() - a view must be created before this can be comitted
+        # check validate() - a view must be created before this can be committed
         with self.assertRaises(ConfigSessionError):
             self.cli_commit()
 
@@ -246,6 +249,36 @@ class TestSNMPService(VyOSUnitTestSHIM.TestCase):
         for excluded in snmpv3_view_oid_exclude:
             self.assertIn(f'view {snmpv3_view} excluded .{excluded}', tmp)
 
+    def test_snmpv3_trap(self):
+        trap_targets = ['192.0.2.55', '2001:db8::1']
+
+        self.cli_set(base_path + ['v3', 'engineid', snmpv3_engine_id])
+        self.cli_set(base_path + ['v3', 'group', snmpv3_group, 'view', snmpv3_view])
+        self.cli_set(base_path + ['v3', 'view', snmpv3_view, 'oid', snmpv3_view_oid])
+
+        for trap_target in trap_targets:
+            trap_base = base_path + ['v3', 'trap-target', trap_target]
+
+            self.cli_set(trap_base + ['auth', 'plaintext-password', snmpv3_auth_pw])
+            self.cli_set(trap_base + ['auth', 'type', 'sha'])
+            self.cli_set(trap_base + ['privacy', 'plaintext-password', snmpv3_priv_pw])
+            self.cli_set(trap_base + ['privacy', 'type', 'aes'])
+            self.cli_set(trap_base + ['type', 'trap'])
+            self.cli_set(trap_base + ['user', snmpv3_user])
+
+        self.cli_commit()
+
+        tmp = read_file(SNMPD_CONF)
+        for trap_target in trap_targets:
+            cli_default_trap_port = default_value(base_path + ['v3', 'trap-target', trap_target, 'port'])
+            cli_default_trap_protocol = default_value(base_path + ['v3', 'trap-target', trap_target, 'protocol'])
+            if is_ipv6(trap_target):
+                cli_default_trap_protocol = f'{cli_default_trap_protocol}6'
+
+            self.assertIn(f'trapsess -v 3  -e "{snmpv3_engine_id}" -u {snmpv3_user} -a SHA -A {snmpv3_auth_pw} ' \
+                          f'-x AES -X {snmpv3_priv_pw} -l authPriv ' \
+                          f'{cli_default_trap_protocol}:{bracketize_ipv6(trap_target)}:{cli_default_trap_port}', tmp)
+
     def test_snmp_script_extensions(self):
         extensions = {
             'default': 'snmp_smoketest_extension_script.sh',
@@ -261,4 +294,4 @@ class TestSNMPService(VyOSUnitTestSHIM.TestCase):
 
 
 if __name__ == '__main__':
-    unittest.main(verbosity=2)
+    unittest.main(verbosity=2, failfast=VyOSUnitTestSHIM.TestCase.debug_on())

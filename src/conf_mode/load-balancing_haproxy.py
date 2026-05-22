@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2023-2024 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -19,6 +19,7 @@ import os
 from sys import exit
 from shutil import rmtree
 
+from vyos.defaults import systemd_services
 from vyos.config import Config
 from vyos.configverify import verify_pki_certificate
 from vyos.configverify import verify_pki_ca_certificate
@@ -26,6 +27,7 @@ from vyos.utils.dict import dict_search
 from vyos.utils.process import call
 from vyos.utils.network import check_port_availability
 from vyos.utils.network import is_listen_port_bind_service
+from vyos.utils.network import is_addr_assigned
 from vyos.pki import find_chain
 from vyos.pki import load_certificate
 from vyos.pki import load_private_key
@@ -39,7 +41,6 @@ airbag.enable()
 
 load_balancing_dir = '/run/haproxy'
 load_balancing_conf_file = f'{load_balancing_dir}/haproxy.cfg'
-systemd_service = 'haproxy.service'
 systemd_override = '/run/systemd/system/haproxy.service.d/10-override.conf'
 
 def get_config(config=None):
@@ -65,18 +66,44 @@ def verify(lb):
         return None
 
     if 'backend' not in lb or 'service' not in lb:
-        raise ConfigError(f'"service" and "backend" must be configured!')
+        raise ConfigError('Both "service" and "backend" must be configured!')
 
     for front, front_config in lb['service'].items():
         if 'port' not in front_config:
             raise ConfigError(f'"{front} service port" must be configured!')
 
-        # Check if bind address:port are used by another service
-        tmp_address = front_config.get('address', '0.0.0.0')
-        tmp_port = front_config['port']
-        if check_port_availability(tmp_address, int(tmp_port), 'tcp') is not True and \
-                not is_listen_port_bind_service(int(tmp_port), 'haproxy'):
-            raise ConfigError(f'"TCP" port "{tmp_port}" is used by another service')
+        # Check if bind 'listen-address:port' are used by another service
+        listen_addresses = front_config.get('listen_address') or {}
+        listen_port = int(front_config['port'])
+        if listen_addresses:
+            for listen_address in listen_addresses:
+                # Remove the interface name if present in the listen address
+                if '%' in listen_address:
+                    listen_address, *_ = listen_address.split('%', maxsplit=1)
+
+                if not is_addr_assigned(listen_address):
+                    raise ConfigError(
+                        f'listen-address "{listen_address}" not assigned on any interface!'
+                    )
+
+                port_availability = check_port_availability(
+                    listen_address, listen_port, 'tcp'
+                )
+                port_bind_service = is_listen_port_bind_service(
+                    listen_port, 'haproxy', address=listen_address
+                )
+                if not port_availability and not port_bind_service:
+                    raise ConfigError(
+                        f'TCP port "{listen_port}" on address "{listen_address}" is used by another service'
+                    )
+        else:
+            # Verify listen port for all IP addresses
+            port_availability = check_port_availability(None, listen_port, 'tcp')
+            port_bind_service = is_listen_port_bind_service(listen_port, 'haproxy')
+            if not port_availability and not port_bind_service:
+                raise ConfigError(
+                    f'TCP port "{listen_port}" is used by another service'
+                )
 
         if 'http_compression' in front_config:
             if front_config['mode'] != 'http':
@@ -85,16 +112,19 @@ def verify(lb):
                 raise ConfigError(f'service {front} must have at least one mime-type configured to use'
                                   f'http_compression!')
 
+        for cert in dict_search('ssl.certificate', front_config) or []:
+            verify_pki_certificate(lb, cert)
+
     for back, back_config in lb['backend'].items():
         if 'http_check' in back_config:
             http_check = back_config['http_check']
             if 'expect' in http_check and 'status' in http_check['expect'] and 'string' in http_check['expect']:
-                raise ConfigError(f'"expect status" and "expect string" can not be configured together!')
+                raise ConfigError('"expect status" and "expect string" can not be configured together!')
 
         if 'health_check' in back_config:
             if back_config['mode'] != 'tcp':
                 raise ConfigError(f'backend "{back}" can only be configured with {back_config["health_check"]} ' +
-                                  f'health-check whilst in TCP mode!')
+                                  'health-check whilst in TCP mode!')
             if 'http_check' in back_config:
                 raise ConfigError(f'backend "{back}" cannot be configured with both http-check and health-check!')
 
@@ -112,24 +142,19 @@ def verify(lb):
             if {'no_verify', 'ca_certificate'} <= set(back_config['ssl']):
                 raise ConfigError(f'backend {back} cannot have both ssl options no-verify and ca-certificate set!')
 
+            tmp = dict_search('ssl.ca_certificate', back_config)
+            if tmp: verify_pki_ca_certificate(lb, tmp)
+
     # Check if http-response-headers are configured in any frontend/backend where mode != http
     for group in ['service', 'backend']:
         for config_name, config in lb[group].items():
             if 'http_response_headers' in config and config['mode'] != 'http':
                 raise ConfigError(f'{group} {config_name} must be set to http mode to use http_response_headers!')
 
-    for front, front_config in lb['service'].items():
-        for cert in dict_search('ssl.certificate', front_config) or []:
-            verify_pki_certificate(lb, cert)
-
-    for back, back_config in lb['backend'].items():
-        tmp = dict_search('ssl.ca_certificate', back_config)
-        if tmp: verify_pki_ca_certificate(lb, tmp)
-
 
 def generate(lb):
     if not lb:
-        # Delete /run/haproxy/haproxy.cfg
+        # Delete generated config files
         config_files = [load_balancing_conf_file, systemd_override]
         for file in config_files:
             if os.path.isfile(file):
@@ -144,8 +169,8 @@ def generate(lb):
     if not os.path.isdir(load_balancing_dir):
         os.mkdir(load_balancing_dir)
 
-    loaded_ca_certs = {load_certificate(c['certificate'])
-        for c in lb['pki']['ca'].values()} if 'ca' in lb['pki'] else {}
+    loaded_ca_certs = {load_certificate(cert_data['certificate'])
+        for _, cert_data in dict_search('pki.ca', lb, default={}).items()}
 
     # SSL Certificates for frontend
     for front, front_config in lb['service'].items():
@@ -193,12 +218,11 @@ def generate(lb):
     return None
 
 def apply(lb):
+    action = 'stop'
+    if lb:
+        action = 'reload-or-restart'
     call('systemctl daemon-reload')
-    if not lb:
-        call(f'systemctl stop {systemd_service}')
-    else:
-        call(f'systemctl reload-or-restart {systemd_service}')
-
+    call(f'systemctl {action} {systemd_services["haproxy"]}')
     return None
 
 

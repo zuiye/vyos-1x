@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2019-2025 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -59,6 +59,8 @@ class TestServiceDDNS(VyOSUnitTestSHIM.TestCase):
 
         # Check for process not running anymore
         self.assertFalse(process_named_running(DDCLIENT_PNAME))
+        # always forward to base class
+        super().tearDown()
 
     # IPv4 standard DDNS service configuration
     def test_01_dyndns_service_standard(self):
@@ -73,7 +75,7 @@ class TestServiceDDNS(VyOSUnitTestSHIM.TestCase):
             for opt, value in details.items():
                 self.cli_set(name_path + [svc, opt, value])
 
-            # 'zone' option is supported by 'cloudfare' and 'zoneedit1', but not 'freedns'
+            # 'zone' option is supported by 'cloudflare' and 'zoneedit1', but not 'freedns'
             self.cli_set(name_path + [svc, 'zone', zone])
             if details['protocol'] in ['cloudflare', 'zoneedit1']:
                 pass
@@ -83,7 +85,7 @@ class TestServiceDDNS(VyOSUnitTestSHIM.TestCase):
                     self.cli_commit()
                 self.cli_delete(name_path + [svc, 'zone'])
 
-            # 'ttl' option is supported by 'cloudfare', but not 'freedns' and 'zoneedit'
+            # 'ttl' option is supported by 'cloudflare', but not 'freedns' and 'zoneedit'
             self.cli_set(name_path + [svc, 'ttl', ttl])
             if details['protocol'] == 'cloudflare':
                 pass
@@ -172,7 +174,7 @@ class TestServiceDDNS(VyOSUnitTestSHIM.TestCase):
             for opt, value in details.items():
                 self.cli_set(name_path + [name, opt, value])
 
-            # Dual stack is supported by 'cloudfare' and 'freedns' but not 'googledomains'
+            # Dual stack is supported by 'cloudflare' and 'freedns' but not 'googledomains'
             # exception is raised for unsupported ones
             self.cli_set(name_path + [name, 'ip-version', ip_version])
             if details['protocol'] not in ['cloudflare', 'freedns']:
@@ -360,4 +362,4 @@ class TestServiceDDNS(VyOSUnitTestSHIM.TestCase):
         self.cli_delete(['vrf', 'name', vrf_name])
 
 if __name__ == '__main__':
-    unittest.main(verbosity=2)
+    unittest.main(verbosity=2, failfast=VyOSUnitTestSHIM.TestCase.debug_on())

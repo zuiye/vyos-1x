@@ -1,4 +1,4 @@
-# Copyright 2017-2024 VyOS maintainers and contributors <maintainers@vyos.io>
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This library is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -53,7 +53,7 @@ VyOS has two distinct modes: operational mode and configuration mode. When a use
 the CLI is in the operational mode. In this mode, only the running (effective) config is accessible for reading.
 
 When a user enters the "configure" command, a configuration session is setup. Every config session
-has its *proposed* (or *session*) config built on top of the current running config. When changes are commited, if commit succeeds,
+has its *proposed* (or *session*) config built on top of the current running config. When changes are committed, if commit succeeds,
 the proposed config is merged into the running config.
 
 In configuration mode, "base" functions like `exists`, `return_value` return values from the session config,
@@ -67,14 +67,18 @@ import json
 from typing import Union
 
 import vyos.configtree
+from vyos.base import Warning
 from vyos.xml_ref import multi_to_list
 from vyos.xml_ref import from_source
 from vyos.xml_ref import ext_dict_merge
 from vyos.xml_ref import relative_defaults
 from vyos.utils.dict import get_sub_dict
 from vyos.utils.dict import mangle_dict_keys
+from vyos.utils.boot import boot_configuration_complete
+from vyos.utils.backend import vyconf_backend
 from vyos.configsource import ConfigSource
 from vyos.configsource import ConfigSourceSession
+from vyos.configsource import ConfigSourceVyconfSession
 
 class ConfigDict(dict):
     _from_defaults = {}
@@ -118,7 +122,7 @@ def config_dict_mangle_acme(name, cli_dict):
             # install ACME based PEM keys into "regular" CLI config keys
             cli_dict.update({'certificate' : cert_base64, 'private' : {'key' : key_base64}})
     except:
-        raise ConfigError(f'Unable to load ACME certificates for "{name}"!')
+        Warning(f'Unable to load ACME certificates for "{name}"!')
 
     return cli_dict
 
@@ -131,8 +135,13 @@ class Config(object):
     subtrees.
     """
     def __init__(self, session_env=None, config_source=None):
+        self.vyconf_session = None
         if config_source is None:
-            self._config_source = ConfigSourceSession(session_env)
+            if vyconf_backend() and boot_configuration_complete():
+                self._config_source = ConfigSourceVyconfSession(session_env)
+                self.vyconf_session = self._config_source._vyconf_session
+            else:
+                self._config_source = ConfigSourceSession(session_env)
         else:
             if not isinstance(config_source, ConfigSource):
                 raise TypeError("config_source not of type ConfigSource")
@@ -148,6 +157,18 @@ class Config(object):
         if effective:
             return self._running_config
         return self._session_config
+
+    def get_bool_attr(self, attr) -> bool:
+        if not hasattr(self, attr):
+            return False
+        else:
+            tmp = getattr(self, attr)
+            if not isinstance(tmp, bool):
+                return False
+        return tmp
+
+    def set_bool_attr(self, attr, val):
+        setattr(self, attr, val)
 
     def _make_path(self, path):
         # Backwards-compatibility stuff: original implementation used string paths
@@ -238,7 +259,7 @@ class Config(object):
     def session_changed(self):
         """
         Returns:
-            True if the config session has uncommited changes, False otherwise.
+            True if the config session has uncommitted changes, False otherwise.
         """
         return self._config_source.session_changed()
 
@@ -342,7 +363,7 @@ class Config(object):
                         pki_dict['certificate'][certificate] = config_dict_mangle_acme(
                             certificate, pki_dict['certificate'][certificate])
 
-            conf_dict['pki'] = pki_dict
+                conf_dict['pki'] = pki_dict
 
         interfaces_root = root_dict.get('interfaces', {})
         setattr(conf_dict, 'interfaces_root', interfaces_root)
@@ -523,7 +544,7 @@ class Config(object):
 
         Note:
             This function is safe to use in operational mode. In configuration mode,
-            it ignores uncommited changes.
+            it ignores uncommitted changes.
         """
         if self._running_config is None:
             return False

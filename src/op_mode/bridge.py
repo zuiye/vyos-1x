@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2022-2024 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -83,7 +83,7 @@ def _get_raw_data_fdb(bridge):
 
 
 def _get_raw_data_mdb(bridge):
-    """Get MAC-address multicast gorup for the bridge brX
+    """Get MAC-address multicast group for the bridge brX
     :return list
     """
     json_data = cmd(f'bridge --json  mdb show br {bridge}')

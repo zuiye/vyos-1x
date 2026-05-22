@@ -1,4 +1,4 @@
-# Copyright 2024 VyOS maintainers and contributors <maintainers@vyos.io>
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This library is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -111,7 +111,7 @@ class VTIUpDownDB:
         """
         Removes a matching entry from the DB.
 
-        If no matching entry can be fonud, the operation returns successfully.
+        If no matching entry can be found, the operation returns successfully.
         """
         ifspec = f"{interface}:{connection}:{protocol}" if (connection is not None and protocol is not None) else interface
         if ifspec in self._ifspecs:
@@ -173,7 +173,7 @@ class VTIUpDownDB:
         self._fileHandle.truncate()
 
         for interface in self._ifsDown:
-            vti_link = get_interface_config(interface)
+            vti_link = get_interface_config(interface) or {}
             vti_link_up = (vti_link['operstate'] != 'DOWN' if 'operstate' in vti_link else False)
             if vti_link_up:
                 call(f'sudo ip link set {interface} down')
@@ -182,7 +182,7 @@ class VTIUpDownDB:
         self._ifsDown.clear()
 
         for interface in self._ifsUp:
-            vti_link = get_interface_config(interface)
+            vti_link = get_interface_config(interface) or {}
             vti_link_up = (vti_link['operstate'] != 'DOWN' if 'operstate' in vti_link else False)
             if not vti_link_up:
                 vti = interface_dict_supplier(interface)

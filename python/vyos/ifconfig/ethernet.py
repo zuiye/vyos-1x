@@ -1,4 +1,4 @@
-# Copyright 2019-2023 VyOS maintainers and contributors <maintainers@vyos.io>
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This library is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -19,6 +19,7 @@ from glob import glob
 
 from vyos.base import Warning
 from vyos.ethtool import Ethtool
+from vyos.netlink import coalesce
 from vyos.ifconfig import Section
 from vyos.ifconfig.interface import Interface
 from vyos.utils.dict import dict_search
@@ -131,18 +132,16 @@ class EthernetIf(Interface):
         >>> i.remove()
         """
 
+        # T7813: we do need to remove the VLAN subinterfaces first so we can
+        # properly stop the DHCP client and inform the DHCP server that we are
+        # returning the lease.
+        for vlan in Section.sub_interfaces(self.ifname):
+            Interface(vlan).remove()
+
         if self.exists(self.ifname):
             # interface is placed in A/D state when removed from config! It
             # will remain visible for the operating system.
             self.set_admin_state('down')
-
-        # Remove all VLAN subinterfaces - filter with the VLAN dot
-        for vlan in [
-            x
-            for x in Section.interfaces('ethernet')
-            if x.startswith(f'{self.ifname}.')
-        ]:
-            Interface(vlan).remove()
 
         super().remove()
 
@@ -245,7 +244,7 @@ class EthernetIf(Interface):
                 cmd += f' speed {speed} duplex {duplex} autoneg off'
             return self._cmd(cmd)
         except PermissionError:
-            # Some NICs do not tell that they don't suppport settings speed/duplex,
+            # Some NICs do not tell that they don't support settings speed/duplex,
             # but they do not actually support it either.
             # In that case it's probably better to ignore the error
             # than end up with a broken config.
@@ -451,10 +450,78 @@ class EthernetIf(Interface):
         cmd = f'ethtool --set-ring {ifname} {rx_tx} {size}'
         output, code = self._popen(cmd)
         # ethtool error codes:
-        #  80 - value already setted
+        #  80 - value already set
         #  81 - does not possible to set value
         if code and code != 80:
             print(f'could not set "{rx_tx}" ring-buffer for {ifname}')
+        return output
+
+    def set_interrupt_coalescing(self, params: dict):
+        """
+        Apply ethtool coalesce settings to an interface.
+
+        This method configures interrupt coalescing parameters for the interface
+        using the netlink API.
+
+        Args:
+            params: dict containing any of the supported keys, e.g.:
+              - adaptive_rx, adaptive_tx,
+              - rx_usecs, rx_frames, rx_usecs_irq, rx_frames_irq,
+              - tx_usecs, tx_frames, tx_usecs_irq, tx_frames_irq,
+              - stats_block_usecs,
+              - pkt_rate_low, pkt_rate_high,
+              - rx_usecs_low, rx_frames_low,
+              - tx_usecs_low, tx_frames_low,
+              - rx_usecs_high, rx_frames_high,
+              - tx_usecs_high, tx_frames_high,
+              - sample_interval,
+              - cqe_mode_rx, cqe_mode_tx,
+              - tx_aggr_max_bytes, tx_aggr_max_frames, tx_aggr_time_usecs.
+
+        Example:
+        >>> from vyos.ifconfig import EthernetIf
+        >>> i = EthernetIf('eth0')
+        >>> i.set_interrupt_coalescing({'rx_usecs': 8, 'tx_usecs': 16})
+        """
+
+        ifname = self.config['ifname']
+        output = ''
+
+        # Nothing to apply
+        if not params:
+            return None
+
+        # Override boolean parameters to true if they exist and supported by NIC driver
+        for boolean_param in coalesce.get_all_params(boolean=True):
+            supported = self.ethtool.check_coalesce(boolean_param)
+            if supported:
+                params[boolean_param] = boolean_param in params
+
+        # Update interrupt coalescing parameters
+        try:
+            coalesce.set_coalesce(ifname, **params)
+        except coalesce.CoalesceError as e:
+            print(f'interrupt coalescing error: {e}')
+        except coalesce.GeneralNetlinkError as e:
+            print(f'netlink error: {e}')
+
+        return output
+
+    def set_channels(self, rx_tx_comb, queues):
+        """
+        Example:
+        >>> from vyos.ifconfig import EthernetIf
+        >>> i = EthernetIf('eth0')
+        >>> i.set_channels('rx', 2)
+        """
+        ifname = self.config['ifname']
+        cmd = f'ethtool --set-channels {ifname} {rx_tx_comb} {queues}'
+        output, code = self._popen(cmd)
+        # ethtool error codes:
+        #  80 - value already set
+        #  81 - does not possible to set value
+        if code and code != 80:
+            print(f'could not set "{rx_tx_comb}" channel for {ifname}')
         return output
 
     def set_switchdev(self, enable):
@@ -483,9 +550,9 @@ class EthernetIf(Interface):
             self._cmd(f'/sbin/devlink dev eswitch set pci/{addr} mode legacy')
 
     def update(self, config):
-        """General helper function which works on a dictionary retrived by
+        """General helper function which works on a dictionary retrieved by
         get_config_dict(). It's main intention is to consolidate the scattered
-        interface setup code and provide a single point of entry when workin
+        interface setup code and provide a single point of entry when working
         on any interface."""
 
         # disable ethernet flow control (pause frames)
@@ -527,6 +594,10 @@ class EthernetIf(Interface):
         if 'ring_buffer' in config:
             for rx_tx, size in config['ring_buffer'].items():
                 self.set_ring_buffer(rx_tx, size)
+
+        # Set coalesce settings for the interface
+        if 'interrupt_coalescing' in config:
+            self.set_interrupt_coalescing(config['interrupt_coalescing'])
 
         self.set_switchdev('switchdev' in config)
 

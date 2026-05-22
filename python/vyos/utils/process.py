@@ -1,4 +1,4 @@
-# Copyright 2023 VyOS maintainers and contributors <maintainers@vyos.io>
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This library is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -14,27 +14,26 @@
 # License along with this library.  If not, see <http://www.gnu.org/licenses/>.
 
 import os
+import shlex
+import time
 
 from subprocess import Popen
 from subprocess import PIPE
 from subprocess import STDOUT
 from subprocess import DEVNULL
 
-
-def get_wrapper(vrf, netns, auth):
-    wrapper = ''
+def get_wrapper(vrf, netns):
+    wrapper = None
     if vrf:
-        wrapper = f'ip vrf exec {vrf} '
+        wrapper = ['ip', 'vrf', 'exec', vrf]
     elif netns:
-        wrapper = f'ip netns exec {netns} '
-    if auth:
-        wrapper = f'{auth} {wrapper}'
+        wrapper = ['ip', 'netns', 'exec', netns]
     return wrapper
 
 
 def popen(command, flag='', shell=None, input=None, timeout=None, env=None,
-          stdout=PIPE, stderr=PIPE, decode='utf-8', auth='', vrf=None,
-          netns=None):
+          stdout=PIPE, stderr=PIPE, decode='utf-8', vrf=None, netns=None,
+          buffered=True):
     """
     popen is a wrapper helper around subprocess.Popen
     with it default setting it will return a tuple (out, err)
@@ -57,9 +56,12 @@ def popen(command, flag='', shell=None, input=None, timeout=None, env=None,
               - STDOUT, send the data to be merged with stdout
               - DEVNULL, discard the output
     decode:  specify the expected text encoding (utf-8, ascii, ...)
-             the default is explicitely utf-8 which is python's own default
+             the default is explicitly utf-8 which is python's own default
     vrf:     run command in a VRF context
     netns:   run command in the named network namespace
+    buffered: define how process output shall be presented to stdout
+               - true: buffer output and return once after command finished
+               - false: immediately output strings on stdout - give live feedback
 
     usage:
     get both stdout and stderr: popen('command', stdout=PIPE, stderr=STDOUT)
@@ -67,26 +69,13 @@ def popen(command, flag='', shell=None, input=None, timeout=None, env=None,
     """
 
     # airbag must be left as an import in the function as otherwise we have a
-    # a circual import dependency
+    # a circular import dependency
     from vyos import debug
     from vyos import airbag
 
     # log if the flag is set, otherwise log if command is set
     if not debug.enabled(flag):
         flag = 'command'
-
-    # Must be run as root to execute command in VRF or network namespace
-    if vrf or netns:
-        if os.getuid() != 0:
-            raise OSError(
-                'Permission denied: cannot execute commands in VRF and netns contexts as an unprivileged user'
-            )
-
-    wrapper = get_wrapper(vrf, netns, auth)
-    command = f'{wrapper} {command}' if wrapper else command
-
-    cmd_msg = f"cmd '{command}'"
-    debug.message(cmd_msg, flag)
 
     use_shell = shell
     stdin = None
@@ -97,42 +86,75 @@ def popen(command, flag='', shell=None, input=None, timeout=None, env=None,
         if env:
             use_shell = True
 
+    # Must be run as root to execute command in VRF or network namespace
+    wrapper = get_wrapper(vrf, netns)
+    if vrf or netns:
+        if os.getuid() != 0:
+            raise OSError('Permission denied: cannot execute commands in VRF ' \
+                          'and netns contexts as an unprivileged user')
+
+        if use_shell:
+            command = f'{shlex.join(wrapper)} {command}'
+        else:
+            if type(command) is not list:
+                command = [command]
+            command = wrapper + command
+
+    cmd_msg = f"cmd '{command}'" if use_shell else f"cmd '{shlex.join(command)}'"
+    debug.message(cmd_msg, flag)
+
     if input:
         stdin = PIPE
         input = input.encode() if type(input) is str else input
 
+    text = None
+    bufsize = -1 # default: system default of io.DEFAULT_BUFFER_SIZE is used
+    if not buffered:
+        text = True # Treat output as strings (not bytes)
+        bufsize = 1 # Enable line buffering
+
     p = Popen(command, stdin=stdin, stdout=stdout, stderr=stderr,
-              env=env, shell=use_shell)
+              env=env, shell=use_shell, text=text, bufsize=bufsize)
 
-    pipe = p.communicate(input, timeout)
+    if buffered:
+        pipe = p.communicate(input, timeout)
+        rc = p.returncode
 
-    pipe_out = b''
-    if stdout == PIPE:
-        pipe_out = pipe[0]
+        pipe_out = b''
+        if stdout == PIPE:
+            pipe_out = pipe[0]
 
-    pipe_err = b''
-    if stderr == PIPE:
-        pipe_err = pipe[1]
+        pipe_err = b''
+        if stderr == PIPE:
+            pipe_err = pipe[1]
 
-    str_out = pipe_out.decode(decode).replace('\r\n', '\n').strip()
-    str_err = pipe_err.decode(decode).replace('\r\n', '\n').strip()
+        str_out = pipe_out.decode(decode).replace('\r\n', '\n').strip()
+        str_err = pipe_err.decode(decode).replace('\r\n', '\n').strip()
 
-    out_msg = f"returned (out):\n{str_out}"
-    if str_out:
-        debug.message(out_msg, flag)
+        out_msg = f"returned (out):\n{str_out}"
+        if str_out:
+            debug.message(out_msg, flag)
 
-    if str_err:
-        from sys import stderr
-        err_msg = f"returned (err):\n{str_err}"
-        # this message will also be send to syslog via airbag
-        debug.message(err_msg, flag, destination=stderr)
+        if str_err:
+            from sys import stderr
+            err_msg = f"returned (err):\n{str_err}"
+            # this message will also be send to syslog via airbag
+            debug.message(err_msg, flag, destination=stderr)
 
-        # should something go wrong, report this too via airbag
-        airbag.noteworthy(cmd_msg)
-        airbag.noteworthy(out_msg)
-        airbag.noteworthy(err_msg)
+            # should something go wrong, report this too via airbag
+            airbag.noteworthy(cmd_msg)
+            airbag.noteworthy(out_msg)
+            airbag.noteworthy(err_msg)
+    else:
+        output_lines = []
+        for line in p.stdout:
+            print(line, end='', flush=True)  # print each line as it arrives
+            output_lines.append(line)
+        p.stdout.close()
+        rc = p.wait()
+        str_out = ''.join(output_lines)
 
-    return str_out, p.returncode
+    return str_out, rc
 
 
 def run(command, flag='', shell=None, input=None, timeout=None, env=None,
@@ -155,7 +177,7 @@ def run(command, flag='', shell=None, input=None, timeout=None, env=None,
 
 def cmd(command, flag='', shell=None, input=None, timeout=None, env=None,
         stdout=PIPE, stderr=PIPE, decode='utf-8', raising=None, message='',
-        expect=[0], auth='', vrf=None, netns=None):
+        expect=[0], vrf=None, netns=None):
     """
     A wrapper around popen, which returns the stdout and
     will raise the error code of a command
@@ -171,12 +193,11 @@ def cmd(command, flag='', shell=None, input=None, timeout=None, env=None,
         input=input, timeout=timeout,
         env=env, shell=shell,
         decode=decode,
-        auth=auth,
         vrf=vrf,
         netns=netns,
     )
     if code not in expect:
-        wrapper = get_wrapper(vrf, netns, auth='')
+        wrapper = get_wrapper(vrf, netns)
         command = f'{wrapper} {command}'
         feedback = message + '\n' if message else ''
         feedback += f'failed to run command: {command}\n'
@@ -189,9 +210,9 @@ def cmd(command, flag='', shell=None, input=None, timeout=None, env=None,
             raise raising(feedback)
     return decoded
 
-
 def rc_cmd(command, flag='', shell=None, input=None, timeout=None, env=None,
-           stdout=PIPE, stderr=STDOUT, decode='utf-8', vrf=None, netns=None):
+           stdout=PIPE, stderr=STDOUT, decode='utf-8', vrf=None, netns=None,
+           buffered=True):
     """
     A wrapper around popen, which returns the return code
     of a command and stdout
@@ -209,6 +230,7 @@ def rc_cmd(command, flag='', shell=None, input=None, timeout=None, env=None,
         decode=decode,
         vrf=vrf,
         netns=netns,
+        buffered=buffered,
     )
     return code, out
 
@@ -256,7 +278,6 @@ def process_named_running(name: str, cmdline: str=None, timeout: int=0):
                 return p.info['pid']
         return None
     if timeout:
-        import time
         time_expire = time.time() + timeout
         while True:
             tmp = check_process(name, cmdline)
@@ -270,12 +291,48 @@ def process_named_running(name: str, cmdline: str=None, timeout: int=0):
         return check_process(name, cmdline)
     return None
 
-def is_systemd_service_active(service):
+def is_systemd_service_active(service: str, vrf=None, netns=None) -> bool:
     """ Test is a specified systemd service is activated.
     Returns True if service is active, false otherwise.
     Copied from: https://unix.stackexchange.com/a/435317 """
-    tmp = cmd(f'systemctl show --value -p ActiveState {service}')
+    tmp = cmd(f'systemctl show --value -p ActiveState {service}',
+              vrf=vrf, netns=netns)
     return bool((tmp == 'active'))
+
+def stop_systemd_unit(service: str, retries: int=3, delay_s: float=0.250,
+                      raise_on_failure: bool=True, vrf=None, netns=None) -> None:
+    """
+    Stop systemd unit used during interface teardown (e.g. DHCP clients).
+
+    Retries transient "systemctl stop| failures and verifies ActiveState is no
+    longer "active". Escalate to systemctl kill if stop attempts fail while
+    unit remains active.
+    """
+
+    if not is_systemd_service_active(service, vrf=vrf, netns=netns):
+        return None
+
+    for _ in range(retries):
+        rc_cmd(f'systemctl stop {service}', vrf=vrf, netns=netns)
+        if not is_systemd_service_active(service, vrf=vrf, netns=netns):
+            # Service properly stopped - return early, this should be the default
+            return None
+        time.sleep(delay_s)
+
+    rc_cmd(f'systemctl kill {service}', vrf=vrf, netns=netns)
+    time.sleep(delay_s)
+    if not is_systemd_service_active(service, vrf=vrf, netns=netns):
+        return None
+
+    # This should not happen
+    if raise_on_failure:
+        code, out = rc_cmd(f'systemctl show --value -p ActiveState {service}',
+                           vrf=vrf, netns=netns)
+        disp_state = out.strip() if code == 0 and out.strip() else 'unknown'
+
+        raise RuntimeError(f'systemd unit {service} still has ActiveState={disp_state} ' \
+                           f'after {retries} stop attempts and systemctl kill')
+    return None
 
 def is_systemd_service_running(service):
     """ Test is a specified systemd service is actually running.
@@ -298,3 +355,9 @@ def ip_cmd(args, json=True):
     else:
         res = cmd(f"ip {args}")
         return res
+
+
+def wrap_op(cmd: str) -> str:
+    """Returns a command with the VyOS operational mode wrapper."""
+
+    return f'/opt/vyatta/bin/vyatta-op-cmd-wrapper {cmd}'

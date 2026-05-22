@@ -1,4 +1,4 @@
-# Copyright 2019-2024 VyOS maintainers and contributors <maintainers@vyos.io>
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This library is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -36,6 +36,7 @@ DEFAULT_TEMPLATE_DIR = directories["templates"]
 # Holds template filters registered via register_filter()
 _FILTERS = {}
 _TESTS = {}
+_CLEVER_FUNCTIONS = {}
 
 # reuse Environments with identical settings to improve performance
 @functools.lru_cache(maxsize=2)
@@ -54,10 +55,11 @@ def _get_environment(location=None):
         loader=loc_loader,
         trim_blocks=True,
         undefined=ChainableUndefined,
-        extensions=['jinja2.ext.loopcontrols']
+        extensions=['jinja2.ext.loopcontrols', 'jinja2.ext.do']
     )
     env.filters.update(_FILTERS)
     env.tests.update(_TESTS)
+    env.globals.update(_CLEVER_FUNCTIONS)
     return env
 
 
@@ -77,7 +79,7 @@ def register_filter(name, func=None):
             "Filters can only be registered before rendering the first template"
         )
     if name in _FILTERS:
-        raise ValueError(f"A filter with name {name!r} was registered already")
+        raise ValueError(f"A filter with name {name!r} was already registered")
     _FILTERS[name] = func
     return func
 
@@ -97,10 +99,30 @@ def register_test(name, func=None):
             "Tests can only be registered before rendering the first template"
             )
     if name in _TESTS:
-        raise ValueError(f"A test with name {name!r} was registered already")
+        raise ValueError(f"A test with name {name!r} was already registered")
     _TESTS[name] = func
     return func
 
+def register_clever_function(name, func=None):
+    """Register a function to be available as test in templates under given name.
+
+    It can also be used as a decorator, see below in this module for examples.
+
+    :raise RuntimeError:
+        when trying to register a test after a template has been rendered already
+    :raise ValueError: when trying to register a name which was taken already
+    """
+    if func is None:
+        return functools.partial(register_clever_function, name)
+    if _get_environment.cache_info().currsize:
+        raise RuntimeError(
+            "Clever functions can only be registered before rendering the" \
+            "first template")
+    if name in _CLEVER_FUNCTIONS:
+        raise ValueError(f"A clever function with name {name!r} was already "\
+                          "registered")
+    _CLEVER_FUNCTIONS[name] = func
+    return func
 
 def render_to_string(template, content, formater=None, location=None):
     """Render a template from the template directory, raise on any errors.
@@ -150,6 +172,8 @@ def render(
     # As we are opening the file with 'w', we are performing the rendering before
     # calling open() to not accidentally erase the file if rendering fails
     rendered = render_to_string(template, content, formater, location)
+    # Remove any trailing character and always add a new line at the end
+    rendered = rendered.rstrip() + "\n"
 
     # Write to file
     with open(destination, "w") as file:
@@ -250,9 +274,9 @@ def netmask_from_ipv4(address):
     Example:
       - 172.18.201.10 -> 255.255.255.128
     """
-    from netifaces import interfaces
-    from netifaces import ifaddresses
-    from netifaces import AF_INET
+    from netifaces import interfaces # pylint: disable = no-name-in-module
+    from netifaces import ifaddresses # pylint: disable = no-name-in-module
+    from socket import AF_INET
     for interface in interfaces():
         tmp = ifaddresses(interface)
         if AF_INET in tmp:
@@ -390,28 +414,6 @@ def compare_netmask(netmask1, netmask2):
     except:
         return False
 
-@register_filter('isc_static_route')
-def isc_static_route(subnet, router):
-    # https://ercpe.de/blog/pushing-static-routes-with-isc-dhcp-server
-    # Option format is:
-    # <netmask>, <network-byte1>, <network-byte2>, <network-byte3>, <router-byte1>, <router-byte2>, <router-byte3>
-    # where bytes with the value 0 are omitted.
-    from ipaddress import ip_network
-    net = ip_network(subnet)
-    # add netmask
-    string = str(net.prefixlen) + ','
-    # add network bytes
-    if net.prefixlen:
-        width = net.prefixlen // 8
-        if net.prefixlen % 8:
-            width += 1
-        string += ','.join(map(str,tuple(net.network_address.packed)[:width])) + ','
-
-    # add router bytes
-    string += ','.join(router.split('.'))
-
-    return string
-
 @register_filter('is_file')
 def is_file(filename):
     if os.path.exists(filename):
@@ -420,21 +422,25 @@ def is_file(filename):
 
 @register_filter('get_dhcp_router')
 def get_dhcp_router(interface):
-    """ Static routes can point to a router received by a DHCP reply. This
+    """Static routes can point to a router received by a DHCP reply. This
     helper is used to get the current default router from the DHCP reply.
 
-    Returns False of no router is found, returns the IP address as string if
+    Returns None if no router is found, returns the IP address as string if
     a router is found.
     """
-    lease_file = directories['isc_dhclient_dir'] + f'/dhclient_{interface}.leases'
+    lease_file = directories['isc_dhclient_dir'] + f'/dhclient_{interface}.lease'
     if not os.path.exists(lease_file):
         return None
 
     from vyos.utils.file import read_file
     for line in read_file(lease_file).splitlines():
-        if 'option routers' in line:
-            (_, _, address) = line.split()
-            return address.rstrip(';')
+        if 'new_routers' in line:
+            (_, address, _) = line.split("'")
+            if not address:
+                return None
+            # Take first one if there are several
+            address = address.split()[0]
+            return address
 
 @register_filter('natural_sort')
 def natural_sort(iterable):
@@ -566,6 +572,11 @@ def get_openvpn_data_ciphers(ciphers):
             out.append(cipher)
     return ':'.join(out).upper()
 
+
+@register_filter('openvpn_data_ciphers_fallback')
+def get_openvpn_data_ciphers_fallback(cipher):
+    return get_openvpn_cipher(cipher)
+
 @register_filter('snmp_auth_oid')
 def snmp_auth_oid(type):
     if type not in ['md5', 'sha', 'aes', 'des', 'none']:
@@ -579,6 +590,10 @@ def snmp_auth_oid(type):
         'none': '.1.3.6.1.6.3.10.1.2.1'
     }
     return OIDs[type]
+
+@register_filter('quoted_join')
+def quoted_join(input_list, join_str, quote='"'):
+    return str(join_str).join(f'{quote}{elem}{quote}' for elem in input_list)
 
 @register_filter('nft_action')
 def nft_action(vyos_action):
@@ -612,12 +627,17 @@ def nft_default_rule(fw_conf, fw_name, family):
     return " ".join(output)
 
 @register_filter('nft_state_policy')
-def nft_state_policy(conf, state):
+def nft_state_policy(conf, state, bridge=False):
     out = [f'ct state {state}']
+
+    action = conf['action'] if 'action' in conf else None
+
+    if bridge and action == 'reject':
+        action = 'drop' # T7148 - Bridge cannot use reject
 
     if 'log' in conf:
         log_state = state[:3].upper()
-        log_action = (conf['action'] if 'action' in conf else 'accept')[:1].upper()
+        log_action = (action if action else 'accept')[:1].upper()
         out.append(f'log prefix "[STATE-POLICY-{log_state}-{log_action}]"')
 
         if 'log_level' in conf:
@@ -626,8 +646,8 @@ def nft_state_policy(conf, state):
 
     out.append('counter')
 
-    if 'action' in conf:
-        out.append(conf['action'])
+    if action:
+        out.append(action)
 
     return " ".join(out)
 
@@ -666,6 +686,29 @@ def nft_nested_group(out_list, includes, groups, key):
     for name in includes:
         add_includes(name)
     return out_list
+
+@register_filter('nft_accept_invalid')
+def nft_accept_invalid(ether_type):
+    ether_type_mapping = {
+        'dhcp': 'udp sport 67 udp dport 68',
+        'arp': 'arp',
+        'pppoe-discovery': '0x8863',
+        'pppoe': '0x8864',
+        '802.1q': '8021q',
+        '802.1ad': '8021ad',
+        'wol': '0x0842',
+    }
+    if ether_type not in ether_type_mapping:
+        raise RuntimeError(f'Ethernet type "{ether_type}" not found in ' \
+                           'available ethernet types!')
+    out = 'ct state invalid '
+
+    if ether_type != 'dhcp':
+        out += 'ether type '
+
+    out += f'{ether_type_mapping[ether_type]} counter accept'
+
+    return out
 
 @register_filter('nat_rule')
 def nat_rule(rule_conf, rule_id, nat_type, ipv6=False):
@@ -721,7 +764,7 @@ def conntrack_rule(rule_conf, rule_id, action, ipv6=False):
                 if port[0] == '!':
                     operator = '!='
                     port = port[1:]
-                output.append(f'th {prefix}port {operator} {port}')
+                output.append(f'th {prefix}port {operator} {{ {port} }}')
 
             if 'group' in side_conf:
                 group = side_conf['group']
@@ -778,6 +821,11 @@ def conntrack_ct_policy(protocol_conf):
         output.append(f'{item}: {item_value}')
 
     return ", ".join(output)
+
+@register_filter('wlb_nft_rule')
+def wlb_nft_rule(rule_conf, rule_id, local=False, exclude=False, limit=False, weight=None, health_state=None, action=None, restore_mark=False):
+    from vyos.wanloadbalance import nft_rule as wlb_nft_rule
+    return wlb_nft_rule(rule_conf, rule_id, local, exclude, limit, weight, health_state, action, restore_mark)
 
 @register_filter('range_to_regex')
 def range_to_regex(num_range):
@@ -871,10 +919,96 @@ def kea_high_availability_json(config):
 
     return dumps(data)
 
+@register_filter('kea_client_class_json')
+def kea_client_class_json(client_classes):
+    from vyos.kea import kea_build_client_class_test
+    from json import dumps
+    out = []
+
+    for name, config in client_classes.items():
+        if 'disable' in config:
+            continue
+
+        client_class = {
+            'name': name,
+            'test': kea_build_client_class_test(config)
+        }
+
+        out.append(client_class)
+
+    return dumps(out, indent=4)
+
+@register_filter('kea_dynamic_dns_update_main_json')
+def kea_dynamic_dns_update_main_json(config):
+    from vyos.kea import kea_parse_ddns_settings
+    from json import dumps
+
+    data = kea_parse_ddns_settings(config)
+
+    if len(data) == 0:
+        return ''
+
+    return dumps(data, indent=8)[1:-1] + ','
+
+@register_filter('kea_dynamic_dns_update_tsig_key_json')
+def kea_dynamic_dns_update_tsig_key_json(config):
+    from vyos.kea import kea_parse_tsig_algo
+    from json import dumps
+    out = []
+
+    if 'tsig_key' not in config:
+        return dumps(out)
+
+    tsig_keys = config['tsig_key']
+
+    for tsig_key_name, tsig_key_config in tsig_keys.items():
+        tsig_key = {
+            'name': tsig_key_name,
+            'algorithm': kea_parse_tsig_algo(tsig_key_config['algorithm']),
+            'secret': tsig_key_config['secret']
+        }
+        out.append(tsig_key)
+
+    return dumps(out, indent=12)
+
+@register_filter('kea_dynamic_dns_update_domains')
+def kea_dynamic_dns_update_domains(config, type_key):
+    from json import dumps
+    out = []
+
+    if type_key not in config:
+        return dumps(out)
+
+    domains = config[type_key]
+
+    for domain_name, domain_config in domains.items():
+        domain = {
+            'name': domain_name,
+
+        }
+        if 'key_name' in domain_config:
+            domain['key-name'] = domain_config['key_name']
+
+        if 'dns_server' in domain_config:
+            dns_servers = []
+            for dns_server_config in domain_config['dns_server'].values():
+                dns_server = {
+                    'ip-address': dns_server_config['address']
+                }
+                if 'port' in dns_server_config:
+                    dns_server['port'] = int(dns_server_config['port'])
+                dns_servers.append(dns_server)
+            domain['dns-servers'] = dns_servers
+
+        out.append(domain)
+
+    return dumps(out, indent=12)
+
 @register_filter('kea_shared_network_json')
 def kea_shared_network_json(shared_networks):
     from vyos.kea import kea_parse_options
     from vyos.kea import kea_parse_subnet
+    from vyos.kea import kea_parse_ddns_settings
     from json import dumps
     out = []
 
@@ -885,8 +1019,12 @@ def kea_shared_network_json(shared_networks):
         network = {
             'name': name,
             'authoritative': ('authoritative' in config),
-            'subnet4': []
+            'subnet4': [],
+            'user-context': {'enable-ping-check': False}
         }
+
+        if 'dynamic_dns_update' in config:
+            network.update(kea_parse_ddns_settings(config['dynamic_dns_update']))
 
         if 'option' in config:
             network['option-data'] = kea_parse_options(config['option'])
@@ -897,11 +1035,20 @@ def kea_shared_network_json(shared_networks):
             if 'bootfile_server' in config['option']:
                 network['next-server'] = config['option']['bootfile_server']
 
+        subnet_ping_check = False
+
         if 'subnet' in config:
             for subnet, subnet_config in config['subnet'].items():
                 if 'disable' in subnet_config:
                     continue
+
+                if 'ping_check' in subnet_config:
+                    subnet_ping_check = True
+
                 network['subnet4'].append(kea_parse_subnet(subnet, subnet_config))
+
+        if 'ping_check' in config or subnet_ping_check:
+            network['user-context']['enable-ping-check'] = True
 
         out.append(network)
 
@@ -988,3 +1135,48 @@ def vyos_defined(value, test_value=None, var_type=None):
     else:
         # Valid value and is matching optional argument if provided - return true
         return True
+
+@register_clever_function('get_default_port')
+def get_default_port(service):
+    """
+    Jinja2 plugin to retrieve common service port number from vyos.defaults
+    class from a Jinja2 template. This removes the need to hardcode, or pass in
+    the data using the general dictionary.
+
+    Added to remove code complexity and make it easier to read.
+
+    Example:
+    {{ get_default_port('certbot_haproxy') }}
+    """
+    from vyos.defaults import internal_ports
+    if service not in internal_ports:
+        raise RuntimeError(f'Service "{service}" not found in internal ' \
+                           'vyos.defaults.internal_ports dict!')
+    return internal_ports[service]
+
+@register_clever_function('get_default_config_file')
+def get_default_config_file(filename):
+    """
+    Jinja2 plugin to retrieve a common configuration file path from
+    vyos.defaults class from a Jinja2 template. This removes the need to
+    hardcode, or pass in the data using the general dictionary.
+
+    Added to remove code complexity and make it easier to read.
+
+    Example:
+    {{ get_default_config_file('certbot_haproxy') }}
+    """
+    from vyos.defaults import config_files
+    if filename not in config_files:
+        raise RuntimeError(f'Configuration file "{filename}" not found in '\
+                           'internal vyos.defaults.config_files dict!')
+    return config_files[filename]
+
+
+@register_filter('parse_url')
+def parse_url(url):
+    """Parse the given URL and return a urllib.parse.ParseResult object"""
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    return parsed

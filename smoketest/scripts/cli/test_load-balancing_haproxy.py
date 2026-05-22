@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2023 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -14,11 +14,16 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+import re
+import time
+import textwrap
 import unittest
 
 from base_vyostest_shim import VyOSUnitTestSHIM
 
 from vyos.configsession import ConfigSessionError
+from vyos.template import get_default_port
+from vyos.utils.process import call
 from vyos.utils.process import process_named_running
 from vyos.utils.file import read_file
 
@@ -131,7 +136,25 @@ ZXLrtgVJR9W020qTurO2f91qfU8646n11hR9ObBB1IYbagOU0Pw1Nrq/FRp/u2tx
 7i7xFz2WEiQeSCPaKYOiqM3t
 """
 
+haproxy_service_name = 'https_front'
+haproxy_backend_name = 'bk-01'
 
+def parse_haproxy_config() -> dict:
+    config_str = read_file(HAPROXY_CONF)
+    section_pattern = re.compile(r'^(global|defaults|frontend\s+\S+|backend\s+\S+)', re.MULTILINE)
+    sections = {}
+
+    matches = list(section_pattern.finditer(config_str))
+
+    for i, match in enumerate(matches):
+        section_name = match.group(1).strip()
+        start = match.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(config_str)
+        section_body = config_str[start:end]
+        dedented_body = textwrap.dedent(section_body).strip()
+        sections[section_name] = dedented_body
+
+    return sections
 class TestLoadBalancingReverseProxy(VyOSUnitTestSHIM.TestCase):
     def tearDown(self):
         # Check for running process
@@ -145,15 +168,18 @@ class TestLoadBalancingReverseProxy(VyOSUnitTestSHIM.TestCase):
         # Process must be terminated after deleting the config
         self.assertFalse(process_named_running(PROCESS_NAME))
 
-    def base_config(self):
-        self.cli_set(base_path + ['service', 'https_front', 'mode', 'http'])
-        self.cli_set(base_path + ['service', 'https_front', 'port', '4433'])
-        self.cli_set(base_path + ['service', 'https_front', 'backend', 'bk-01'])
+        # always forward to base class
+        super().tearDown()
 
-        self.cli_set(base_path + ['backend', 'bk-01', 'mode', 'http'])
-        self.cli_set(base_path + ['backend', 'bk-01', 'server', 'bk-01', 'address', '192.0.2.11'])
-        self.cli_set(base_path + ['backend', 'bk-01', 'server', 'bk-01', 'port', '9090'])
-        self.cli_set(base_path + ['backend', 'bk-01', 'server', 'bk-01', 'send-proxy'])
+    def base_config(self):
+        self.cli_set(base_path + ['service', haproxy_service_name, 'mode', 'http'])
+        self.cli_set(base_path + ['service', haproxy_service_name, 'port', '4433'])
+        self.cli_set(base_path + ['service', haproxy_service_name, 'backend', haproxy_backend_name])
+
+        self.cli_set(base_path + ['backend', haproxy_backend_name, 'mode', 'http'])
+        self.cli_set(base_path + ['backend', haproxy_backend_name, 'server', haproxy_backend_name, 'address', '192.0.2.11'])
+        self.cli_set(base_path + ['backend', haproxy_backend_name, 'server', haproxy_backend_name, 'port', '9090'])
+        self.cli_set(base_path + ['backend', haproxy_backend_name, 'server', haproxy_backend_name, 'send-proxy'])
 
         self.cli_set(base_path + ['global-parameters', 'max-connections', '1000'])
 
@@ -167,20 +193,21 @@ class TestLoadBalancingReverseProxy(VyOSUnitTestSHIM.TestCase):
         self.cli_set(['pki', 'certificate', 'smoketest', 'certificate', valid_cert.replace('\n','')])
         self.cli_set(['pki', 'certificate', 'smoketest', 'private', 'key', valid_cert_private_key.replace('\n','')])
 
-    def test_01_lb_reverse_proxy_domain(self):
+    def test_reverse_proxy_domain(self):
         domains_bk_first = ['n1.example.com', 'n2.example.com', 'n3.example.com']
         domain_bk_second = 'n5.example.com'
-        frontend = 'https_front'
+        frontend = 'vyos_smoketest'
         front_port = '4433'
         bk_server_first = '192.0.2.11'
         bk_server_second = '192.0.2.12'
-        bk_first_name = 'bk-01'
-        bk_second_name = 'bk-02'
+        bk_first_name = 'vyosbk-01'
+        bk_second_name = 'vyosbk-02'
         bk_server_port = '9090'
         mode = 'http'
         rule_ten = '10'
         rule_twenty = '20'
         rule_thirty = '30'
+        rule_forty = '40'
         send_proxy = 'send-proxy'
         max_connections = '1000'
 
@@ -195,6 +222,9 @@ class TestLoadBalancingReverseProxy(VyOSUnitTestSHIM.TestCase):
         self.cli_set(base_path + ['service', frontend, 'rule', rule_twenty, 'set', 'backend', bk_second_name])
         self.cli_set(base_path + ['service', frontend, 'rule', rule_thirty, 'url-path', 'end', '/test'])
         self.cli_set(base_path + ['service', frontend, 'rule', rule_thirty, 'set', 'backend', bk_second_name])
+        self.cli_set(base_path + ['service', frontend, 'rule', rule_forty, 'domain-name', domain_bk_second])
+        self.cli_set(base_path + ['service', frontend, 'rule', rule_forty, 'set', 'backend', bk_second_name])
+        self.cli_set(base_path + ['service', frontend, 'rule', rule_forty, 'wildcard-domain'])
 
         self.cli_set(back_base + [bk_first_name, 'mode', mode])
         self.cli_set(back_base + [bk_first_name, 'server', bk_first_name, 'address', bk_server_first])
@@ -227,6 +257,8 @@ class TestLoadBalancingReverseProxy(VyOSUnitTestSHIM.TestCase):
         self.assertIn(f'use_backend {bk_second_name} if {rule_twenty}', config)
         self.assertIn(f'acl {rule_thirty} path -i -m end /test', config)
         self.assertIn(f'use_backend {bk_second_name} if {rule_thirty}', config)
+        self.assertIn(f'acl {rule_forty} hdr(host) -i -m end .{domain_bk_second}', config)
+        self.assertIn(f'use_backend {bk_second_name} if {rule_forty}', config)
 
         # Backend
         self.assertIn(f'backend {bk_first_name}', config)
@@ -241,9 +273,9 @@ class TestLoadBalancingReverseProxy(VyOSUnitTestSHIM.TestCase):
         self.assertIn(f'server {bk_second_name} {bk_server_second}:{bk_server_port}', config)
         self.assertIn(f'server {bk_second_name} {bk_server_second}:{bk_server_port} backup', config)
 
-    def test_02_lb_reverse_proxy_cert_not_exists(self):
+    def test_reverse_proxy_cert_not_exists(self):
         self.base_config()
-        self.cli_set(base_path + ['service', 'https_front', 'ssl', 'certificate', 'cert'])
+        self.cli_set(base_path + ['service', haproxy_service_name, 'ssl', 'certificate', 'cert'])
 
         with self.assertRaises(ConfigSessionError) as e:
             self.cli_commit()
@@ -253,19 +285,19 @@ class TestLoadBalancingReverseProxy(VyOSUnitTestSHIM.TestCase):
         self.configure_pki()
 
         self.base_config()
-        self.cli_set(base_path + ['service', 'https_front', 'ssl', 'certificate', 'cert'])
+        self.cli_set(base_path + ['service', haproxy_service_name, 'ssl', 'certificate', 'cert'])
 
         with self.assertRaises(ConfigSessionError) as e:
             self.cli_commit()
         # self.assertIn('\nCertificate "cert" does not exist\n', str(e.exception))
 
-        self.cli_delete(base_path + ['service', 'https_front', 'ssl', 'certificate', 'cert'])
-        self.cli_set(base_path + ['service', 'https_front', 'ssl', 'certificate', 'smoketest'])
+        self.cli_delete(base_path + ['service', haproxy_service_name, 'ssl', 'certificate', 'cert'])
+        self.cli_set(base_path + ['service', haproxy_service_name, 'ssl', 'certificate', 'smoketest'])
         self.cli_commit()
 
-    def test_03_lb_reverse_proxy_ca_not_exists(self):
+    def test_reverse_proxy_ca_not_exists(self):
         self.base_config()
-        self.cli_set(base_path + ['backend', 'bk-01', 'ssl', 'ca-certificate', 'ca-test'])
+        self.cli_set(base_path + ['backend', haproxy_backend_name, 'ssl', 'ca-certificate', 'ca-test'])
 
         with self.assertRaises(ConfigSessionError) as e:
             self.cli_commit()
@@ -275,40 +307,40 @@ class TestLoadBalancingReverseProxy(VyOSUnitTestSHIM.TestCase):
         self.configure_pki()
 
         self.base_config()
-        self.cli_set(base_path + ['backend', 'bk-01', 'ssl', 'ca-certificate', 'ca-test'])
+        self.cli_set(base_path + ['backend', haproxy_backend_name, 'ssl', 'ca-certificate', 'ca-test'])
 
         with self.assertRaises(ConfigSessionError) as e:
             self.cli_commit()
         # self.assertIn('\nCA certificate "ca-test" does not exist\n', str(e.exception))
 
-        self.cli_delete(base_path + ['backend', 'bk-01', 'ssl', 'ca-certificate', 'ca-test'])
-        self.cli_set(base_path + ['backend', 'bk-01', 'ssl', 'ca-certificate', 'smoketest'])
+        self.cli_delete(base_path + ['backend', haproxy_backend_name, 'ssl', 'ca-certificate', 'ca-test'])
+        self.cli_set(base_path + ['backend', haproxy_backend_name, 'ssl', 'ca-certificate', 'smoketest'])
         self.cli_commit()
 
-    def test_04_lb_reverse_proxy_backend_ssl_no_verify(self):
+    def test_reverse_proxy_backend_ssl_no_verify(self):
         # Setup base
         self.configure_pki()
         self.base_config()
 
         # Set no-verify option
-        self.cli_set(base_path + ['backend', 'bk-01', 'ssl', 'no-verify'])
+        self.cli_set(base_path + ['backend', haproxy_backend_name, 'ssl', 'no-verify'])
         self.cli_commit()
 
         # Test no-verify option
         config = read_file(HAPROXY_CONF)
-        self.assertIn('server bk-01 192.0.2.11:9090 send-proxy ssl verify none', config)
+        self.assertIn(f'server {haproxy_backend_name} 192.0.2.11:9090 send-proxy ssl verify none', config)
 
         # Test setting ca-certificate alongside no-verify option fails, to test config validation
-        self.cli_set(base_path + ['backend', 'bk-01', 'ssl', 'ca-certificate', 'smoketest'])
+        self.cli_set(base_path + ['backend', haproxy_backend_name, 'ssl', 'ca-certificate', 'smoketest'])
         with self.assertRaises(ConfigSessionError) as e:
             self.cli_commit()
 
-    def test_05_lb_reverse_proxy_backend_http_check(self):
+    def test_reverse_proxy_backend_http_check(self):
         # Setup base
         self.base_config()
 
         # Set http-check
-        self.cli_set(base_path + ['backend', 'bk-01', 'http-check', 'method', 'get'])
+        self.cli_set(base_path + ['backend', haproxy_backend_name, 'http-check', 'method', 'get'])
         self.cli_commit()
 
         # Test http-check
@@ -317,8 +349,8 @@ class TestLoadBalancingReverseProxy(VyOSUnitTestSHIM.TestCase):
         self.assertIn('http-check send meth GET', config)
 
         # Set http-check with uri and status
-        self.cli_set(base_path + ['backend', 'bk-01', 'http-check', 'uri', '/health'])
-        self.cli_set(base_path + ['backend', 'bk-01', 'http-check', 'expect', 'status', '200'])
+        self.cli_set(base_path + ['backend', haproxy_backend_name, 'http-check', 'uri', '/health'])
+        self.cli_set(base_path + ['backend', haproxy_backend_name, 'http-check', 'expect', 'status', '200'])
         self.cli_commit()
 
         # Test http-check with uri and status
@@ -328,8 +360,8 @@ class TestLoadBalancingReverseProxy(VyOSUnitTestSHIM.TestCase):
         self.assertIn('http-check expect status 200', config)
 
         # Set http-check with string
-        self.cli_delete(base_path + ['backend', 'bk-01', 'http-check', 'expect', 'status', '200'])
-        self.cli_set(base_path + ['backend', 'bk-01', 'http-check', 'expect', 'string', 'success'])
+        self.cli_delete(base_path + ['backend', haproxy_backend_name, 'http-check', 'expect', 'status', '200'])
+        self.cli_set(base_path + ['backend', haproxy_backend_name, 'http-check', 'expect', 'string', 'success'])
         self.cli_commit()
 
         # Test http-check with string
@@ -339,11 +371,11 @@ class TestLoadBalancingReverseProxy(VyOSUnitTestSHIM.TestCase):
         self.assertIn('http-check expect string success', config)
 
         # Test configuring both http-check & health-check fails validation script
-        self.cli_set(base_path + ['backend', 'bk-01', 'health-check', 'ldap'])
+        self.cli_set(base_path + ['backend', haproxy_backend_name, 'health-check', 'ldap'])
         with self.assertRaises(ConfigSessionError) as e:
             self.cli_commit()
 
-    def test_06_lb_reverse_proxy_tcp_mode(self):
+    def test_reverse_proxy_tcp_mode(self):
         frontend = 'tcp_8443'
         mode = 'tcp'
         front_port = '8433'
@@ -390,27 +422,27 @@ class TestLoadBalancingReverseProxy(VyOSUnitTestSHIM.TestCase):
         self.assertIn(f'mode {mode}', config)
         self.assertIn(f'server {bk_name} {bk_server}:{bk_server_port}', config)
 
-    def test_07_lb_reverse_proxy_http_response_headers(self):
+    def test_reverse_proxy_http_response_headers(self):
         # Setup base
         self.configure_pki()
         self.base_config()
 
         # Set example headers in both frontend and backend
-        self.cli_set(base_path + ['service', 'https_front', 'http-response-headers', 'Cache-Control', 'value', 'max-age=604800'])
-        self.cli_set(base_path + ['backend', 'bk-01',  'http-response-headers', 'Proxy-Backend-ID', 'value', 'bk-01'])
+        self.cli_set(base_path + ['service', haproxy_service_name, 'http-response-headers', 'Cache-Control', 'value', 'max-age=604800'])
+        self.cli_set(base_path + ['backend', haproxy_backend_name,  'http-response-headers', 'Proxy-Backend-ID', 'value', haproxy_backend_name])
         self.cli_commit()
 
         # Test headers are present in generated configuration file
         config = read_file(HAPROXY_CONF)
         self.assertIn('http-response set-header Cache-Control \'max-age=604800\'', config)
-        self.assertIn('http-response set-header Proxy-Backend-ID \'bk-01\'', config)
+        self.assertIn(f'http-response set-header Proxy-Backend-ID \'{haproxy_backend_name}\'', config)
 
         # Test setting alongside modes other than http is blocked by validation conditions
-        self.cli_set(base_path + ['service', 'https_front', 'mode', 'tcp'])
+        self.cli_set(base_path + ['service', haproxy_service_name, 'mode', 'tcp'])
         with self.assertRaises(ConfigSessionError) as e:
             self.cli_commit()
 
-    def test_08_lb_reverse_proxy_tcp_health_checks(self):
+    def test_reverse_proxy_tcp_health_checks(self):
         # Setup PKI
         self.configure_pki()
 
@@ -458,7 +490,67 @@ class TestLoadBalancingReverseProxy(VyOSUnitTestSHIM.TestCase):
         config = read_file(HAPROXY_CONF)
         self.assertIn(f'option smtpchk', config)
 
-    def test_09_lb_reverse_proxy_logging(self):
+    def test_reverse_proxy_tcp_health_checks_custom_port(self):
+        # Define variables
+        service = 'my-tcp-api'
+        mode = 'tcp'
+        front_port = '9000'
+        backend = 'bk-01'
+        balance = 'round-robin'
+        servers = [
+            ('srv01', '192.0.2.11', '9001', '9011'),
+            ('srv02', '192.0.2.12', '9002', None),
+            ('srv03', '192.0.2.13', '9003', '9013'),
+        ]
+
+        # Configure frontend
+        self.cli_set(base_path + ['service', service, 'backend', backend])
+        self.cli_set(base_path + ['service', service, 'mode', mode])
+        self.cli_set(base_path + ['service', service, 'port', front_port])
+
+        # Configure backend
+        self.cli_set(base_path + ['backend', backend, 'balance', balance])
+        self.cli_set(base_path + ['backend', backend, 'mode', mode])
+
+        # Configure backend servers
+        for name, addr, port, check_port in servers:
+            base_server_path = base_path + ['backend', backend, 'server', name]
+            self.cli_set(base_server_path + ['address', addr])
+            self.cli_set(base_server_path + ['port', port])
+
+            if check_port:
+                self.cli_set(base_server_path + ['check', 'port', check_port])
+            else:
+                self.cli_set(base_server_path + ['check'])
+
+        # Commit and read config
+        self.cli_commit()
+        config = read_file(HAPROXY_CONF)
+        config_lines = [line.strip() for line in config.splitlines()]
+
+        # Validate Frontend
+        self.assertIn(f'frontend {service}', config)
+        self.assertIn(f'bind [::]:{front_port} v4v6', config)
+        self.assertIn(f'mode {mode}', config)
+        self.assertIn(f'default_backend {backend}', config)
+
+        # Validate Backend
+        self.assertIn(f'backend {backend}', config)
+        self.assertIn('balance roundrobin', config)
+        self.assertIn(f'mode {mode}', config)
+
+        # Validate backend servers
+        for name, addr, port, check_port in servers:
+            with self.subTest(name=name):
+                expected_line = f'server {name} {addr}:{port}'
+                if check_port:
+                    expected_line += f' check port {check_port}'
+                else:
+                    expected_line += f' check'
+
+                self.assertIn(expected_line, config_lines)
+
+    def test_reverse_proxy_logging(self):
         # Setup base
         self.base_config()
         self.cli_commit()
@@ -477,7 +569,7 @@ class TestLoadBalancingReverseProxy(VyOSUnitTestSHIM.TestCase):
         self.assertIn('log /dev/log local2 warning', config)
 
         # Test backend logging options
-        backend_path = base_path + ['backend', 'bk-01']
+        backend_path = base_path + ['backend', haproxy_backend_name]
         self.cli_set(backend_path + ['logging', 'facility', 'local3', 'level', 'debug'])
         self.cli_set(backend_path + ['logging', 'facility', 'local4', 'level', 'info'])
         self.cli_commit()
@@ -488,7 +580,7 @@ class TestLoadBalancingReverseProxy(VyOSUnitTestSHIM.TestCase):
         self.assertIn('log /dev/log local4 info', config)
 
         # Test service logging options
-        service_path = base_path + ['service', 'https_front']
+        service_path = base_path + ['service', haproxy_service_name]
         self.cli_set(service_path + ['logging', 'facility', 'local5', 'level', 'notice'])
         self.cli_set(service_path + ['logging', 'facility', 'local6', 'level', 'crit'])
         self.cli_commit()
@@ -498,16 +590,17 @@ class TestLoadBalancingReverseProxy(VyOSUnitTestSHIM.TestCase):
         self.assertIn('log /dev/log local5 notice', config)
         self.assertIn('log /dev/log local6 crit', config)
 
-    def test_10_lb_reverse_proxy_http_compression(self):
+    def test_reverse_proxy_http_compression(self):
         # Setup base
         self.configure_pki()
         self.base_config()
 
         # Configure compression in frontend
-        self.cli_set(base_path + ['service', 'https_front', 'http-compression', 'algorithm', 'gzip'])
-        self.cli_set(base_path + ['service', 'https_front', 'http-compression', 'mime-type', 'text/html'])
-        self.cli_set(base_path + ['service', 'https_front', 'http-compression', 'mime-type', 'text/javascript'])
-        self.cli_set(base_path + ['service', 'https_front', 'http-compression', 'mime-type', 'text/plain'])
+        http_comp_path = base_path + ['service', haproxy_service_name, 'http-compression']
+        self.cli_set(http_comp_path + ['algorithm', 'gzip'])
+        self.cli_set(http_comp_path + ['mime-type', 'text/html'])
+        self.cli_set(http_comp_path + ['mime-type', 'text/javascript'])
+        self.cli_set(http_comp_path + ['mime-type', 'text/plain'])
         self.cli_commit()
 
         # Test compression is present in generated configuration file
@@ -517,9 +610,124 @@ class TestLoadBalancingReverseProxy(VyOSUnitTestSHIM.TestCase):
         self.assertIn('compression type text/html text/javascript text/plain', config)
 
         # Test setting compression without specifying any mime-types fails verification
-        self.cli_delete(base_path + ['service', 'https_front', 'http-compression', 'mime-type'])
+        self.cli_delete(base_path + ['service', haproxy_service_name, 'http-compression', 'mime-type'])
         with self.assertRaises(ConfigSessionError) as e:
             self.cli_commit()
 
+    def test_reverse_proxy_timeout(self):
+        t_default_check = '5'
+        t_default_client = '50'
+        t_default_connect = '10'
+        t_default_server ='50'
+        t_check = '4'
+        t_client = '300'
+        t_connect = '12'
+        t_server ='120'
+        t_front_client = '600'
+
+        self.base_config()
+        self.cli_commit()
+        # Check default timeout options
+        config_entries = (
+            f'timeout check {t_default_check}s',
+            f'timeout connect {t_default_connect}s',
+            f'timeout client {t_default_client}s',
+            f'timeout server {t_default_server}s',
+        )
+        # Check default timeout options
+        config = read_file(HAPROXY_CONF)
+        for config_entry in config_entries:
+            self.assertIn(config_entry, config)
+
+        # Set custom timeout options
+        self.cli_set(base_path + ['timeout', 'check', t_check])
+        self.cli_set(base_path + ['timeout', 'client', t_client])
+        self.cli_set(base_path + ['timeout', 'connect', t_connect])
+        self.cli_set(base_path + ['timeout', 'server', t_server])
+        self.cli_set(base_path + ['service', haproxy_service_name, 'timeout', 'client', t_front_client])
+
+        self.cli_commit()
+
+        # Check custom timeout options
+        config_entries = (
+            f'timeout check {t_check}s',
+            f'timeout connect {t_connect}s',
+            f'timeout client {t_client}s',
+            f'timeout server {t_server}s',
+            f'timeout client {t_front_client}s',
+        )
+
+        # Check configured options
+        config = read_file(HAPROXY_CONF)
+        for config_entry in config_entries:
+            self.assertIn(config_entry, config)
+
+    def test_reverse_proxy_http_redirect(self):
+        self.base_config()
+        self.cli_set(base_path + ['service', haproxy_service_name, 'redirect-http-to-https'])
+
+        self.cli_commit()
+
+        config = parse_haproxy_config()
+        frontend_name = f'frontend {haproxy_service_name}-http'
+        self.assertIn(frontend_name, config.keys())
+        self.assertIn('mode http', config[frontend_name])
+        self.assertIn('bind [::]:80 v4v6', config[frontend_name])
+        self.assertIn('acl acme_acl path_beg /.well-known/acme-challenge/', config[frontend_name])
+        self.assertIn('use_backend buildin_acme_certbot if acme_acl', config[frontend_name])
+        self.assertIn('redirect scheme https code 301 if !acme_acl', config[frontend_name])
+
+        backend_name = 'backend buildin_acme_certbot'
+        self.assertIn(backend_name, config.keys())
+        port = get_default_port('certbot_haproxy')
+        self.assertIn(f'server localhost 127.0.0.1:{port}', config[backend_name])
+
+    def test_reverse_proxy_listen_address_no_port_conflict(self):
+        # HAProxy port conflict check must consider listen-address (T7928)
+
+        frontend = 'svc-1'
+        backend = 'bk-1'
+        shared_port = '993'
+        addr_listen = '::1'  # HAProxy listen-address
+        addr_busy = '127.0.0.1'  # IP address kept busy by nc (different from the first)
+
+        # Run the netcat command to bind to the specified address and port
+        call(f'sudo nc -lk -s {addr_busy} -p {shared_port} &')
+
+        # Give nc a moment to bind before we commit
+        time.sleep(0.5)
+
+        try:
+            backend_path = base_path + ['backend', backend]
+            self.cli_set(backend_path + ['mode', 'tcp'])
+            self.cli_set(backend_path + ['server', 'srv-m', 'address', '192.0.2.14'])
+            self.cli_set(backend_path + ['server', 'srv-m', 'port', shared_port])
+
+            # Configure HAProxy frontend with listen-address
+            service_path = base_path + ['service', frontend]
+            self.cli_set(service_path + ['mode', 'tcp'])
+            self.cli_set(service_path + ['port', shared_port])
+            self.cli_set(service_path + ['listen-address', addr_listen])
+            self.cli_set(service_path + ['backend', backend])
+
+            # Must commit without raising "TCP port N is used by another service"
+            self.cli_commit()
+
+            # Commit with raising "TCP port N is used by another service"
+            self.cli_set(service_path + ['listen-address', addr_busy])
+            with self.assertRaises(ConfigSessionError) as e:
+                self.cli_commit()
+        finally:
+            # Always clean up nc regardless of test outcome
+            call('sudo pkill nc')
+
+        self.assertTrue(process_named_running(PROCESS_NAME))
+        config = read_file(HAPROXY_CONF)
+
+        # The busy address must NOT appear as a HAProxy bind
+        self.assertNotIn(f'bind {addr_busy}:{shared_port}', config)
+        self.assertIn(f'bind [{addr_listen}]:{shared_port}', config)
+
+
 if __name__ == '__main__':
-    unittest.main(verbosity=2)
+    unittest.main(verbosity=2, failfast=VyOSUnitTestSHIM.TestCase.debug_on())

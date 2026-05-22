@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2021-2024 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -21,13 +21,18 @@ from sys import exit
 
 from vyos.base import Warning
 from vyos.config import Config
+from vyos.configdict import node_changed
+from vyos.configdiff import Diff
 from vyos.template import render
 from vyos.utils.dict import dict_search_args
+from vyos.utils.dict import dict_search_recursive
 from vyos.utils.process import cmd
 from vyos.utils.process import run
 from vyos.utils.network import get_vrf_tableid
+from vyos.utils.network import interface_exists
 from vyos.defaults import rt_global_table
 from vyos.defaults import rt_global_vrf
+from vyos.geoip import  geoip_refresh, geoip_update
 from vyos import ConfigError
 from vyos import airbag
 airbag.enable()
@@ -42,6 +47,41 @@ valid_groups = [
     'port_group',
     'interface_group'
 ]
+
+def geoip_updated(conf):
+    updated = False
+
+    changes_v4 = node_changed(conf, ['policy', 'route'],
+                                 key_mangling=('-', '_'),
+                                 recursive=True,
+                                 expand_nodes=Diff.ADD | Diff.DELETE)
+
+    for _, path in dict_search_recursive(changes_v4, 'geoip'):
+        updated = True
+        break
+
+    if not updated:
+        changes_v6 = node_changed(conf, ['policy', 'route6'],
+                                 key_mangling=('-', '_'),
+                                 recursive=True,
+                                 expand_nodes=Diff.ADD | Diff.DELETE)
+
+        for _, path in dict_search_recursive(changes_v6, 'geoip'):
+            updated = True
+            break
+
+    return updated
+
+def geoip_sets(policy):
+    out = {'name': [], 'ipv6_name': []}
+
+    for _, path in dict_search_recursive(policy, 'geoip'):
+        if (path[0] == 'route'):
+            out['name'].append(f'GEOIP_CC_{path[0]}_{path[1]}_{path[3]}')
+        elif (path[0] == 'route6'):
+            out['ipv6_name'].append(f'GEOIP_CC6_{path[0]}_{path[1]}_{path[3]}')
+
+    return out
 
 def get_config(config=None):
     if config:
@@ -59,6 +99,9 @@ def get_config(config=None):
     # Remove dynamic firewall groups if present:
     if 'dynamic_group' in policy['firewall_group']:
         del policy['firewall_group']['dynamic_group']
+
+    policy['geoip_sets'] = geoip_sets(policy)
+    policy['geoip_updated'] = geoip_updated(conf)
 
     return policy
 
@@ -88,6 +131,11 @@ def verify_rule(policy, name, rule_conf, ipv6, rule_id):
 
         if 'vrf' in rule_conf['set'] and 'table' in rule_conf['set']:
             raise ConfigError(f'{name} rule {rule_id}: Cannot set both forwarding route table and VRF')
+
+        if 'vrf' in rule_conf['set']:
+            vrf = rule_conf['set']['vrf']
+            if vrf != 'default' and not interface_exists(vrf):
+                raise ConfigError(f'{name} rule {rule_id}: VRF "{vrf}" does not exist')
 
     tcp_flags = dict_search_args(rule_conf, 'tcp', 'flags')
     if tcp_flags:
@@ -202,6 +250,13 @@ def apply(policy):
         cleanup_table_marks()
 
     apply_table_marks(policy)
+
+    if policy['geoip_sets']:
+        # Call helper script to Update set contents
+        if 'name' in policy['geoip_sets'] or 'ipv6_name' in policy['geoip_sets']:
+            if policy['geoip_updated'] or not geoip_refresh():
+                print('Updating GeoIP. Please wait...')
+                geoip_update(policy=policy)
 
     return None
 

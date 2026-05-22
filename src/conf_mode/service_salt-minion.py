@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2018-2022 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -20,7 +20,7 @@ from socket import gethostname
 from sys import exit
 from urllib3 import PoolManager
 
-from vyos.base import Warning
+from vyos.base import Warning, DeprecationWarning
 from vyos.config import Config
 from vyos.configverify import verify_interface_exists
 from vyos.template import render
@@ -52,7 +52,7 @@ def get_config(config=None):
     if 'id' not in salt:
         salt['id'] = gethostname()
     # We have gathered the dict representation of the CLI, but there are default
-    # options which we need to update into the dictionary retrived.
+    # options which we need to update into the dictionary retrieved.
     salt = conf.merge_defaults(salt, recursive=True)
 
     if not conf.exists(base):
@@ -65,6 +65,8 @@ def get_config(config=None):
 def verify(salt):
     if not salt:
         return None
+
+    DeprecationWarning('Salt minion integration is deprecated and will be removed in future VyOS versions')
 
     if 'hash' in salt and salt['hash'] == 'sha1':
         Warning('Do not use sha1 hashing algorithm, upgrade to sha256 or later!')

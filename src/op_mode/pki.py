@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2021-2024 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -26,6 +26,7 @@ from cryptography.x509.oid import ExtendedKeyUsageOID
 
 import vyos.opmode
 
+from vyos.base import Warning
 from vyos.config import Config
 from vyos.config import config_dict_mangle_acme
 from vyos.pki import encode_certificate
@@ -417,7 +418,7 @@ def parse_san_string(san_string):
             output.append(ipaddress.IPv6Address(value))
         elif tag == 'dns' or tag == 'rfc822':
             output.append(value)
-    return
+    return output
 
 
 def generate_certificate_request(
@@ -1373,6 +1374,27 @@ def show_all(raw: bool):
     print('\n')
     show_crl(raw)
 
+def renew_certbot(raw: bool, force: typing.Optional[bool] = False):
+    from vyos.defaults import directories
+
+    certbot_config = directories['certbot']
+    vyos_conf_scripts_dir = directories['conf_mode']
+
+    if force and not os.path.isdir(f'{certbot_config}'):
+        # Assume someone deleted the certbot_config folder, renew alone will not
+        # work as there are no configuration files left to know what to renew.
+        # Re-run CLI PKI helper to initially request certificates via ACME
+        # again. This should never be the case - but sometimes the universe has
+        # a bad time
+        Warning(f'Directory "{certbot_config}" missing. Reinitializing PKI ' \
+                'subsystem...\n\n')
+        out = cmd(f'sudo sg vyattacfg -c "{vyos_conf_scripts_dir}/pki.py"')
+    elif force:
+        out = cmd(f'sudo sg vyattacfg -c "{vyos_conf_scripts_dir}/pki.py certbot_renew_force"')
+    else:
+        out = cmd(f'sudo sg vyattacfg -c "{vyos_conf_scripts_dir}/pki.py certbot_renew"')
+
+    print(out)
 
 if __name__ == '__main__':
     try:

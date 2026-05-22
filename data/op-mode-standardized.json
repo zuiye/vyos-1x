@@ -5,6 +5,7 @@
 "bridge.py",
 "cgnat.py",
 "config_mgmt.py",
+"config_sync.py",
 "conntrack.py",
 "container.py",
 "cpu.py",
@@ -13,6 +14,7 @@
 "evpn.py",
 "interfaces.py",
 "ipsec.py",
+"load-balancing_wan.py",
 "lldp.py",
 "log.py",
 "memory.py",
@@ -27,8 +29,10 @@
 "load-balancing_haproxy.py",
 "route.py",
 "storage.py",
+"stp.py",
 "system.py",
 "uptime.py",
 "version.py",
+"vpp.py",
 "vrf.py"
 ]

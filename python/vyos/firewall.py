@@ -1,4 +1,4 @@
-# Copyright (C) 2021-2024 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -12,24 +12,16 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-import csv
-import gzip
-import os
 import re
 
-from pathlib import Path
 from socket import AF_INET
 from socket import AF_INET6
 from socket import getaddrinfo
-from time import strftime
 
-from vyos.remote import download
 from vyos.template import is_ipv4
-from vyos.template import render
 from vyos.utils.dict import dict_search_args
 from vyos.utils.dict import dict_search_recursive
 from vyos.utils.process import cmd
-from vyos.utils.process import run
 from vyos.utils.network import get_vrf_tableid
 from vyos.defaults import rt_global_table
 from vyos.defaults import rt_global_vrf
@@ -233,6 +225,9 @@ def parse_rule(rule_conf, hook, fw_name, rule_id, ip_name):
                     hook_name = 'prerouting'
                 if hook == 'NAM':
                     hook_name = f'name'
+                # for policy
+                if hook == 'route' or hook == 'route6':
+                    hook_name = hook
                 output.append(f'{ip_name} {prefix}addr {operator} @GEOIP_CC{def_suffix}_{hook_name}_{fw_name}_{rule_id}')
 
             if 'mac_address' in side_conf:
@@ -310,6 +305,16 @@ def parse_rule(rule_conf, hook, fw_name, rule_id, ip_name):
                         operator = '!='
                         group_name = group_name[1:]
                     output.append(f'{ip_name} {prefix}addr {operator} @D_{group_name}')
+                elif 'remote_group' in group:
+                    group_name = group['remote_group']
+                    operator = ''
+                    if group_name[0] == '!':
+                        operator = '!='
+                        group_name = group_name[1:]
+                    if ip_name == 'ip':
+                        output.append(f'{ip_name} {prefix}addr {operator} @R_{group_name}')
+                    elif ip_name == 'ip6':
+                        output.append(f'{ip_name} {prefix}addr {operator} @R6_{group_name}')
                 if 'mac_group' in group:
                     group_name = group['mac_group']
                     operator = ''
@@ -348,7 +353,7 @@ def parse_rule(rule_conf, hook, fw_name, rule_id, ip_name):
             if iiface[0] == '!':
                 operator = '!='
                 iiface = iiface[1:]
-            output.append(f'iifname {operator} {{{iiface}}}')
+            output.append(f'iifname {operator} {{"{iiface}"}}')
         elif 'group' in rule_conf['inbound_interface']:
             iiface = rule_conf['inbound_interface']['group']
             if iiface[0] == '!':
@@ -363,7 +368,7 @@ def parse_rule(rule_conf, hook, fw_name, rule_id, ip_name):
             if oiface[0] == '!':
                 operator = '!='
                 oiface = oiface[1:]
-            output.append(f'oifname {operator} {{{oiface}}}')
+            output.append(f'oifname {operator} {{"{oiface}"}}')
         elif 'group' in rule_conf['outbound_interface']:
             oiface = rule_conf['outbound_interface']['group']
             if oiface[0] == '!':
@@ -461,14 +466,14 @@ def parse_rule(rule_conf, hook, fw_name, rule_id, ip_name):
             output.append('gre version 1')
 
         if gre_key:
-            # The offset of the key within the packet shifts depending on the C-flag. 
-            # nftables cannot handle complex enough expressions to match multiple 
+            # The offset of the key within the packet shifts depending on the C-flag.
+            # nftables cannot handle complex enough expressions to match multiple
             # offsets based on bitfields elsewhere.
-            # We enforce a specific match for the checksum flag in validation, so the 
-            # gre_flags dict will always have a 'checksum' key when gre_key is populated. 
-            if not gre_flags['checksum']: 
+            # We enforce a specific match for the checksum flag in validation, so the
+            # gre_flags dict will always have a 'checksum' key when gre_key is populated.
+            if not gre_flags['checksum']:
                 # No "unset" child node means C is set, we offset key lookup +32 bits
-                output.append(f'@th,64,32 == {gre_key}')                
+                output.append(f'@th,64,32 == {gre_key}')
             else:
                 output.append(f'@th,32,32 == {gre_key}')
 
@@ -550,7 +555,7 @@ def parse_rule(rule_conf, hook, fw_name, rule_id, ip_name):
                     timeout_value = side_conf['timeout']
                     output.append(f'set update ip{def_suffix} {prefix}addr timeout {timeout_value} @DA{def_suffix}_{dyn_group}')
                 else:
-                    output.append(f'set update ip{def_suffix} saddr @DA{def_suffix}_{dyn_group}')
+                    output.append(f'set update ip{def_suffix} {prefix}addr @DA{def_suffix}_{dyn_group}')
 
     set_table = False
     if 'set' in rule_conf:
@@ -627,7 +632,7 @@ def parse_rule(rule_conf, hook, fw_name, rule_id, ip_name):
     return " ".join(output)
 
 def parse_gre_flags(flags, force_keyed=False):
-    flag_map = { # nft does not have symbolic names for these. 
+    flag_map = { # nft does not have symbolic names for these.
         'checksum': 1<<0,
         'routing':  1<<1,
         'key':      1<<2,
@@ -638,7 +643,7 @@ def parse_gre_flags(flags, force_keyed=False):
     include = 0
     exclude = 0
     for fl_name, fl_state in flags.items():
-        if not fl_state: 
+        if not fl_state:
             include |= flag_map[fl_name]
         else: # 'unset' child tag
             exclude |= flag_map[fl_name]
@@ -657,6 +662,19 @@ def parse_tcp_flags(flags):
     exclude = list(flags['not']) if 'not' in flags else []
     return f'tcp flags & ({"|".join(include + exclude)}) == {"|".join(include) if include else "0x0"}'
 
+def expand_weekday(abbrev: str) -> str:
+    mapping = {
+        'mon': 'monday',
+        'tue': 'tuesday',
+        'wed': 'wednesday',
+        'thu': 'thursday',
+        'fri': 'friday',
+        'sat': 'saturday',
+        'sun': 'sunday',
+    }
+    return mapping.get(abbrev.lower(), abbrev).lower()
+
+
 def parse_time(time):
     out = []
     if 'startdate' in time:
@@ -674,123 +692,7 @@ def parse_time(time):
     if 'stoptime' in time and 'stopdate' not in time:
         out.append(f'hour < "{time["stoptime"]}"')
     if 'weekdays' in time:
-        days = time['weekdays'].split(",")
-        out_days = [f'"{day}"' for day in days if day[0] != '!']
+        days = [day.strip() for day in time['weekdays'].split(",") if day]
+        out_days = [f'"{expand_weekday(day).title()}"' for day in days if day[0] != '!']
         out.append(f'day {{{",".join(out_days)}}}')
     return " ".join(out)
-
-# GeoIP
-
-nftables_geoip_conf = '/run/nftables-geoip.conf'
-geoip_database = '/usr/share/vyos-geoip/dbip-country-lite.csv.gz'
-geoip_lock_file = '/run/vyos-geoip.lock'
-
-def geoip_load_data(codes=[]):
-    data = None
-
-    if not os.path.exists(geoip_database):
-        return []
-
-    try:
-        with gzip.open(geoip_database, mode='rt') as csv_fh:
-            reader = csv.reader(csv_fh)
-            out = []
-            for start, end, code in reader:
-                if code.lower() in codes:
-                    out.append([start, end, code.lower()])
-            return out
-    except:
-        print('Error: Failed to open GeoIP database')
-    return []
-
-def geoip_download_data():
-    url = 'https://download.db-ip.com/free/dbip-country-lite-{}.csv.gz'.format(strftime("%Y-%m"))
-    try:
-        dirname = os.path.dirname(geoip_database)
-        if not os.path.exists(dirname):
-            os.mkdir(dirname)
-
-        download(geoip_database, url)
-        print("Downloaded GeoIP database")
-        return True
-    except:
-        print("Error: Failed to download GeoIP database")
-    return False
-
-class GeoIPLock(object):
-    def __init__(self, file):
-        self.file = file
-
-    def __enter__(self):
-        if os.path.exists(self.file):
-            return False
-
-        Path(self.file).touch()
-        return True
-
-    def __exit__(self, exc_type, exc_value, tb):
-        os.unlink(self.file)
-
-def geoip_update(firewall, force=False):
-    with GeoIPLock(geoip_lock_file) as lock:
-        if not lock:
-            print("Script is already running")
-            return False
-
-        if not firewall:
-            print("Firewall is not configured")
-            return True
-
-        if not os.path.exists(geoip_database):
-            if not geoip_download_data():
-                return False
-        elif force:
-            geoip_download_data()
-
-        ipv4_codes = {}
-        ipv6_codes = {}
-
-        ipv4_sets = {}
-        ipv6_sets = {}
-
-        # Map country codes to set names
-        for codes, path in dict_search_recursive(firewall, 'country_code'):
-            set_name = f'GEOIP_CC_{path[1]}_{path[2]}_{path[4]}'
-            if ( path[0] == 'ipv4'):
-                for code in codes:
-                    ipv4_codes.setdefault(code, []).append(set_name)
-            elif ( path[0] == 'ipv6' ):
-                set_name = f'GEOIP_CC6_{path[1]}_{path[2]}_{path[4]}'
-                for code in codes:
-                    ipv6_codes.setdefault(code, []).append(set_name)
-
-        if not ipv4_codes and not ipv6_codes:
-            if force:
-                print("GeoIP not in use by firewall")
-            return True
-
-        geoip_data = geoip_load_data([*ipv4_codes, *ipv6_codes])
-
-        # Iterate IP blocks to assign to sets
-        for start, end, code in geoip_data:
-            ipv4 = is_ipv4(start)
-            if code in ipv4_codes and ipv4:
-                ip_range = f'{start}-{end}' if start != end else start
-                for setname in ipv4_codes[code]:
-                    ipv4_sets.setdefault(setname, []).append(ip_range)
-            if code in ipv6_codes and not ipv4:
-                ip_range = f'{start}-{end}' if start != end else start
-                for setname in ipv6_codes[code]:
-                    ipv6_sets.setdefault(setname, []).append(ip_range)
-
-        render(nftables_geoip_conf, 'firewall/nftables-geoip-update.j2', {
-            'ipv4_sets': ipv4_sets,
-            'ipv6_sets': ipv6_sets
-        })
-
-        result = run(f'nft --file {nftables_geoip_conf}')
-        if result != 0:
-            print('Error: GeoIP failed to update firewall')
-            return False
-
-        return True

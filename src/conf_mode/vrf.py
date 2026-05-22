@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2020-2024 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -18,6 +18,8 @@ from sys import exit
 from jmespath import search
 from json import loads
 
+import vyos.defaults
+
 from vyos.config import Config
 from vyos.configdict import node_changed
 from vyos.configverify import verify_route_map
@@ -27,6 +29,8 @@ from vyos.frrender import get_frrender_dict
 from vyos.ifconfig import Interface
 from vyos.template import render
 from vyos.utils.dict import dict_search
+from vyos.utils.dict import dict_set_nested
+from vyos.utils.dict import dict_search_recursive
 from vyos.utils.network import get_vrf_tableid
 from vyos.utils.network import get_vrf_members
 from vyos.utils.network import interface_exists
@@ -116,6 +120,17 @@ def get_config(config=None):
     vrf = conf.get_config_dict(base, key_mangling=('-', '_'),
                                no_tag_node_value_mangle=True, get_first_key=True)
 
+    # Policy based routing supports referencing VRFs in it's rules - we need to
+    # prevent VRF deletion if VRF is used in a PBR rule
+    for policy_type in ['local-route', 'local-route6', 'route', 'route6']:
+        tmp = conf.get_config_dict(['policy', policy_type],
+                                    key_mangling=('-', '_'),
+                                    no_tag_node_value_mangle=True,
+                                    get_first_key=True)
+        if tmp:
+            policy_type = policy_type.replace('-', '_')
+            dict_set_nested(f'policy.{policy_type}', tmp, vrf)
+
     # determine which VRF has been removed
     for name in node_changed(conf, base + ['name']):
         if 'vrf_remove' not in vrf:
@@ -128,6 +143,10 @@ def get_config(config=None):
         # get VRF bound routing instances
         routes = vrf_routing(conf, name)
         if routes: vrf['vrf_remove'][name]['route'] = routes
+        # get VRF bound policy routes
+        if 'policy' in vrf:
+            for key, _ in dict_search_recursive(vrf['policy'], 'vrf'):
+                if key == name: vrf['vrf_remove'][name]['policy'] = {}
 
     if 'name' in vrf:
         vrf['conntrack'] = conntrack_required(conf)
@@ -141,12 +160,13 @@ def verify(vrf):
     # ensure VRF is not assigned to any interface
     if 'vrf_remove' in vrf:
         for name, config in vrf['vrf_remove'].items():
+            err = f'Can not remove VRF "{name}",'
             if 'interface' in config:
-                raise ConfigError(f'Can not remove VRF "{name}", it still has '\
-                                  f'member interfaces!')
+                raise ConfigError(f'{err} it still has member interfaces!')
             if 'route' in config:
-                raise ConfigError(f'Can not remove VRF "{name}", it still has '\
-                                  f'static routes installed!')
+                raise ConfigError(f'{err} it still has static routes installed!')
+            if 'policy' in config:
+                raise ConfigError(f'{err} it still has policy routes!')
 
     if 'name' in vrf:
         reserved_names = ['add', 'all', 'broadcast', 'default', 'delete', 'dev',
@@ -157,11 +177,16 @@ def verify(vrf):
         for name, vrf_config in vrf['name'].items():
             # Reserved VRF names
             if name in reserved_names:
-                raise ConfigError(f'VRF name "{name}" is reserved and connot be used!')
+                raise ConfigError(f'VRF name "{name}" is reserved and cannot be used!')
 
             # table id is mandatory
             if 'table' not in vrf_config:
                 raise ConfigError(f'VRF "{name}" table id is mandatory!')
+
+            if int(vrf_config['table']) == vyos.defaults.rt_global_vrf:
+                raise ConfigError(
+                    f'VRF "{name}" table id {vrf_config["table"]} cannot be used!'
+                )
 
             # routing table id can't be changed - OS restriction
             if interface_exists(name):
@@ -218,13 +243,13 @@ def apply(vrf):
     bind_all = '0'
     if 'bind_to_all' in vrf:
         bind_all = '1'
-    sysctl_write('net.ipv4.tcp_l3mdev_accept', bind_all)
-    sysctl_write('net.ipv4.udp_l3mdev_accept', bind_all)
+    sysctl_write(['net', 'ipv4', 'tcp_l3mdev_accept'], bind_all)
+    sysctl_write(['net', 'ipv4', 'udp_l3mdev_accept'], bind_all)
 
     for tmp in (dict_search('vrf_remove', vrf) or []):
         if interface_exists(tmp):
             # T5492: deleting a VRF instance may leafe processes running
-            # (e.g. dhclient) as there is a depedency ordering issue in the CLI.
+            # (e.g. dhclient) as there is a dependency ordering issue in the CLI.
             # We need to ensure that we stop the dhclient processes first so
             # a proper DHCLP RELEASE message is sent
             for interface in get_vrf_members(tmp):
@@ -233,12 +258,18 @@ def apply(vrf):
                 vrf_iface.set_dhcpv6(False)
 
             # Remove nftables conntrack zone map item
-            nft_del_element = f'delete element inet vrf_zones ct_iface_map {{ "{tmp}" }}'
+            nft_del_element = f'delete element inet vrf_zones ct_iface_map {{ \'"{tmp}"\' }}'
             # Check if deleting is possible first to avoid raising errors
             _, err = popen(f'nft --check {nft_del_element}')
             if not err:
                 # Remove map element
                 cmd(f'nft {nft_del_element}')
+
+            # Remove all ip rules pointing to this VRF table
+            table_id = get_vrf_tableid(tmp)
+            for afi in ['-4', '-6']:
+                while call(f'ip {afi} rule del table {table_id}') == 0:
+                    pass
 
             # Delete the VRF Kernel interface
             call(f'ip link delete dev {tmp}')
@@ -313,11 +344,11 @@ def apply(vrf):
             state = 'down' if 'disable' in config else 'up'
             vrf_if.set_admin_state(state)
             # Add nftables conntrack zone map item
-            nft_add_element = f'add element inet vrf_zones ct_iface_map {{ "{name}" : {table} }}'
+            nft_add_element = f'add element inet vrf_zones ct_iface_map {{ \'"{name}"\' : {table} }}'
             cmd(f'nft {nft_add_element}')
 
         # Only call into nftables as long as there is nothing setup to avoid wasting
-        # CPU time and thus lenghten the commit process
+        # CPU time and thus lengthen the commit process
         if not nft_vrf_zone_rule_setup:
             nft_vrf_zone_rule_setup = is_nft_vrf_zone_rule_setup()
         # Install nftables conntrack rules only once

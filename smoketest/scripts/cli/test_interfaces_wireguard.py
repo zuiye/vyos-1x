@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2020-2025 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -18,6 +18,8 @@ import os
 import unittest
 
 from base_interfaces_test import BasicInterfaceTest
+from base_interfaces_test import VyOSUnitTestSHIM
+
 from vyos.configsession import ConfigSessionError
 from vyos.utils.file import read_file
 from vyos.utils.process import cmd
@@ -154,13 +156,15 @@ class WireGuardInterfaceTest(BasicInterfaceTest.TestCase):
             tmp = read_file(f'/sys/class/net/{intf}/threaded')
             self.assertTrue(tmp, "1")
 
-    def test_wireguard_peer_pubkey_change(self):
+    def test_wireguard_peer_change(self):
         # T5707 changing WireGuard CLI public key of a peer - it's not removed
+        # Also check if allowed-ips update
 
-        def get_peers(interface) -> list:
+        def get_peers(interface) -> list[tuple]:
             tmp = cmd(f'sudo wg show {interface} dump')
             first_line = True
             peers = []
+            allowed_ips = []
             for line in tmp.split('\n'):
                 if not line:
                     continue # Skip empty lines and last line
@@ -170,24 +174,27 @@ class WireGuardInterfaceTest(BasicInterfaceTest.TestCase):
                     first_line = False
                 else:
                     peers.append(items[0])
-            return peers
+                    allowed_ips.append(items[3])
+            return peers, allowed_ips
 
         interface = 'wg1337'
         port = '1337'
         privkey = 'iJi4lb2HhkLx2KSAGOjji2alKkYsJjSPkHkrcpxgEVU='
         pubkey_1 = 'srQ8VF6z/LDjKCzpxBzFpmaNUOeuHYzIfc2dcmoc/h4='
         pubkey_2 = '8pbMHiQ7NECVP7F65Mb2W8+4ldGG2oaGvDSpSEsOBn8='
+        allowed_ips_1 = '10.205.212.10/32'
+        allowed_ips_2 = '10.205.212.11/32'
 
         self.cli_set(base_path + [interface, 'address', '172.16.0.1/24'])
         self.cli_set(base_path + [interface, 'port', port])
         self.cli_set(base_path + [interface, 'private-key', privkey])
 
         self.cli_set(base_path + [interface, 'peer', 'VyOS', 'public-key', pubkey_1])
-        self.cli_set(base_path + [interface, 'peer', 'VyOS', 'allowed-ips', '10.205.212.10/32'])
+        self.cli_set(base_path + [interface, 'peer', 'VyOS', 'allowed-ips', allowed_ips_1])
 
         self.cli_commit()
 
-        peers = get_peers(interface)
+        peers, _ = get_peers(interface)
         self.assertIn(pubkey_1, peers)
         self.assertNotIn(pubkey_2, peers)
 
@@ -196,9 +203,19 @@ class WireGuardInterfaceTest(BasicInterfaceTest.TestCase):
         self.cli_commit()
 
         # Verify config
-        peers = get_peers(interface)
+        peers, _ = get_peers(interface)
         self.assertNotIn(pubkey_1, peers)
         self.assertIn(pubkey_2, peers)
+
+        # Update allowed-ips
+        self.cli_delete(base_path + [interface, 'peer', 'VyOS', 'allowed-ips', allowed_ips_1])
+        self.cli_set(base_path + [interface, 'peer', 'VyOS', 'allowed-ips', allowed_ips_2])
+        self.cli_commit()
+
+        # Verify config
+        _, allowed_ips = get_peers(interface)
+        self.assertNotIn(allowed_ips_1, allowed_ips)
+        self.assertIn(allowed_ips_2, allowed_ips)
 
     def test_wireguard_hostname(self):
         # T4930: Test dynamic endpoint support
@@ -236,5 +253,62 @@ class WireGuardInterfaceTest(BasicInterfaceTest.TestCase):
         # Ensure the service is no longer running after WireGuard interface is deleted
         self.assertFalse(is_systemd_service_running(domain_resolver))
 
+    def test_wireguard_vrf_fwmark(self):
+        # T8509 Check fwmark ip rule created for WireGuard interface with VRF
+        interface = 'wg0'
+        port = '12345'
+        privkey = '6ISOkASm6VhHOOSz/5iIxw+Q9adq9zA17iMM4X40dlc='
+        pubkey = 'n1CUsmR0M2LUUsyicBd6blZICwUqqWWHbu4ifZ2/9gk='
+        mark = '101'
+        vrf_table = '200'
+        vrf = 'testvrf'
+
+        base_interface_path = base_path + [interface]
+        self.cli_set(base_interface_path + ['address', '172.16.0.1/24'])
+        self.cli_set(base_interface_path + ['private-key', privkey])
+        self.cli_set(base_interface_path + ['port', port])
+
+        peer_base_path = base_interface_path + ['peer', 'VyOS']
+        self.cli_set(peer_base_path + ['port', port])
+        self.cli_set(peer_base_path + ['public-key', pubkey])
+        self.cli_set(peer_base_path + ['allowed-ips', '169.254.0.0/16'])
+        self.cli_set(peer_base_path + ['address', '192.0.2.1'])
+
+        self.cli_set(base_interface_path + ['fwmark', mark])
+        self.cli_set(base_interface_path + ['vrf', vrf])
+        self.cli_set(['vrf', 'name', vrf, 'table', vrf_table])
+
+        self.cli_commit()
+
+        hex_fwmark = hex(int(mark))
+
+        # Verify ip rule at priority 1998 routes fwmark-tagged packets into the VRF
+        tmp = cmd(f'ip rule show priority 1998')
+        self.assertIn(f'fwmark {hex_fwmark} lookup {vrf}', tmp)
+
+        # Remove VRF from the interface — ip rule must be cleaned up
+        self.cli_delete(base_interface_path + ['vrf'])
+        self.cli_commit()
+
+        tmp = cmd(f'ip rule show priority 1998')
+        self.assertNotIn(f'fwmark {hex_fwmark}', tmp)
+
+        # Re-add VRF — ip rule must be re-created
+        self.cli_set(base_interface_path + ['vrf', vrf])
+        self.cli_commit()
+
+        tmp = cmd(f'ip rule show priority 1998')
+        self.assertIn(f'fwmark {hex_fwmark} lookup {vrf}', tmp)
+
+        # Delete the interface entirely — ip rule must be removed
+        self.cli_delete(base_interface_path)
+        self.cli_commit()
+
+        tmp = cmd(f'ip rule show priority 1998')
+        self.assertNotIn(f'fwmark {hex_fwmark}', tmp)
+
+        self.cli_delete(['vrf', 'name', vrf])
+
+
 if __name__ == '__main__':
-    unittest.main(verbosity=2)
+    unittest.main(verbosity=2, failfast=VyOSUnitTestSHIM.TestCase.debug_on())

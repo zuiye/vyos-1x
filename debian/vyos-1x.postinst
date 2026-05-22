@@ -50,6 +50,10 @@ if [[ -e /usr/share/pam-configs/tacplus ]]; then
     rm /usr/share/pam-configs/tacplus
 fi
 
+# Disable pam_nologin.so behavior for regular users
+sed -i '/^auth[[:space:]]\+requisite[[:space:]]\+pam_nologin\.so$/s/^/#/' /etc/pam.d/login
+sed -i '/^account[[:space:]]\+required[[:space:]]\+pam_nologin\.so$/s/^/#/' /etc/pam.d/sshd
+
 # Add TACACS system users required for TACACS based system authentication
 if ! grep -q '^tacacs' /etc/passwd; then
     # Add the tacacs group and all 16 possible tacacs privilege-level users to
@@ -77,6 +81,7 @@ if ! grep -q '^tacacs' /etc/passwd; then
             adduser --quiet tacacs${level} disk
             adduser --quiet tacacs${level} frr
             adduser --quiet tacacs${level} _kea
+            adduser --quiet tacacs${level} vpp
         fi
         level=$(( level+1 ))
     done 2>&1 | grep -v "User tacacs${level} already exists"
@@ -109,6 +114,7 @@ if ! grep -q '^radius_priv_user' /etc/passwd; then
     adduser --quiet radius_priv_user users
     adduser --quiet radius_priv_user frr
     adduser --quiet radius_priv_user _kea
+    adduser --quiet radius_priv_user vpp
 fi
 
 # add hostsd group for vyos-hostsd
@@ -149,6 +155,11 @@ chown -R root:vyattacfg /opt/vyatta/etc/config
 chmod -R 775 /opt/vyatta/etc/config
 mkdir -p /opt/vyatta/etc/logrotate
 mkdir -p /opt/vyatta/etc/netdevice.d
+
+# T8326: GeoIP permissions
+mkdir -p /var/cache/vyos /usr/share/vyos-geoip
+chown -R root:vyattacfg /var/cache/vyos /usr/share/vyos-geoip
+chmod -R 775 /var/cache/vyos /usr/share/vyos-geoip
 
 touch /etc/environment
 
@@ -220,12 +231,8 @@ fi
 
 # Remove unwanted daemon files from /etc
 # conntackd
-# pmacct
-# fastnetmon
 # ntp
 DELETE="/etc/logrotate.d/conntrackd.distrib /etc/init.d/conntrackd /etc/default/conntrackd
-        /etc/default/pmacctd /etc/pmacct
-        /etc/networks_list /etc/networks_whitelist /etc/fastnetmon.conf
         /etc/ntp.conf /etc/default/ssh /etc/avahi/avahi-daemon.conf /etc/avahi/hosts
         /etc/powerdns /etc/default/pdns-recursor
         /etc/ppp/ip-up.d/0000usepeerdns /etc/ppp/ip-down.d/0000usepeerdns"
@@ -275,4 +282,9 @@ fi
 # Restart vyos-domain-resolver if running
 if systemctl is-active --quiet vyos-domain-resolver; then
     systemctl restart vyos-domain-resolver
+fi
+
+# Restart vyos-netlinkd if running
+if systemctl is-active --quiet vyos-netlinkd; then
+    systemctl restart vyos-netlinkd
 fi

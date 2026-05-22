@@ -1,4 +1,4 @@
-# Copyright 2024-2025 VyOS maintainers and contributors <maintainers@vyos.io>
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This library is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -14,18 +14,31 @@
 # along with this library.  If not, see <http://www.gnu.org/licenses/>.
 
 """
-Library used to interface with FRRs mgmtd introduced in version 10.0
+Helper class attached to vyos-configd to interact between our CLI configuration
+and FRR. Class will render one full FRR configuration and apply this via
+frr-reload.py, if the configuration has no errors.
+
+Will fail early if the rendered configuration has any errors.
 """
 
 import os
 
+from copy import deepcopy
 from time import sleep
 
+from vyos.config import Config
+from vyos.config import config_dict_merge
+from vyos.configdict import get_dhcp_interfaces
+from vyos.configdict import get_pppoe_interfaces
 from vyos.defaults import frr_debug_enable
+from vyos.defaults import static_route_dhcp_interfaces_path
 from vyos.utils.dict import dict_search
+from vyos.utils.dict import dict_set_nested
+from vyos.utils.file import read_file
 from vyos.utils.file import write_file
 from vyos.utils.process import cmd
 from vyos.utils.process import rc_cmd
+from vyos.template import get_dhcp_router
 from vyos.template import render_to_string
 from vyos import ConfigError
 
@@ -34,9 +47,30 @@ def debug(message):
         return
     print(message)
 
-frr_protocols = ['babel', 'bfd', 'bgp', 'eigrp', 'isis', 'mpls', 'nhrp',
-                 'openfabric', 'ospf', 'ospfv3', 'pim', 'pim6', 'rip',
-                 'ripng', 'rpki', 'segment_routing', 'static']
+ERROR_RELOAD_TEST: str = 'The system encountered an error while rendering the ' \
+    'new routing daemon configuration. To ensure network stability and avoid ' \
+    'potential connectivity disruptions, the configuration was not applied!'
+
+frr_protocols = [
+    'babel',
+    'bfd',
+    'bgp',
+    'eigrp',
+    'isis',
+    'mpls',
+    'nhrp',
+    'openfabric',
+    'ospf',
+    'ospfv3',
+    'pim',
+    'pim6',
+    'rip',
+    'ripng',
+    'rpki',
+    'segment_routing',
+    'static',
+    'traffic_engineering',
+]
 
 babel_daemon = 'babeld'
 bfd_daemon = 'bfdd'
@@ -54,11 +88,10 @@ ripng_daemon = 'ripngd'
 zebra_daemon = 'zebra'
 nhrp_daemon = 'nhrpd'
 
-def get_frrender_dict(conf, argv=None) -> dict:
-    from copy import deepcopy
-    from vyos.config import config_dict_merge
-    from vyos.configdict import get_dhcp_interfaces
-    from vyos.configdict import get_pppoe_interfaces
+def get_frrender_dict(conf: Config, argv=None) -> dict:
+    # We need to re-set the CLI path to the root level, as this function uses
+    # conf.exists() with an absolute path form the CLI root
+    conf.set_level([])
 
     # Create an empty dictionary which will be filled down the code path and
     # returned to the caller
@@ -69,7 +102,7 @@ def get_frrender_dict(conf, argv=None) -> dict:
 
     def dict_helper_ospf_defaults(ospf, path):
         # We have gathered the dict representation of the CLI, but there are default
-        # options which we need to update into the dictionary retrived.
+        # options which we need to update into the dictionary retrieved.
         default_values = conf.get_config_defaults(path, key_mangling=('-', '_'),
                                                   get_first_key=True, recursive=True)
 
@@ -88,7 +121,7 @@ def get_frrender_dict(conf, argv=None) -> dict:
             if dict_search(f'area.{area_num}.area_type.nssa', ospf) is None:
                 del default_values['area'][area_num]['area_type']['nssa']
 
-        for protocol in ['babel', 'bgp', 'connected', 'isis', 'kernel', 'rip', 'static']:
+        for protocol in ['babel', 'bgp', 'connected', 'isis', 'kernel', 'nhrp', 'rip', 'static']:
             if dict_search(f'redistribute.{protocol}', ospf) is None:
                 del default_values['redistribute'][protocol]
         if not bool(default_values['redistribute']):
@@ -107,7 +140,7 @@ def get_frrender_dict(conf, argv=None) -> dict:
 
     def dict_helper_ospfv3_defaults(ospfv3, path):
         # We have gathered the dict representation of the CLI, but there are default
-        # options which we need to update into the dictionary retrived.
+        # options which we need to update into the dictionary retrieved.
         default_values = conf.get_config_defaults(path, key_mangling=('-', '_'),
                                                   get_first_key=True, recursive=True)
 
@@ -135,7 +168,7 @@ def get_frrender_dict(conf, argv=None) -> dict:
 
     def dict_helper_pim_defaults(pim, path):
         # We have gathered the dict representation of the CLI, but there are default
-        # options which we need to update into the dictionary retrived.
+        # options which we need to update into the dictionary retrieved.
         default_values = conf.get_config_defaults(path, key_mangling=('-', '_'),
                                                   get_first_key=True, recursive=True)
 
@@ -192,6 +225,8 @@ def get_frrender_dict(conf, argv=None) -> dict:
                             'security_profile'] = name
         return nhrp
 
+    deleted_protocol = {'deleted' : ''}
+
     # Ethernet and bonding interfaces can participate in EVPN which is configured via FRR
     tmp = {}
     for if_type in ['ethernet', 'bonding']:
@@ -217,6 +252,12 @@ def get_frrender_dict(conf, argv=None) -> dict:
             ip_dict['afi'] = ip_version
             dict.update({ip_version : ip_dict})
 
+    # Get FRR profile
+    frr_system_cli_path = ['system', 'frr']
+    dict['system_frr'] = conf.get_config_dict(frr_system_cli_path, key_mangling=('-', '_'),
+                                              get_first_key=True,
+                                              with_recursive_defaults=True)
+
     # Enable SNMP agentx support
     # SNMP AgentX support cannot be disabled once enabled
     if conf.exists(['service', 'snmp']):
@@ -235,6 +276,8 @@ def get_frrender_dict(conf, argv=None) -> dict:
                                      get_first_key=True,
                                      with_recursive_defaults=True)
         dict.update({'babel' : babel})
+    elif conf.exists_effective(babel_cli_path):
+        dict.update({'babel' : deleted_protocol})
 
     # We need to check the CLI if the BFD node is present and thus load in all the default
     # values present on the CLI - that's why we have if conf.exists()
@@ -245,6 +288,8 @@ def get_frrender_dict(conf, argv=None) -> dict:
                                    no_tag_node_value_mangle=True,
                                    with_recursive_defaults=True)
         dict.update({'bfd' : bfd})
+    elif conf.exists_effective(bfd_cli_path):
+        dict.update({'bfd' : deleted_protocol})
 
     # We need to check the CLI if the BGP node is present and thus load in all the default
     # values present on the CLI - that's why we have if conf.exists()
@@ -269,7 +314,7 @@ def get_frrender_dict(conf, argv=None) -> dict:
                                      with_recursive_defaults=True)
         dict.update({'eigrp' : eigrp})
     elif conf.exists_effective(eigrp_cli_path):
-        dict.update({'eigrp' : {'deleted' : ''}})
+        dict.update({'eigrp' : deleted_protocol})
 
     # We need to check the CLI if the ISIS node is present and thus load in all the default
     # values present on the CLI - that's why we have if conf.exists()
@@ -281,7 +326,7 @@ def get_frrender_dict(conf, argv=None) -> dict:
                                     with_recursive_defaults=True)
         dict.update({'isis' : isis})
     elif conf.exists_effective(isis_cli_path):
-        dict.update({'isis' : {'deleted' : ''}})
+        dict.update({'isis' : deleted_protocol})
 
     # We need to check the CLI if the MPLS node is present and thus load in all the default
     # values present on the CLI - that's why we have if conf.exists()
@@ -291,7 +336,7 @@ def get_frrender_dict(conf, argv=None) -> dict:
                                     get_first_key=True)
         dict.update({'mpls' : mpls})
     elif conf.exists_effective(mpls_cli_path):
-        dict.update({'mpls' : {'deleted' : ''}})
+        dict.update({'mpls' : deleted_protocol})
 
     # We need to check the CLI if the OPENFABRIC node is present and thus load in all the default
     # values present on the CLI - that's why we have if conf.exists()
@@ -302,7 +347,7 @@ def get_frrender_dict(conf, argv=None) -> dict:
                                           no_tag_node_value_mangle=True)
         dict.update({'openfabric' : openfabric})
     elif conf.exists_effective(openfabric_cli_path):
-        dict.update({'openfabric' : {'deleted' : ''}})
+        dict.update({'openfabric' : deleted_protocol})
 
     # We need to check the CLI if the OSPF node is present and thus load in all the default
     # values present on the CLI - that's why we have if conf.exists()
@@ -313,7 +358,7 @@ def get_frrender_dict(conf, argv=None) -> dict:
         ospf = dict_helper_ospf_defaults(ospf, ospf_cli_path)
         dict.update({'ospf' : ospf})
     elif conf.exists_effective(ospf_cli_path):
-        dict.update({'ospf' : {'deleted' : ''}})
+        dict.update({'ospf' : deleted_protocol})
 
     # We need to check the CLI if the OSPFv3 node is present and thus load in all the default
     # values present on the CLI - that's why we have if conf.exists()
@@ -324,7 +369,7 @@ def get_frrender_dict(conf, argv=None) -> dict:
         ospfv3 = dict_helper_ospfv3_defaults(ospfv3, ospfv3_cli_path)
         dict.update({'ospfv3' : ospfv3})
     elif conf.exists_effective(ospfv3_cli_path):
-        dict.update({'ospfv3' : {'deleted' : ''}})
+        dict.update({'ospfv3' : deleted_protocol})
 
     # We need to check the CLI if the PIM node is present and thus load in all the default
     # values present on the CLI - that's why we have if conf.exists()
@@ -335,7 +380,7 @@ def get_frrender_dict(conf, argv=None) -> dict:
         pim = dict_helper_pim_defaults(pim, pim_cli_path)
         dict.update({'pim' : pim})
     elif conf.exists_effective(pim_cli_path):
-        dict.update({'pim' : {'deleted' : ''}})
+        dict.update({'pim' : deleted_protocol})
 
     # We need to check the CLI if the PIM6 node is present and thus load in all the default
     # values present on the CLI - that's why we have if conf.exists()
@@ -346,7 +391,7 @@ def get_frrender_dict(conf, argv=None) -> dict:
                                     with_recursive_defaults=True)
         dict.update({'pim6' : pim6})
     elif conf.exists_effective(pim6_cli_path):
-        dict.update({'pim6' : {'deleted' : ''}})
+        dict.update({'pim6' : deleted_protocol})
 
     # We need to check the CLI if the RIP node is present and thus load in all the default
     # values present on the CLI - that's why we have if conf.exists()
@@ -357,7 +402,7 @@ def get_frrender_dict(conf, argv=None) -> dict:
                                    with_recursive_defaults=True)
         dict.update({'rip' : rip})
     elif conf.exists_effective(rip_cli_path):
-        dict.update({'rip' : {'deleted' : ''}})
+        dict.update({'rip' : deleted_protocol})
 
     # We need to check the CLI if the RIPng node is present and thus load in all the default
     # values present on the CLI - that's why we have if conf.exists()
@@ -368,7 +413,7 @@ def get_frrender_dict(conf, argv=None) -> dict:
                                      with_recursive_defaults=True)
         dict.update({'ripng' : ripng})
     elif conf.exists_effective(ripng_cli_path):
-        dict.update({'ripng' : {'deleted' : ''}})
+        dict.update({'ripng' : deleted_protocol})
 
     # We need to check the CLI if the RPKI node is present and thus load in all the default
     # values present on the CLI - that's why we have if conf.exists()
@@ -384,7 +429,7 @@ def get_frrender_dict(conf, argv=None) -> dict:
                 cache_config['ssh']['private_key_file'] = f'{rpki_ssh_key_base}_{cache}'
         dict.update({'rpki' : rpki})
     elif conf.exists_effective(rpki_cli_path):
-        dict.update({'rpki' : {'deleted' : ''}})
+        dict.update({'rpki' : deleted_protocol})
 
     # We need to check the CLI if the Segment Routing node is present and thus load in
     # all the default values present on the CLI - that's why we have if conf.exists()
@@ -396,7 +441,22 @@ def get_frrender_dict(conf, argv=None) -> dict:
                                   with_recursive_defaults=True)
         dict.update({'segment_routing' : sr})
     elif conf.exists_effective(sr_cli_path):
-        dict.update({'segment_routing' : {'deleted' : ''}})
+        dict.update({'segment_routing' : deleted_protocol})
+
+    # We need to check the CLI if the Traffic Engineering node is present and thus load in
+    # all the default values present on the CLI - that's why we have if conf.exists()
+    te_cli_path = ['protocols', 'traffic-engineering']
+    if conf.exists(te_cli_path):
+        te = conf.get_config_dict(
+            te_cli_path,
+            key_mangling=('-', '_'),
+            get_first_key=True,
+            no_tag_node_value_mangle=True,
+            with_recursive_defaults=True,
+        )
+        dict.update({'traffic_engineering': te})
+    elif conf.exists_effective(te_cli_path):
+        dict.update({'traffic_engineering': deleted_protocol})
 
     # We need to check the CLI if the static node is present and thus load in
     # all the default values present on the CLI - that's why we have if conf.exists()
@@ -407,7 +467,7 @@ def get_frrender_dict(conf, argv=None) -> dict:
                                   no_tag_node_value_mangle=True)
         dict.update({'static' : static})
     elif conf.exists_effective(static_cli_path):
-        dict.update({'static' : {'deleted' : ''}})
+        dict.update({'static' : deleted_protocol})
 
     # We need to check the CLI if the NHRP node is present and thus load in all the default
     # values present on the CLI - that's why we have if conf.exists()
@@ -419,21 +479,14 @@ def get_frrender_dict(conf, argv=None) -> dict:
         nhrp = dict_helper_nhrp_defaults(nhrp)
         dict.update({'nhrp' : nhrp})
     elif conf.exists_effective(nhrp_cli_path):
-        dict.update({'nhrp' : {'deleted' : ''}})
+        dict.update({'nhrp' : deleted_protocol})
 
     # T3680 - get a list of all interfaces currently configured to use DHCP
     tmp = get_dhcp_interfaces(conf)
-    if tmp:
-        if 'static' in dict:
-            dict['static'].update({'dhcp' : tmp})
-        else:
-            dict.update({'static' : {'dhcp' : tmp}})
+    if tmp: dict_set_nested('static.dhcp', tmp, dict)
+
     tmp = get_pppoe_interfaces(conf)
-    if tmp:
-        if 'static' in dict:
-            dict['static'].update({'pppoe' : tmp})
-        else:
-            dict.update({'static' : {'pppoe' : tmp}})
+    if tmp: dict_set_nested('static.pppoe', tmp, dict)
 
     # keep a re-usable list of dependent VRFs
     dependent_vrfs_default = {}
@@ -452,10 +505,12 @@ def get_frrender_dict(conf, argv=None) -> dict:
         # come into place under the protocols tree, thus we can safely merge them with the
         # appropriate routing protocols
         for vrf_name, vrf_config in vrf['name'].items():
+            protocol_dict_path = f'name.{vrf_name}.protocols'
+
             bgp_vrf_path = ['vrf', 'name', vrf_name, 'protocols', 'bgp']
             if 'bgp' in vrf_config.get('protocols', []):
                 # We have gathered the dict representation of the CLI, but there are default
-                # options which we need to update into the dictionary retrived.
+                # options which we need to update into the dictionary retrieved.
                 default_values = conf.get_config_defaults(bgp_vrf_path, key_mangling=('-', '_'),
                                                         get_first_key=True, recursive=True)
 
@@ -494,10 +549,7 @@ def get_frrender_dict(conf, argv=None) -> dict:
                 if 'bgp' in dict:
                     dict['bgp']['dependent_vrfs'].update({vrf_name : {'protocols': tmp} })
 
-                if 'protocols' not in vrf['name'][vrf_name]:
-                    vrf['name'][vrf_name].update({'protocols': {'bgp' : tmp}})
-                else:
-                    vrf['name'][vrf_name]['protocols'].update({'bgp' : tmp})
+                dict_set_nested(f'{protocol_dict_path}.bgp', tmp, vrf)
 
             # We need to check the CLI if the EIGRP node is present and thus load in all the default
             # values present on the CLI - that's why we have if conf.exists()
@@ -505,9 +557,9 @@ def get_frrender_dict(conf, argv=None) -> dict:
             if 'eigrp' in vrf_config.get('protocols', []):
                 eigrp = conf.get_config_dict(eigrp_vrf_path, key_mangling=('-', '_'), get_first_key=True,
                                             no_tag_node_value_mangle=True)
-                vrf['name'][vrf_name]['protocols'].update({'eigrp' : isis})
+                dict_set_nested(f'{protocol_dict_path}.eigrp', eigrp, vrf)
             elif conf.exists_effective(eigrp_vrf_path):
-                vrf['name'][vrf_name]['protocols'].update({'eigrp' : {'deleted' : ''}})
+                dict_set_nested(f'{protocol_dict_path}.eigrp', deleted_protocol, vrf)
 
             # We need to check the CLI if the ISIS node is present and thus load in all the default
             # values present on the CLI - that's why we have if conf.exists()
@@ -515,9 +567,9 @@ def get_frrender_dict(conf, argv=None) -> dict:
             if 'isis' in vrf_config.get('protocols', []):
                 isis = conf.get_config_dict(isis_vrf_path, key_mangling=('-', '_'), get_first_key=True,
                                             no_tag_node_value_mangle=True, with_recursive_defaults=True)
-                vrf['name'][vrf_name]['protocols'].update({'isis' : isis})
+                dict_set_nested(f'{protocol_dict_path}.isis', isis, vrf)
             elif conf.exists_effective(isis_vrf_path):
-                vrf['name'][vrf_name]['protocols'].update({'isis' : {'deleted' : ''}})
+                dict_set_nested(f'{protocol_dict_path}.isis', deleted_protocol, vrf)
 
             # We need to check the CLI if the OSPF node is present and thus load in all the default
             # values present on the CLI - that's why we have if conf.exists()
@@ -525,9 +577,9 @@ def get_frrender_dict(conf, argv=None) -> dict:
             if 'ospf' in vrf_config.get('protocols', []):
                 ospf = conf.get_config_dict(ospf_vrf_path, key_mangling=('-', '_'), get_first_key=True)
                 ospf = dict_helper_ospf_defaults(vrf_config['protocols']['ospf'], ospf_vrf_path)
-                vrf['name'][vrf_name]['protocols'].update({'ospf' : ospf})
+                dict_set_nested(f'{protocol_dict_path}.ospf', ospf, vrf)
             elif conf.exists_effective(ospf_vrf_path):
-                vrf['name'][vrf_name]['protocols'].update({'ospf' : {'deleted' : ''}})
+                dict_set_nested(f'{protocol_dict_path}.ospf', deleted_protocol, vrf)
 
             # We need to check the CLI if the OSPFv3 node is present and thus load in all the default
             # values present on the CLI - that's why we have if conf.exists()
@@ -535,9 +587,24 @@ def get_frrender_dict(conf, argv=None) -> dict:
             if 'ospfv3' in vrf_config.get('protocols', []):
                 ospfv3 = conf.get_config_dict(ospfv3_vrf_path, key_mangling=('-', '_'), get_first_key=True)
                 ospfv3 = dict_helper_ospfv3_defaults(vrf_config['protocols']['ospfv3'], ospfv3_vrf_path)
-                vrf['name'][vrf_name]['protocols'].update({'ospfv3' : ospfv3})
+                dict_set_nested(f'{protocol_dict_path}.ospfv3', ospfv3, vrf)
             elif conf.exists_effective(ospfv3_vrf_path):
-                vrf['name'][vrf_name]['protocols'].update({'ospfv3' : {'deleted' : ''}})
+                dict_set_nested(f'{protocol_dict_path}.ospfv3', deleted_protocol, vrf)
+
+            # We need to check the CLI if the RPKI node is present and thus load in all the default
+            # values present on the CLI - that's why we have if conf.exists()
+            rpki_vrf_path = ['vrf', 'name', vrf_name, 'protocols', 'rpki']
+            if 'rpki' in vrf_config.get('protocols', []):
+                rpki = conf.get_config_dict(rpki_vrf_path, key_mangling=('-', '_'), get_first_key=True,
+                                            with_pki=True, with_recursive_defaults=True)
+                rpki_ssh_key_base = '/run/frr/id_rpki'
+                for cache, cache_config in rpki.get('cache',{}).items():
+                    if 'ssh' in cache_config:
+                        cache_config['ssh']['public_key_file'] = f'{rpki_ssh_key_base}_{cache}.pub'
+                        cache_config['ssh']['private_key_file'] = f'{rpki_ssh_key_base}_{cache}'
+                dict_set_nested(f'{protocol_dict_path}.rpki', rpki, vrf)
+            elif conf.exists_effective(rpki_vrf_path):
+                dict_set_nested(f'{protocol_dict_path}.rpki', deleted_protocol, vrf)
 
             # We need to check the CLI if the static node is present and thus load in all the default
             # values present on the CLI - that's why we have if conf.exists()
@@ -546,15 +613,16 @@ def get_frrender_dict(conf, argv=None) -> dict:
                 static = conf.get_config_dict(static_vrf_path, key_mangling=('-', '_'),
                                               get_first_key=True,
                                               no_tag_node_value_mangle=True)
-                # T3680 - get a list of all interfaces currently configured to use DHCP
-                tmp = get_dhcp_interfaces(conf, vrf_name)
-                if tmp: static.update({'dhcp' : tmp})
-                tmp = get_pppoe_interfaces(conf, vrf_name)
-                if tmp: static.update({'pppoe' : tmp})
-
-                vrf['name'][vrf_name]['protocols'].update({'static': static})
+                dict_set_nested(f'{protocol_dict_path}.static', static, vrf)
             elif conf.exists_effective(static_vrf_path):
-                vrf['name'][vrf_name]['protocols'].update({'static': {'deleted' : ''}})
+                dict_set_nested(f'{protocol_dict_path}.static', deleted_protocol, vrf)
+
+            # T3680 - get a list of all interfaces currently configured to use DHCP
+            tmp = get_dhcp_interfaces(conf, vrf_name)
+            if tmp: dict_set_nested(f'name.{vrf_name}.protocols.static.dhcp', tmp, vrf)
+
+            tmp = get_pppoe_interfaces(conf, vrf_name)
+            if tmp: dict_set_nested(f'name.{vrf_name}.protocols.static.pppoe', tmp, vrf)
 
             vrf_vni_path = ['vrf', 'name', vrf_name, 'vni']
             if conf.exists(vrf_vni_path):
@@ -599,13 +667,16 @@ def get_frrender_dict(conf, argv=None) -> dict:
         dict.update({'vrf' : vrf})
 
     if os.path.exists(frr_debug_enable):
+        print(f'---- get_frrender_dict({conf}) ----')
         import pprint
         pprint.pprint(dict)
+        print('-----------------------------------')
 
     return dict
 
 class FRRender:
     cached_config_dict = {}
+    cached_dhcp_gateways = {}
     def __init__(self):
         self._frr_conf = '/run/frr/config/vyos.frr.conf'
 
@@ -618,11 +689,20 @@ class FRRender:
             tmp = type(config_dict)
             raise ValueError(f'Config must be of type "dict" and not "{tmp}"!')
 
+        dhcp_gateways = {
+            interface: get_dhcp_router(interface)
+            for interface in read_file(static_route_dhcp_interfaces_path, '').split()
+        }
 
-        if self.cached_config_dict == config_dict:
+        if (
+            self.cached_config_dict == config_dict
+            and self.cached_dhcp_gateways == dhcp_gateways
+        ):
             debug('FRR:        NO CHANGES DETECTED')
             return False
+
         self.cached_config_dict = config_dict
+        self.cached_dhcp_gateways = dhcp_gateways
 
         def inline_helper(config_dict) -> str:
             output = '!\n'
@@ -669,10 +749,19 @@ class FRRender:
                 output += render_to_string('frr/ripngd.frr.j2', config_dict['ripng'])
                 output += '\n'
             if 'rpki' in config_dict and 'deleted' not in config_dict['rpki']:
-                output += render_to_string('frr/rpki.frr.j2', config_dict['rpki'])
+                output += render_to_string('frr/rpki.frr.j2', {'rpki': config_dict['rpki']})
                 output += '\n'
             if 'segment_routing' in config_dict and 'deleted' not in config_dict['segment_routing']:
                 output += render_to_string('frr/zebra.segment_routing.frr.j2', config_dict['segment_routing'])
+                output += '\n'
+            if (
+                'traffic_engineering' in config_dict
+                and 'deleted' not in config_dict['traffic_engineering']
+            ):
+                output += render_to_string(
+                    'frr/zebra.traffic_engineering.frr.j2',
+                    config_dict['traffic_engineering'],
+                )
                 output += '\n'
             if 'static' in config_dict and 'deleted' not in config_dict['static']:
                 output += render_to_string('frr/staticd.frr.j2', config_dict['static'])
@@ -691,6 +780,23 @@ class FRRender:
         debug('FRR:        START CONFIGURATION RENDERING')
         # we can not reload an empty file, thus we always embed the marker
         output = '!\n'
+
+        # FRR profile configuration
+        tmp = dict_search('system_frr.profile', config_dict)
+        if tmp:
+            output += f'frr defaults {tmp}\n'
+
+        # Enable FRR logging
+        output += 'log facility daemon\n'
+        output += 'log timestamp precision 3\n'
+        # Extend logging depending on operating mode
+        if os.path.exists(frr_debug_enable):
+            output += 'log syslog informational\n'
+            output += 'log unique-id\n'
+        else:
+            output += 'log syslog notifications\n'
+            output += 'no log unique-id\n'
+
         # Enable SNMP agentx support
         # SNMP AgentX support cannot be disabled once enabled
         if 'snmp' in config_dict:
@@ -712,7 +818,7 @@ class FRRender:
 
                 output += inline_helper(vrf_config['protocols'])
 
-        # remove any accidently added empty newline to not confuse FRR
+        # remove any accidentally added empty newline to not confuse FRR
         output = os.linesep.join([s for s in output.splitlines() if s])
 
         if '!!' in output:
@@ -724,6 +830,13 @@ class FRRender:
         return True
 
     def apply(self, count_max=5):
+        # Do a config reload test
+        cmdline = f'/usr/lib/frr/frr-reload.py --test'
+        rc, emsg = rc_cmd(f'{cmdline} {self._frr_conf}')
+        if rc != 0:
+            debug(emsg)
+            raise ConfigError(ERROR_RELOAD_TEST)
+
         count = 0
         emsg = ''
         while count < count_max:

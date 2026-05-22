@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2020-2024 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -18,6 +18,7 @@ import os
 import argparse
 
 from psutil import process_iter
+from time import sleep
 
 from vyos.configquery import ConfigTreeQuery
 from vyos.utils.process import call
@@ -68,7 +69,7 @@ def connect(interface):
             if ( count % 60 == 0 ):
                 print(f'Commit still in progress after {count}s - waiting')
             count += 1
-            time.sleep(1)
+            sleep(1)
         call('/usr/libexec/vyos/conf_mode/qos.py')
 
 def disconnect(interface):
@@ -97,19 +98,23 @@ def main():
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--connect", help="Bring up a connection-oriented network interface", action="store_true")
     group.add_argument("--disconnect", help="Take down connection-oriented network interface", action="store_true")
+    group.add_argument("--reconnect", help="Reconnect connection-oriented network interface", action="store_true")
     parser.add_argument("--interface", help="Interface name", action="store", required=True)
     args = parser.parse_args()
 
-    if args.connect or args.disconnect:
-        if args.disconnect:
-            disconnect(args.interface)
+    # Disallow connecting interfaces while their configuration might be changing
+    if args.connect or args.reconnect:
+        if commit_in_progress():
+            print('Cannot connect while a commit is in progress')
+            exit(1)
 
-        if args.connect:
-            if commit_in_progress():
-                print('Cannot connect while a commit is in progress')
-                exit(1)
-            connect(args.interface)
-
+    if args.connect:
+        connect(args.interface)
+    elif args.disconnect:
+        disconnect(args.interface)
+    elif args.reconnect:
+        disconnect(args.interface)
+        connect(args.interface)
     else:
         parser.print_help()
 

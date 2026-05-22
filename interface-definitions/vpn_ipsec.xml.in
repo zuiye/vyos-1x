@@ -45,10 +45,48 @@
                     <properties>
                       <help>Secret type</help>
                       <completionHelp>
-                        <list>base64 plaintext</list>
+                        <list>base64 hex plaintext</list>
                       </completionHelp>
                       <constraint>
-                        <regex>(base64|plaintext)</regex>
+                        <regex>(base64|hex|plaintext)</regex>
+                      </constraint>
+                    </properties>
+                    <defaultValue>plaintext</defaultValue>
+                  </leafNode>
+                </children>
+              </tagNode>
+              <tagNode name="ppk">
+                <properties>
+                  <help>Post-quantum preshared key name</help>
+                </properties>
+                <children>
+                  <leafNode name="id">
+                    <properties>
+                      <help>ID for PPK</help>
+                      <valueHelp>
+                        <format>txt</format>
+                        <description>ID used for PPK</description>
+                      </valueHelp>
+                      <multi/>
+                    </properties>
+                  </leafNode>
+                  <leafNode name="secret">
+                    <properties>
+                      <help>Post-quantum preshared secret key</help>
+                      <valueHelp>
+                        <format>txt</format>
+                        <description>Post-quantum preshared secret key</description>
+                      </valueHelp>
+                    </properties>
+                  </leafNode>
+                  <leafNode name="secret-type">
+                    <properties>
+                      <help>Secret type</help>
+                      <completionHelp>
+                        <list>base64 hex plaintext</list>
+                      </completionHelp>
+                      <constraint>
+                        <regex>(base64|hex|plaintext)</regex>
                       </constraint>
                     </properties>
                     <defaultValue>plaintext</defaultValue>
@@ -91,7 +129,7 @@
                 <properties>
                   <help>Security Association byte count to expire</help>
                   <valueHelp>
-                    <format>u32:1024-26843545600000</format>
+                    <format>u64:1024-26843545600000</format>
                     <description>SA life in bytes</description>
                   </valueHelp>
                   <constraint>
@@ -103,7 +141,7 @@
                 <properties>
                   <help>Security Association packet count to expire</help>
                   <valueHelp>
-                    <format>u32:1000-26843545600000</format>
+                    <format>u64:1000-26843545600000</format>
                     <description>SA life in packets</description>
                   </valueHelp>
                   <constraint>
@@ -701,6 +739,52 @@
                   <valueless/>
                 </properties>
               </leafNode>
+              <node name="retransmission">
+                <properties>
+                  <help>IPsec retransmission settings</help>
+                </properties>
+                <children>
+                  <leafNode name="attempts">
+                    <properties>
+                      <help>Maximum number of retransmissions</help>
+                      <valueHelp>
+                        <format>u32:1-65535</format>
+                        <description>Maximum number of retransmissions</description>
+                      </valueHelp>
+                      <constraint>
+                        <validator name="numeric" argument="--range 1-65535"/>
+                      </constraint>
+                    </properties>
+                    <defaultValue>5</defaultValue>
+                  </leafNode>
+                  <leafNode name="base">
+                    <properties>
+                      <help>Base of exponential backoff</help>
+                      <valueHelp>
+                        <format>&lt;1.0-5.0&gt;</format>
+                        <description>Base of exponential backoff</description>
+                      </valueHelp>
+                      <constraint>
+                        <validator name="numeric" argument="--range 1-5 --float"/>
+                      </constraint>
+                    </properties>
+                    <defaultValue>1.8</defaultValue>
+                  </leafNode>
+                  <leafNode name="timeout">
+                    <properties>
+                      <help>Timeout in seconds before the first retransmission</help>
+                      <valueHelp>
+                        <format>u32:1-1000</format>
+                        <description>Timeout in seconds before the first retransmission</description>
+                      </valueHelp>
+                      <constraint>
+                        <validator name="numeric" argument="--range 1-1000"/>
+                      </constraint>
+                    </properties>
+                    <defaultValue>4</defaultValue>
+                  </leafNode>
+                </children>
+              </node>
             </children>
           </node>
           <tagNode name="profile">
@@ -824,6 +908,12 @@
                         <defaultValue>eap-mschapv2</defaultValue>
                       </leafNode>
                       #include <include/auth-local-users.xml.i>
+                      <leafNode name="always-send-cert">
+                        <properties>
+                          <help>Always send local certificate for this connection</help>
+                          <valueless/>
+                        </properties>
+                      </leafNode>
                       <leafNode name="server-mode">
                         <properties>
                           <help>Server authentication mode</help>
@@ -844,9 +934,11 @@
                         </properties>
                         <defaultValue>x509</defaultValue>
                       </leafNode>
+                      #include <include/ipsec/ppk.xml.i>
                       #include <include/ipsec/authentication-pre-shared-secret.xml.i>
                     </children>
                   </node>
+                  #include <include/ipsec/childless.xml.i>
                   #include <include/generic-description.xml.i>
                   #include <include/generic-disable-node.xml.i>
                   #include <include/ipsec/esp-group.xml.i>
@@ -1061,6 +1153,7 @@
                     </properties>
                     <children>
                       #include <include/ipsec/authentication-id.xml.i>
+                      #include <include/ipsec/ppk.xml.i>
                       #include <include/ipsec/authentication-rsa.xml.i>
                       #include <include/ipsec/authentication-x509.xml.i>
                       <leafNode name="mode">
@@ -1104,32 +1197,33 @@
                       </leafNode>
                     </children>
                   </node>
+                  #include <include/ipsec/childless.xml.i>
                   <leafNode name="connection-type">
                     <properties>
                       <help>Connection type</help>
                       <completionHelp>
-                        <list>initiate respond none</list>
+                        <list>initiate trap none</list>
                       </completionHelp>
                       <valueHelp>
                         <format>initiate</format>
                         <description>Bring the connection up immediately</description>
                       </valueHelp>
                       <valueHelp>
-                        <format>respond</format>
-                        <description>Wait for the peer to initiate the connection</description>
+                        <format>trap</format>
+                        <description>Bring the connection up only when matching traffic is detected</description>
                       </valueHelp>
                       <valueHelp>
                         <format>none</format>
                         <description>Load the connection only</description>
                       </valueHelp>
                       <constraint>
-                        <regex>(initiate|respond|none)</regex>
+                        <regex>(initiate|trap|none)</regex>
                       </constraint>
                     </properties>
                   </leafNode>
                   <leafNode name="default-esp-group">
                     <properties>
-                      <help>Defult ESP group name</help>
+                      <help>Default ESP group name</help>
                       <completionHelp>
                         <path>vpn ipsec esp-group</path>
                       </completionHelp>
@@ -1152,11 +1246,11 @@
                       </completionHelp>
                       <valueHelp>
                         <format>yes</format>
-                        <description>Enable remote host re-autentication during an IKE re-key. Currently broken due to a strong swan bug</description>
+                        <description>Enable remote host re-authentication during an IKE re-key. Currently broken due to a strong swan bug</description>
                       </valueHelp>
                       <valueHelp>
                         <format>no</format>
-                        <description>Disable remote host re-authenticaton during an IKE re-key.</description>
+                        <description>Disable remote host re-authentication during an IKE re-key.</description>
                       </valueHelp>
                       <valueHelp>
                         <format>inherit</format>
@@ -1182,6 +1276,13 @@
                       #include <include/generic-disable-node.xml.i>
                       #include <include/ipsec/esp-group.xml.i>
                       #include <include/ipsec/local-traffic-selector.xml.i>
+                      <node name="local">
+                        <children>
+                          <leafNode name="prefix">
+                            <defaultValue>dynamic</defaultValue>
+                          </leafNode>
+                        </children>
+                      </node>
                       #include <include/ip-protocol.xml.i>
                       <leafNode name="priority">
                         <properties>
@@ -1218,6 +1319,7 @@
                               </constraint>
                               <multi/>
                             </properties>
+                            <defaultValue>dynamic</defaultValue>
                           </leafNode>
                         </children>
                       </node>
@@ -1244,6 +1346,63 @@
                     <children>
                       #include <include/ipsec/bind.xml.i>
                       #include <include/ipsec/esp-group.xml.i>
+                      <node name="traffic-selector">
+                        <properties>
+                          <help>Traffic-selectors parameters</help>
+                        </properties>
+                        <children>
+                          <node name="local">
+                            <properties>
+                              <help>Local parameters for interesting traffic</help>
+                            </properties>
+                            <children>
+                              <leafNode name="prefix">
+                                <properties>
+                                  <help>Local IPv4 or IPv6 prefix</help>
+                                  <valueHelp>
+                                    <format>ipv4net</format>
+                                    <description>Local IPv4 prefix</description>
+                                  </valueHelp>
+                                  <valueHelp>
+                                    <format>ipv6net</format>
+                                    <description>Local IPv6 prefix</description>
+                                  </valueHelp>
+                                  <constraint>
+                                    <validator name="ipv4-prefix"/>
+                                    <validator name="ipv6-prefix"/>
+                                  </constraint>
+                                  <multi/>
+                                </properties>
+                              </leafNode>
+                            </children>
+                          </node>
+                          <node name="remote">
+                            <properties>
+                              <help>Remote parameters for interesting traffic</help>
+                            </properties>
+                            <children>
+                              <leafNode name="prefix">
+                                <properties>
+                                  <help>Remote IPv4 or IPv6 prefix</help>
+                                  <valueHelp>
+                                    <format>ipv4net</format>
+                                    <description>Remote IPv4 prefix</description>
+                                  </valueHelp>
+                                  <valueHelp>
+                                    <format>ipv6net</format>
+                                    <description>Remote IPv6 prefix</description>
+                                  </valueHelp>
+                                  <constraint>
+                                    <validator name="ipv4-prefix"/>
+                                    <validator name="ipv6-prefix"/>
+                                  </constraint>
+                                  <multi/>
+                                </properties>
+                              </leafNode>
+                            </children>
+                          </node>
+                        </children>
+                      </node>
                     </children>
                   </node>
                 </children>

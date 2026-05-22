@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2019-2024 VyOS maintainers and contributors
+# Copyright VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -25,6 +25,7 @@ from vyos.configdict import has_vlan_subinterface_configured
 from vyos.configverify import verify_dhcpv6
 from vyos.configverify import verify_mirror_redirect
 from vyos.configverify import verify_vrf
+from vyos.configverify import verify_mtu_ipv6
 from vyos.ifconfig import BridgeIf
 from vyos.configdict import has_address_configured
 from vyos.configdict import has_vrf_configured
@@ -32,6 +33,7 @@ from vyos.configdep import set_dependents
 from vyos.configdep import call_dependents
 from vyos.utils.dict import dict_search
 from vyos.utils.network import interface_exists
+from vyos.vpp.utils import cli_ifaces_list
 from vyos import ConfigError
 
 from vyos import airbag
@@ -39,7 +41,7 @@ airbag.enable()
 
 def get_config(config=None):
     """
-    Retrive CLI config as dictionary. Dictionary can never be empty, as at least the
+    Retrieve CLI config as dictionary. Dictionary can never be empty, as at least the
     interface name will be added or a deleted flag
     """
     if config:
@@ -74,8 +76,9 @@ def get_config(config=None):
         for interface in list(bridge['member']['interface']):
             # Check if member interface is already member of another bridge
             tmp = is_member(conf, interface, 'bridge')
-            if tmp and bridge['ifname'] not in tmp:
-                bridge['member']['interface'][interface].update({'is_bridge_member' : tmp})
+            if ifname in tmp:
+                del tmp[ifname]
+            if tmp: bridge['member']['interface'][interface].update({'is_bridge_member' : tmp})
 
             # Check if member interface is already member of a bond
             tmp = is_member(conf, interface, 'bonding')
@@ -109,6 +112,11 @@ def get_config(config=None):
             elif interface.startswith('wlan') and interface_exists(interface):
                 set_dependents('wlan', conf, interface)
 
+            if interface.startswith('vtun'):
+                _, tmp_config = get_interface_dict(conf, ['interfaces', 'openvpn'], interface)
+                tmp = tmp_config.get('device_type') == 'tap'
+                bridge['member']['interface'][interface].update({'valid_ovpn' : tmp})
+
     # delete empty dictionary keys - no need to run code paths if nothing is there to do
     if 'member' in bridge:
         if 'interface' in bridge['member'] and len(bridge['member']['interface']) == 0:
@@ -116,6 +124,12 @@ def get_config(config=None):
 
         if len(bridge['member']) == 0:
             del bridge['member']
+
+    # Protocols static arp dependency
+    if 'static_arp' in bridge:
+        set_dependents('static_arp', conf)
+
+    bridge['vpp_ifaces'] = cli_ifaces_list(conf)
 
     return bridge
 
@@ -135,13 +149,14 @@ def verify(bridge):
 
     verify_dhcpv6(bridge)
     verify_vrf(bridge)
+    verify_mtu_ipv6(bridge)
     verify_mirror_redirect(bridge)
 
     ifname = bridge['ifname']
 
     if dict_search('member.interface', bridge):
         for interface, interface_config in bridge['member']['interface'].items():
-            error_msg = f'Can not add interface "{interface}" to bridge, '
+            error_msg = f'Cannot add interface "{interface}" to bridge, '
 
             if interface == 'lo':
                 raise ConfigError('Loopback interface "lo" can not be added to a bridge')
@@ -164,6 +179,9 @@ def verify(bridge):
             if 'has_vrf' in interface_config:
                 raise ConfigError(error_msg + 'it has a VRF assigned!')
 
+            if 'bpdu_guard' in interface_config and 'root_guard' in interface_config:
+                raise ConfigError(error_msg + 'bpdu-guard and root-guard cannot be configured at the same time!')
+
             if 'enable_vlan' in bridge:
                 if 'has_vlan' in interface_config:
                     raise ConfigError(error_msg + 'it has VLAN subinterface(s) assigned!')
@@ -171,6 +189,15 @@ def verify(bridge):
                 for option in ['allowed_vlan', 'native_vlan']:
                     if option in interface_config:
                         raise ConfigError('Can not use VLAN options on non VLAN aware bridge')
+
+            if interface.startswith('vtun') and not interface_config['valid_ovpn']:
+                raise ConfigError(error_msg + 'OpenVPN device-type must be set to "tap"')
+
+            iface_base = interface.split('.')[0]  # get the parent interface name
+            if iface_base in bridge['vpp_ifaces']:
+                raise ConfigError(
+                    error_msg + 'it is already configured as VPP interface'
+                )
 
     if 'enable_vlan' in bridge:
         if dict_search('vif.1', bridge):
@@ -199,12 +226,20 @@ def apply(bridge):
         if 'interface' in bridge['member']:
             tmp.extend(bridge['member']['interface'])
 
-    for interface in tmp:
-        if interface.startswith(tuple(['vxlan', 'wlan'])) and interface_exists(interface):
-            try:
-                call_dependents()
-            except ConfigError:
-                raise ConfigError(f'Error updating member interface {interface} configuration after changing bridge!')
+    # collect member interfaces that require dependent updates
+    interfaces_need_update = [
+        iface
+        for iface in tmp
+        if iface.startswith(('vxlan', 'wlan')) and interface_exists(iface)
+    ]
+
+    if interfaces_need_update or 'static_arp' in bridge:
+        try:
+            call_dependents()
+        except ConfigError:
+            raise ConfigError(
+                'Error updating member interface configuration after changing bridge!'
+            )
 
     return None
 
