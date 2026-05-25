@@ -73,11 +73,11 @@ def verify(vmagent):
                         for label_name, label_config in target_config["label"].items():
                             if "value" not in label_config:
                                 raise ConfigError(
-                                    f'label value not specified in snmp-exporter target {taget} label {mod_name}'
+                                    f'label value not specified in snmp-exporter target {target} label {label_name}'
                                 )
                     else:
                         raise ConfigError(
-                            f'label name not specified in snmp-exporter target {taget}'
+                            f'label name not specified in snmp-exporter target {target}'
                         )
             else:
                 raise ConfigError(
