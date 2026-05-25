@@ -60,6 +60,9 @@ def verify(vmagent):
     if not vmagent:
         return None
 
+    verify_vrf(vmagent)
+
+
     if 'remote_write' not in vmagent:
         raise ConfigError(
             f'remote write not specified in vmagent'

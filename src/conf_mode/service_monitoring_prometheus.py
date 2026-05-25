@@ -26,7 +26,7 @@ from vyos.utils.process import call
 from vyos.utils.process import is_systemd_service_active
 from vyos import ConfigError
 from vyos import airbag
-from vyos.utils.process import process_named_running
+# from vyos.utils.process import process_named_running
 
 airbag.enable()
 
@@ -246,16 +246,21 @@ def generate(monitoring):
 def apply(monitoring):
     # Reload systemd manager configuration
     call('systemctl daemon-reload')
-    if (not monitoring or 'node_exporter' not in monitoring) and process_named_running("node_exporter"):
-        call(f'systemctl stop {node_exporter_systemd_service}')
-    if (not monitoring or 'frr_exporter' not in monitoring) and process_named_running("frr_exporter"):
-        call(f'systemctl stop {frr_exporter_systemd_service}')
-    if (not monitoring or 'blackbox_exporter' not in monitoring) and process_named_running("blackbox_exporter"):
-        call(f'systemctl stop {blackbox_exporter_systemd_service}')
-    if (not monitoring or 'ping_exporter' not in monitoring) and process_named_running("ping_exporter"):
-        call(f'systemctl stop {ping_exporter_systemd_service}')
-    if (not monitoring or 'snmp_exporter' not in monitoring) and process_named_running("snmp_exporter"):
-        call(f'systemctl stop {snmp_exporter_systemd_service}')
+    if not monitoring or 'node_exporter' not in monitoring:
+        if is_systemd_service_active("node_exporter"):
+            call(f'systemctl stop {node_exporter_systemd_service}')
+    if not monitoring or 'frr_exporter' not in monitoring:
+        if is_systemd_service_active("frr_exporter"):
+            call(f'systemctl stop {frr_exporter_systemd_service}')
+    if not monitoring or 'blackbox_exporter' not in monitoring:
+        if is_systemd_service_active("blackbox_exporter"):
+            call(f'systemctl stop {blackbox_exporter_systemd_service}')
+    if not monitoring or 'ping_exporter' not in monitoring:
+        if is_systemd_service_active("ping_exporter"):
+            call(f'systemctl stop {ping_exporter_systemd_service}')
+    if not monitoring or 'snmp_exporter' not in monitoring:
+        if is_systemd_service_active("snmp_exporter"):
+            call(f'systemctl stop {snmp_exporter_systemd_service}')
 
     if not monitoring:
         return
