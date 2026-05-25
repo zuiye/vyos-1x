@@ -134,6 +134,8 @@ def apply(vmagent):
     if process_named_running("vmagent"):
         url = f'http://127.0.0.1:8429/-/reload'
         r = requests.get(url)
+        if r.status_code != 200:
+            print(f'Failed to reload vmagent configuration, status code: {r.status_code}')
     else:
         systemd_action = 'reload-or-restart'
         if 'vmagent_restart_required' in vmagent:
