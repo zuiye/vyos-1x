@@ -61,6 +61,8 @@ def get_config(config=None):
         'node_exporter': base + ['node-exporter'],
         'frr_exporter': base + ['frr-exporter'],
         'blackbox_exporter': base + ['blackbox-exporter'],
+        'ping_exporter': base + ['ping-exporter'],
+        'snmp_exporter': base + ['snmp-exporter']
     }
 
     for exporter_name, exporter_base in exporters.items():
