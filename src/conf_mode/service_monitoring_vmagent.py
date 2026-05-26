@@ -16,6 +16,7 @@
 
 import os
 import requests
+import socket
 
 from sys import exit
 
@@ -37,6 +38,14 @@ vmagent_systemd_service = 'vmagent.service'
 vmagent_config_file = '/run/vmagent/prometheus.yml'
 
 
+def get_hostname() -> str:
+    try:
+        hostname = socket.getfqdn()
+    except socket.gaierror:
+        hostname = socket.gethostname()
+    return hostname
+
+
 def get_config(config=None):
     if config:
         conf = config
@@ -50,8 +59,18 @@ def get_config(config=None):
         base, key_mangling=('-', '_'), get_first_key=True, with_recursive_defaults=True
     )
 
-    if is_node_changed(conf, base):
-        vmagent.update({'vmagent_restart_required': {}})
+    restart_required_list = ['global-label', 'listen-address', 'port','remote-write']
+    for restart_node in restart_required_list:
+        if is_node_changed(conf, base + [restart_node]):
+            vmagent.update({'vmagent_restart_required': {}})
+            break
+
+    if not conf.exists(base + ['job', 'ping-exporter']):
+        # vmagent 删除ping_exporter
+        vmagent['job'].pop('ping_exporter', None)
+    if not conf.exists(base + ['job', 'snmp-exporter']):
+        # vmagent 删除snmp_exporter
+        vmagent['job'].pop('snmp_exporter', None)
 
     return vmagent
 
@@ -96,7 +115,6 @@ def generate(vmagent):
             os.unlink(vmagent_service_file)
         return None
 
-
     # Render blackbox_exporter service_file
     render(
         vmagent_service_file,
@@ -105,6 +123,11 @@ def generate(vmagent):
     )
 
     if 'job' in vmagent:
+        # 获取hostname 作为global_label的一部分，方便在prometheus中区分不同的vyos设备
+        hostname = get_hostname()
+        if "global_label" not in vmagent:
+            vmagent["global_label"] = {}
+        vmagent["global_label"]["vyosName"] = {"value": hostname}
         # Render blackbox_exporter config file
         render(
             '/run/vmagent/prometheus.yml',
@@ -114,10 +137,17 @@ def generate(vmagent):
 
         if "snmp_exporter" in vmagent["job"]:
             render(
-            '/run/vmagent/snmp-file_sd_config.yml',
-            'prometheus/snmp-file_sd_config.yml.j2',
-            vmagent['job']["snmp_exporter"],
-        )
+                '/run/vmagent/snmp-file_sd_config.yml',
+                'prometheus/snmp-file_sd_config.yml.j2',
+                vmagent['job']["snmp_exporter"],
+            )
+        else:
+            render(
+                '/run/vmagent/snmp-file_sd_config.yml',
+                'prometheus/snmp-file_sd_config.yml.j2',
+                {},
+            )
+
 
     return None
 
@@ -131,16 +161,14 @@ def apply(vmagent):
     if not vmagent:
         return
 
-    if process_named_running("vmagent"):
+    if 'vmagent_restart_required' in vmagent:
+        call(f'systemctl restart {vmagent_systemd_service}')
+    else:
         url = f'http://127.0.0.1:8429/-/reload'
         r = requests.get(url)
         if r.status_code != 200:
             print(f'Failed to reload vmagent configuration, status code: {r.status_code}')
-    else:
-        systemd_action = 'reload-or-restart'
-        if 'vmagent_restart_required' in vmagent:
-            systemd_action = 'restart'
-        call(f'systemctl {systemd_action} {vmagent_systemd_service}')
+
 
 
 if __name__ == '__main__':
