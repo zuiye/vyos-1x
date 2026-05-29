@@ -136,6 +136,15 @@
                             </properties>
                             <defaultValue>if_mib</defaultValue>
                           </leafNode>
+                          <leafNode name="scrape-interval">
+                            <properties>
+                              <help>Scrape interval for snmp-exporter target.</help>
+                              <completionHelp>
+                                <list>30s 1m 2m 3m</list>
+                              </completionHelp>
+                            </properties>
+                            <defaultValue>30s</defaultValue>
+                          </leafNode>
                         </children>
                       </tagNode>
                     </children>

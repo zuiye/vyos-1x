@@ -24,14 +24,20 @@ scrape_configs:
       - targets: ["{{ job.ping_exporter.url }}"]
 {% endif %}
 
-  # vyos snmp-exporter
-  - job_name: "vyos-snmp-exporter"
-    scrape_interval: 60s
-    scrape_timeout: 60s
+
+{'target': {'192.168.47.202': {'auth': 'public', 'label': {'hostname': {'value': 'jayden-dev-monitor'}, 'pop': {'value': 'SZX-CYP'}, 'vendor': {'value': 'linux-test'}, 'zone': {'value': 'SZX7-华南部'}}, 'module': 'if_mib'}}, 'url': '192.168.47.7:9116'}
+
+{% if scrape_interval_list is defined %}
+{%     for interval in scrape_interval_list %}
+  # vyos snmp-exporter-{{ interval }}
+  - job_name: "vyos-snmp-exporter-{{ interval }}"
+    scrape_interval: {{ interval }}
+    scrape_timeout: {{ interval }}
     metrics_path: /snmp
     file_sd_configs:
     - files:
-      - "/run/vmagent/*-file_sd_config.yml"
+      - "/run/vmagent/*-file_sd_config-{{ interval }}.yml"
+      refresh_interval: {{ interval }}
     relabel_configs:
       - source_labels: [module]
         target_label: __param_module
@@ -43,3 +49,7 @@ scrape_configs:
         target_label: instance
       - target_label: __address__
         replacement: 127.0.0.1:9116
+{%     endfor %}
+{% endif %}
+
+ 

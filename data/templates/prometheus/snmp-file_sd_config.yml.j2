@@ -1,6 +1,28 @@
-{% if target is defined %}
-{%     for target_name, target_config in target.items() %}
+# {% if target is defined %}
+# {%     for target_name, target_config in target.items() %}
 
+# - targets: ["{{ target_name }}"]
+#   labels:
+# {%         if target_config.label is defined %}
+# {%             for label_name, label_config in target_config.label.items() %}
+#     {{ label_name }}: {{ label_config.value }}
+# {%             endfor %}
+# {%         endif %}
+# {%         if target_config.module is defined %}
+#     module: {{ target_config.module }}
+# {%         endif %}
+# {%         if target_config.auth is defined %}
+#     auth: {{ target_config.auth }}
+# {%         endif %}
+# {%     endfor %}
+# {% endif %}
+
+# 原始数据
+# {'target': {'192.168.47.202': {'auth': 'public', 'label': {'hostname': {'value': 'jayden-dev-monitor'}, 'pop': {'value': 'SZX-CYP'}, 'vendor': {'value': 'linux-test'}, 'zone': {'value': 'SZX7-华南部'}}, 'module': 'if_mib'}}, 'url': '192.168.47.7:9116'}
+
+
+{% if targets_dict is defined %}
+{%     for target_name, target_config in targets_dict.items() %}
 - targets: ["{{ target_name }}"]
   labels:
 {%         if target_config.label is defined %}
@@ -14,5 +36,6 @@
 {%         if target_config.auth is defined %}
     auth: {{ target_config.auth }}
 {%         endif %}
+
 {%     endfor %}
 {% endif %}

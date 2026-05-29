@@ -129,24 +129,41 @@ def generate(vmagent):
             vmagent["global_label"] = {}
         vmagent["global_label"]["vyosName"] = {"value": hostname}
         # Render blackbox_exporter config file
+
+
+        scrape_interval_dict = {}
+        if "snmp_exporter" in vmagent["job"]:
+            for target, target_config in vmagent["job"]["snmp_exporter"]["target"].items():
+                scrape_interval = target_config["scrape_interval"]
+                if scrape_interval not in scrape_interval_dict:
+                    scrape_interval_dict[scrape_interval] = {}
+                scrape_interval_dict[scrape_interval][target] = target_config
+
+        scrape_interval_keys = list(scrape_interval_dict.keys())
+        vmagent["scrape_interval_list"] = scrape_interval_keys
+
         render(
             '/run/vmagent/prometheus.yml',
             'prometheus/vmagent-prometheus.yml.j2',
             vmagent,
         )
 
-        if "snmp_exporter" in vmagent["job"]:
+        for scrape_interval, targets_dict in scrape_interval_dict.items():
             render(
-                '/run/vmagent/snmp-file_sd_config.yml',
+                f'/run/vmagent/snmp-file_sd_config-{scrape_interval}.yml',
                 'prometheus/snmp-file_sd_config.yml.j2',
-                vmagent['job']["snmp_exporter"],
+                {
+                    "targets_dict": targets_dict,
+                    "scrape_interval": scrape_interval
+                }
             )
-        else:
-            render(
-                '/run/vmagent/snmp-file_sd_config.yml',
-                'prometheus/snmp-file_sd_config.yml.j2',
-                {},
-            )
+
+        # else:
+        #     render(
+        #         '/run/vmagent/snmp-file_sd_config.yml',
+        #         'prometheus/snmp-file_sd_config.yml.j2',
+        #         {},
+        #     )
 
 
     return None
