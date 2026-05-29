@@ -25,8 +25,6 @@ scrape_configs:
 {% endif %}
 
 
-{'target': {'192.168.47.202': {'auth': 'public', 'label': {'hostname': {'value': 'jayden-dev-monitor'}, 'pop': {'value': 'SZX-CYP'}, 'vendor': {'value': 'linux-test'}, 'zone': {'value': 'SZX7-华南部'}}, 'module': 'if_mib'}}, 'url': '192.168.47.7:9116'}
-
 {% if scrape_interval_list is defined %}
 {%     for interval in scrape_interval_list %}
   # vyos snmp-exporter-{{ interval }}
@@ -51,5 +49,3 @@ scrape_configs:
         replacement: 127.0.0.1:9116
 {%     endfor %}
 {% endif %}
-
- 
