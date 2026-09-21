@@ -29,15 +29,27 @@ scrape_configs:
 
 {% if scrape_interval_list is defined %}
 {%     for interval in scrape_interval_list %}
-  # vyos snmp-exporter-{{ interval }}
-  - job_name: "vyos-snmp-exporter-{{ interval }}"
+{%         if interval == "30s" %}
+{%             set job_name = "snmp-exporter-BBone" %}
+{%         elif interval == "1m" %}
+{%             set job_name = "snmp-exporter-BBone-1minute" %}
+{%         elif interval == "2m" %}
+{%             set job_name = "snmp-exporter-BBone-2minute" %}
+{%         elif interval == "3m" %}
+{%             set job_name = "snmp-exporter-BBone-3minute" %}
+{%         elif interval == "5m" %}
+{%             set job_name = "snmp-exporter-BBone-5minute" %}
+{%         else %}
+{%             set job_name = "snmp-exporter-BBone-" ~ interval %}
+{%         endif %}
+  # vyos {{ job_name }}
+  - job_name: "{{ job_name }}"
     scrape_interval: {{ interval }}
     scrape_timeout: {{ interval }}
     metrics_path: /snmp
     file_sd_configs:
     - files:
       - "/run/vmagent/*-file_sd_config-{{ interval }}.yml"
-      refresh_interval: {{ interval }}
     relabel_configs:
       - source_labels: [module]
         target_label: __param_module
