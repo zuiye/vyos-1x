@@ -20,6 +20,8 @@ scrape_configs:
 {% if job.ping_exporter is defined %}
   # vyos ping-exporter
   - job_name: "vyos-ping-exporter"
+    scrape_interval: {{ job.ping_exporter.scrape_interval }}
+    scrape_timeout: {{ job.ping_exporter.scrape_interval }}
     static_configs:
       - targets: ["{{ job.ping_exporter.url }}"]
 {% endif %}
