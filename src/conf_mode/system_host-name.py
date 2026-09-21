@@ -26,7 +26,7 @@ from vyos.configdict import leaf_node_changed
 from vyos.defaults import systemd_services
 from vyos.ifconfig import Section
 from vyos.template import is_ip
-from vyos.utils.process import cmd
+from vyos.utils.process import cmdl
 from vyos.utils.process import call
 from vyos.utils.process import process_named_running
 from vyos import ConfigError
@@ -39,7 +39,7 @@ default_config_data = {
     'domain_search': [],
     'nameserver': [],
     'nameservers_dhcp_interfaces': {},
-    'snmpd_restart_reqired': False,
+    'snmpd_restart_required': False,
     'static_host_mapping': {}
 }
 
@@ -57,7 +57,7 @@ def get_config(config=None):
 
     base = ['system']
     if leaf_node_changed(conf, base + ['host-name']) or leaf_node_changed(conf, base + ['domain-name']):
-        hosts['snmpd_restart_reqired'] = True
+        hosts['snmpd_restart_required'] = True
 
     # This may happen if the config is not loaded yet,
     # e.g. if run by cloud-init
@@ -170,7 +170,7 @@ def apply(config):
 
     # rsyslog runs into a race condition at boot time with systemd
     # restart rsyslog only if the hostname changed.
-    hostname_old = cmd('hostnamectl --static')
+    hostname_old = cmdl(['hostnamectl', '--static'])
     call(f'hostnamectl set-hostname --static {hostname_new}')
 
     # Restart services that use the hostname
@@ -179,7 +179,7 @@ def apply(config):
         call(f'systemctl restart {tmp}')
 
     # If SNMP is running, restart it too
-    if process_named_running('snmpd') and config['snmpd_restart_reqired']:
+    if process_named_running('snmpd') and config['snmpd_restart_required']:
         tmp = systemd_services['snmpd']
         call(f'systemctl restart {tmp}')
 

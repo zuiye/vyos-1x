@@ -18,6 +18,7 @@ from vyos.referencetree import ReferenceTree
 from vyos.configtree import ConfigTree
 from vyos.configtree import ConfigTreeError
 from vyos.configtree import subtree_from_partial
+from vyos.configtree import mask_exclusive
 
 
 class DerivedTreeError(Exception):
@@ -25,27 +26,34 @@ class DerivedTreeError(Exception):
 
 
 def subtree_from_list_of_partial_paths(
-    ctree: ConfigTree, paths: list[list[str]], accumulator: ConfigTree = None
-):
+    ctree: ConfigTree,
+    paths: list[list[str]],
+    accumulator: ConfigTree = None,
+    reference_tree: ReferenceTree = None,
+) -> ConfigTree:
     """Return the union of subtrees of the ConfigTree argument matching each
     of the 'partial' paths. A partial path is one that may or may not
     contain intervening tag node values, in which case it will match for all
     values that apply.
 
     An existing subtree may be passed as the initial value of accumulator.
+
+    For testing or use outside of the canonical environment, an instance of
+    the ReferenceTree may be passed from an alternative cache location.
     """
-    if accumulator:
+    if reference_tree is None:
+        reference_tree = ReferenceTree()
+
+    if accumulator is not None:
         if not isinstance(accumulator, ConfigTree):
             raise TypeError("Argument 'accumulator' must be an instance of ConfigTree")
     else:
         accumulator = ConfigTree('')
 
-    rtree = ReferenceTree()
-
     errors = []
     for path in paths:
         try:
-            accumulator = subtree_from_partial(ctree, path, rtree, accumulator)
+            accumulator = subtree_from_partial(ctree, path, reference_tree, accumulator)
         except ConfigTreeError as e:
             errors.append(str(e))
             continue
@@ -54,3 +62,15 @@ def subtree_from_list_of_partial_paths(
         raise DerivedTreeError(f'Nonsensical paths: {errors}')
 
     return accumulator
+
+
+def apply_exclusion_list(
+    config_tree: ConfigTree, exclusion_list: list[list[str]]
+) -> ConfigTree:
+    mask_ex = subtree_from_list_of_partial_paths(config_tree, exclusion_list)
+    try:
+        masked = mask_exclusive(config_tree, mask_ex)
+    except ConfigTreeError as e:
+        raise DerivedTreeError(str(e)) from e
+
+    return masked

@@ -15,6 +15,7 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import os
+import tempfile
 import unittest
 import time
 
@@ -23,7 +24,7 @@ from vyos.utils.file import chmod_755
 from vyos.utils.file import write_file
 from vyos.utils.misc import wait_for
 from vyos.utils.process import call
-from vyos.utils.process import cmd
+from vyos.utils.process import cmdl
 from vyos.utils.process import rc_cmd
 
 base_path = ['load-balancing']
@@ -131,12 +132,29 @@ class TestLoadBalancingWan(VyOSUnitTestSHIM.TestCase):
         # Check default routes in tables 201, 202
         # Expected values
         original = 'default via 203.0.113.1 dev eth201'
-        tmp = cmd('sudo ip route show table 201')
+        tmp = cmdl(['ip', 'route', 'show', 'table', '201'], sudo=True)
         self.assertEqual(tmp, original)
 
         original = 'default via 192.0.2.1 dev eth202'
-        tmp = cmd('sudo ip route show table 202')
+        tmp = cmdl(['ip', 'route', 'show', 'table', '202'], sudo=True)
         self.assertEqual(tmp, original)
+
+        tmp = cmdl(['ip', 'rule', 'show'], sudo=True)
+        self.assertIn('from all fwmark 0xc9 lookup 201', tmp)
+        self.assertIn('from all fwmark 0xca lookup 202', tmp)
+        self.assertNotIn('fwmark 0xc9 lookup main suppress_prefixlength 0', tmp)
+        self.assertNotIn('fwmark 0xca lookup main suppress_prefixlength 0', tmp)
+
+        self.cli_set(base_path + ['wan', 'only-default-route'])
+        self.cli_commit()
+
+        time.sleep(5)
+
+        tmp = cmdl(['ip', 'rule', 'show'], sudo=True)
+        self.assertIn('from all fwmark 0xc9 lookup main suppress_prefixlength 0', tmp)
+        self.assertIn('from all fwmark 0xc9 lookup 201', tmp)
+        self.assertIn('from all fwmark 0xca lookup main suppress_prefixlength 0', tmp)
+        self.assertIn('from all fwmark 0xca lookup 202', tmp)
 
         # Delete veth interfaces and netns
         for iface in [iface1, iface2, iface3]:
@@ -226,17 +244,17 @@ class TestLoadBalancingWan(VyOSUnitTestSHIM.TestCase):
         time.sleep(5)
 
         # Check mangle chains
-        tmp = cmd(f'sudo nft -s list chain ip vyos_wanloadbalance wlb_mangle_isp_{iface1}')
+        tmp = cmdl(['nft', '-s', 'list', 'chain', 'ip', 'vyos_wanloadbalance', f'wlb_mangle_isp_{iface1}'], sudo=True)
         self.assertEqual(tmp, mangle_isp1)
 
-        tmp = cmd(f'sudo nft -s list chain ip vyos_wanloadbalance wlb_mangle_isp_{iface2}')
+        tmp = cmdl(['nft', '-s', 'list', 'chain', 'ip', 'vyos_wanloadbalance', f'wlb_mangle_isp_{iface2}'], sudo=True)
         self.assertEqual(tmp, mangle_isp2)
 
-        tmp = cmd('sudo nft -s list chain ip vyos_wanloadbalance wlb_mangle_prerouting')
+        tmp = cmdl(['nft', '-s', 'list', 'chain', 'ip', 'vyos_wanloadbalance', 'wlb_mangle_prerouting'], sudo=True)
         self.assertEqual(tmp, mangle_prerouting)
 
         # Check nat chains
-        tmp = cmd('sudo nft -s list chain ip vyos_wanloadbalance wlb_nat_postrouting')
+        tmp = cmdl(['nft', '-s', 'list', 'chain', 'ip', 'vyos_wanloadbalance', 'wlb_nat_postrouting'], sudo=True)
         self.assertEqual(tmp, nat_wanloadbalance)
 
         # Set limit configuration
@@ -257,7 +275,7 @@ class TestLoadBalancingWan(VyOSUnitTestSHIM.TestCase):
         time.sleep(5)
 
         # Check prerouting mangle chain
-        tmp = cmd('sudo nft -s list chain ip vyos_wanloadbalance wlb_mangle_prerouting')
+        tmp = cmdl(['nft', '-s', 'list', 'chain', 'ip', 'vyos_wanloadbalance', 'wlb_mangle_prerouting'], sudo=True)
         self.assertEqual(tmp, mangle_prerouting_limit)
 
         # Delete veth interfaces and netns
@@ -373,6 +391,89 @@ echo "$ifname - $state" > {hook_output_path}
 
         with open(hook_output_path, 'r') as f:
             self.assertIn('eth0 - FAILED', f.read())
+
+    def test_user_defined_health_check_script_env(self):
+        isp_interfaces = {
+            'eth0': ('203.0.113.2/30', '203.0.113.1'),
+            'eth1': ('192.0.2.2/30', '192.0.2.1'),
+        }
+        lan_iface = 'eth2'
+        temp_dir = tempfile.TemporaryDirectory(prefix='wlb_health_check_')
+        self.addCleanup(temp_dir.cleanup)
+        script_path = os.path.join(temp_dir.name, 'health_check.sh')
+        output_path = os.path.join(temp_dir.name, 'health_check_output')
+
+        health_check_script = f"""
+#!/bin/sh
+
+printf 'WLB_INTERFACE_NAME=%s WLB_SCRIPT_IFACE=%s\\n' \\
+    "$WLB_INTERFACE_NAME" "$WLB_SCRIPT_IFACE" >> {output_path}
+
+[ "$WLB_INTERFACE_NAME" = "$WLB_SCRIPT_IFACE" ]
+"""
+
+        write_file(script_path, health_check_script)
+        chmod_755(script_path)
+
+        for isp_iface, (address, nexthop) in isp_interfaces.items():
+            self.cli_set(['interfaces', 'ethernet', isp_iface, 'address', address])
+            self.cli_set(
+                base_path + ['wan', 'interface-health', isp_iface, 'failure-count', '1']
+            )
+            self.cli_set(
+                base_path + ['wan', 'interface-health', isp_iface, 'nexthop', nexthop]
+            )
+            self.cli_set(
+                base_path + ['wan', 'interface-health', isp_iface, 'success-count', '1']
+            )
+            self.cli_set(
+                base_path
+                + [
+                    'wan',
+                    'interface-health',
+                    isp_iface,
+                    'test',
+                    '10',
+                    'test-script',
+                    script_path,
+                ]
+            )
+            self.cli_set(
+                base_path
+                + [
+                    'wan',
+                    'interface-health',
+                    isp_iface,
+                    'test',
+                    '10',
+                    'type',
+                    'user-defined',
+                ]
+            )
+
+        self.cli_set(
+            ['interfaces', 'ethernet', lan_iface, 'address', '198.51.100.2/30']
+        )
+        self.cli_set(base_path + ['wan', 'rule', '10', 'inbound-interface', lan_iface])
+
+        for isp_iface in isp_interfaces:
+            self.cli_set(base_path + ['wan', 'rule', '10', 'interface', isp_iface])
+
+        self.cli_commit()
+
+        def check_script_output():
+            if not os.path.exists(output_path):
+                return False
+
+            with open(output_path, 'r') as f:
+                output = f.read()
+
+            return all(
+                f'WLB_INTERFACE_NAME={isp_iface} WLB_SCRIPT_IFACE={isp_iface}' in output
+                for isp_iface in isp_interfaces
+            )
+
+        wait_for(check_script_output)
 
     def test_firewall_groups(self):
         isp1_iface = 'eth0'

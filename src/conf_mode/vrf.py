@@ -23,6 +23,7 @@ import vyos.defaults
 from vyos.config import Config
 from vyos.configdict import node_changed
 from vyos.configverify import verify_route_map
+from vyos.defaults import wireguard_fwmark_pref
 from vyos.firewall import conntrack_required
 from vyos.frrender import FRRender
 from vyos.frrender import get_frrender_dict
@@ -35,7 +36,7 @@ from vyos.utils.network import get_vrf_tableid
 from vyos.utils.network import get_vrf_members
 from vyos.utils.network import interface_exists
 from vyos.utils.process import call
-from vyos.utils.process import cmd
+from vyos.utils.process import cmdl
 from vyos.utils.process import is_systemd_service_running
 from vyos.utils.process import popen
 from vyos.utils.system import sysctl_write
@@ -47,10 +48,44 @@ config_file = '/etc/iproute2/rt_tables.d/vyos-vrf.conf'
 k_mod = ['vrf']
 
 nftables_table = 'inet vrf_zones'
+# Only the original direction is zoned on purpose - do not "fix" this to a
+# plain "ct zone set" (T3655, T6097).
+#
+# Leaving the reply tuple in the default zone 0 is what makes default route
+# leaking work: the reply of a leaked and NATed flow enters the default VRF
+# (e.g. pppoe0), where no zone is assigned, and can only be matched if the
+# reply tuple lives in zone 0 as well. Zoning both directions puts it in the
+# VRF zone instead and the reply is never found again.
+#
+# The flip side is that reply tuples of different VRFs collide in zone 0. That
+# is resolved by the NAT engine reallocating the clashing tuple - see the anchor
+# table below.
 nftables_rules = {
     'vrf_zones_ct_in': 'counter ct original zone set iifname map @ct_iface_map',
     'vrf_zones_ct_out': 'counter ct original zone set oifname map @ct_iface_map'
 }
+
+# The NAT engine only reallocates a clashing reply tuple if nf_nat is registered
+# for the address family, and it only gets registered once a "type nat" chain
+# exists. NAT itself brings its own tables, but zoning is also active without it
+# (e.g. VRF plus a stateful firewall rule), and IPv6 rarely has any NAT at all -
+# which is what broke IPv6 while IPv4 kept working by accident.
+#
+# This anchor table provides that chain. A "type nat" chain in the inet family
+# registers nf_nat for IPv4 and IPv6 in one go, so a single table covers both.
+#
+# It is tied to the zone rules rather than created unconditionally at boot
+# because a registered nf_nat costs roughly 200ns per new connection - measured
+# at +19% (IPv4) and +11% (IPv6) on a pure connection setup benchmark, while
+# established traffic is unaffected.
+#
+# It carries a name of its own so no other component can take it down: every
+# other place that removes an nftables table names its own one. Whatever makes
+# conntrack_required() flip (nat, nat66, firewall, load-balancing wan) pulls in
+# system_conntrack, which lists vrf as a dependent, so we are called again and
+# can add or remove the anchor accordingly.
+nftables_nat_anchor = 'inet vrf_zones_nat'
+nftables_nat_anchor_chain = 'anchor'
 
 def has_rule(af : str, priority : int, table : str=None):
     """
@@ -64,8 +99,8 @@ def has_rule(af : str, priority : int, table : str=None):
     """
     if af not in ['-4', '-6']:
         raise ValueError()
-    command = f'ip --detail --json {af} rule show'
-    for tmp in loads(cmd(command)):
+    command = ['ip', '--detail', '--json', af, 'rule', 'show']
+    for tmp in loads(cmdl(command)):
         if 'priority' in tmp and 'table' in tmp:
             if tmp['priority'] == priority and tmp['table'] == table:
                 return True
@@ -79,9 +114,25 @@ def is_nft_vrf_zone_rule_setup() -> bool:
     """
     Check if an nftables connection tracking rule already exists
     """
-    tmp = loads(cmd('sudo nft -j list table inet vrf_zones'))
+    tmp = loads(cmdl(['nft', '-j', 'list', 'table', 'inet', 'vrf_zones'], sudo=True))
     num_rules = len(search("nftables[].rule[].chain", tmp))
     return bool(num_rules)
+
+def nft_vrf_nat_anchor(enable: bool) -> None:
+    """
+    Create or remove the nat anchor table the conntrack zoning depends on
+    """
+    table = nftables_nat_anchor.split()
+    if enable:
+        # both commands are idempotent, no need to probe for existence
+        cmdl(['nft', 'add', 'table'] + table)
+        cmdl(['nft', 'add', 'chain'] + table + [nftables_nat_anchor_chain,
+              '{', 'type', 'nat', 'hook', 'postrouting', 'priority', '99;',
+              'policy', 'accept;', '}'])
+    else:
+        # this runs on every commit that does not need zoning, so a missing
+        # table is the normal case and must not raise
+        cmdl(['nft', 'delete', 'table'] + table, expect=[0, 1])
 
 def vrf_interfaces(c, match):
     matched = []
@@ -160,7 +211,7 @@ def verify(vrf):
     # ensure VRF is not assigned to any interface
     if 'vrf_remove' in vrf:
         for name, config in vrf['vrf_remove'].items():
-            err = f'Can not remove VRF "{name}",'
+            err = f'Cannot remove VRF "{name}",'
             if 'interface' in config:
                 raise ConfigError(f'{err} it still has member interfaces!')
             if 'route' in config:
@@ -258,17 +309,18 @@ def apply(vrf):
                 vrf_iface.set_dhcpv6(False)
 
             # Remove nftables conntrack zone map item
-            nft_del_element = f'delete element inet vrf_zones ct_iface_map {{ \'"{tmp}"\' }}'
+            nft_del_element = ['delete', 'element', 'inet', 'vrf_zones', 'ct_iface_map',
+                                '{', f'"{tmp}"', '}']
             # Check if deleting is possible first to avoid raising errors
-            _, err = popen(f'nft --check {nft_del_element}')
+            _, err = popen(f'nft --check {" ".join(nft_del_element)}')
             if not err:
                 # Remove map element
-                cmd(f'nft {nft_del_element}')
+                cmdl(['nft'] + nft_del_element)
 
-            # Remove all ip rules pointing to this VRF table
+            # Remove WireGuard fwmark routing rules created for this VRF table
             table_id = get_vrf_tableid(tmp)
             for afi in ['-4', '-6']:
-                while call(f'ip {afi} rule del table {table_id}') == 0:
+                while call(f'ip {afi} rule del pref {wireguard_fwmark_pref} table {table_id}') == 0:
                     pass
 
             # Delete the VRF Kernel interface
@@ -344,8 +396,9 @@ def apply(vrf):
             state = 'down' if 'disable' in config else 'up'
             vrf_if.set_admin_state(state)
             # Add nftables conntrack zone map item
-            nft_add_element = f'add element inet vrf_zones ct_iface_map {{ \'"{name}"\' : {table} }}'
-            cmd(f'nft {nft_add_element}')
+            nft_add_element = ['add', 'element', 'inet', 'vrf_zones', 'ct_iface_map',
+                                '{', f'"{name}"', ':', str(table), '}']
+            cmdl(['nft'] + nft_add_element)
 
         # Only call into nftables as long as there is nothing setup to avoid wasting
         # CPU time and thus lengthen the commit process
@@ -354,11 +407,18 @@ def apply(vrf):
         # Install nftables conntrack rules only once
         if vrf['conntrack'] and not nft_vrf_zone_rule_setup:
             for chain, rule in nftables_rules.items():
-                cmd(f'nft add rule inet vrf_zones {chain} {rule}')
+                cmdl(f'nft add rule inet vrf_zones {chain} {rule}'.split())
+        # Deliberately not guarded by nft_vrf_zone_rule_setup: that guard only
+        # lets the rules above be installed on the transition into "zoning
+        # needed", while the anchor tables have to be re-asserted on every run
+        # that wants zoning, even when the rules are already in place
+        if vrf['conntrack']:
+            nft_vrf_nat_anchor(True)
 
     if 'name' not in vrf or not vrf['conntrack']:
         for chain, rule in nftables_rules.items():
-            cmd(f'nft flush chain inet vrf_zones {chain}')
+            cmdl(f'nft flush chain inet vrf_zones {chain}'.split())
+        nft_vrf_nat_anchor(False)
 
     # Return default ip rule values
     if 'name' not in vrf:

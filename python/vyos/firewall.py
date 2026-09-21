@@ -21,7 +21,7 @@ from socket import getaddrinfo
 from vyos.template import is_ipv4
 from vyos.utils.dict import dict_search_args
 from vyos.utils.dict import dict_search_recursive
-from vyos.utils.process import cmd
+from vyos.utils.process import cmdl
 from vyos.utils.network import get_vrf_tableid
 from vyos.defaults import rt_global_table
 from vyos.defaults import rt_global_vrf
@@ -36,6 +36,9 @@ def conntrack_required(conf):
 
     firewall = conf.get_config_dict(['firewall'], key_mangling=('-', '_'),
                                     no_tag_node_value_mangle=True, get_first_key=True)
+
+    if dict_search_args(firewall, 'global_options', 'state_policy'):
+        return True
 
     for rules, path in dict_search_recursive(firewall, 'rule'):
         if any(('state' in rule_conf or 'connection_status' in rule_conf or 'offload_target' in rule_conf) for rule_conf in rules.values()):
@@ -76,12 +79,12 @@ def fqdn_resolve(fqdn, ipv6=False):
     try:
         res = getaddrinfo(fqdn, None, AF_INET6 if ipv6 else AF_INET)
         return set(item[4][0] for item in res)
-    except:
+    except OSError:
         return None
 
 def find_nftables_rule(table, chain, rule_matches=[]):
     # Find rule in table/chain that matches all criteria and return the handle
-    results = cmd(f'sudo nft --handle list chain {table} {chain}').split("\n")
+    results = cmdl(['nft', '--handle', 'list', 'chain', table, chain], sudo=True).split("\n")
     for line in results:
         if all(rule_match in line for rule_match in rule_matches):
             handle_search = re.search('handle (\d+)', line)
@@ -90,7 +93,7 @@ def find_nftables_rule(table, chain, rule_matches=[]):
     return None
 
 def remove_nftables_rule(table, chain, handle):
-    cmd(f'sudo nft delete rule {table} {chain} handle {handle}')
+    cmdl(['nft', 'delete', 'rule', table, chain, 'handle', str(handle)], sudo=True)
 
 # Functions below used by template generation
 
@@ -162,11 +165,36 @@ def parse_rule(rule_conf, hook, fw_name, rule_id, ip_name):
         ether_type = ether_type_mapping.get(ether_type, ether_type)
         output.append(f'ether type {operator} {ether_type}')
 
+    if 'fib' in rule_conf:
+        lookup = rule_conf['fib']['lookup']
+        lookup_list = []
+
+        if 'source-address' in lookup:
+            lookup_list.append('saddr')
+        if 'destination-address' in lookup:
+            lookup_list.append('daddr')
+
+        lookup_output = ' . '.join(lookup_list)
+
+        match_conf = rule_conf['fib']['match']
+        match_output = ''
+
+        if 'route_type' in match_conf:
+            route_type = match_conf['route_type']
+            operator = ''
+            if route_type[0] == '!':
+                operator = '!= '
+                route_type = route_type[1:]
+            match_output = f'type {operator}{route_type}'
+
+        output.append(f'fib {lookup_output} {match_output}')
+
     for side in ['destination', 'source']:
         if side in rule_conf:
             prefix = side[0]
             side_conf = rule_conf[side]
             address_mask = side_conf.get('address_mask', None)
+            mac_address_mask = side_conf.get('mac_address_mask', None)
 
             if 'address' in side_conf:
                 suffix = side_conf['address']
@@ -210,10 +238,13 @@ def parse_rule(rule_conf, hook, fw_name, rule_id, ip_name):
                     hook_name = f'name{def_suffix}'
                 output.append(f'{ip_name} {prefix}addr {operator} @FQDN_{hook_name}_{fw_name}_{rule_id}_{prefix}')
 
-            if dict_search_args(side_conf, 'geoip', 'country_code'):
+            country_code = dict_search_args(side_conf, 'geoip', 'country_code')
+            asn = dict_search_args(side_conf, 'geoip', 'asn')
+            if country_code or asn:
+                geoip_prefix = 'CC' if country_code else 'ASN'
                 operator = ''
                 hook_name = ''
-                if dict_search_args(side_conf, 'geoip', 'inverse_match') != None:
+                if dict_search_args(side_conf, 'geoip', 'inverse_match') is not None:
                     operator = '!='
                 if hook == 'FWD':
                     hook_name = 'forward'
@@ -224,17 +255,23 @@ def parse_rule(rule_conf, hook, fw_name, rule_id, ip_name):
                 if hook == 'PRE':
                     hook_name = 'prerouting'
                 if hook == 'NAM':
-                    hook_name = f'name'
+                    hook_name = 'name'
                 # for policy
                 if hook == 'route' or hook == 'route6':
                     hook_name = hook
-                output.append(f'{ip_name} {prefix}addr {operator} @GEOIP_CC{def_suffix}_{hook_name}_{fw_name}_{rule_id}')
+                output.append(f'{ip_name} {prefix}addr {operator} @GEOIP_{geoip_prefix}{def_suffix}_{hook_name}_{fw_name}_{rule_id}')
 
             if 'mac_address' in side_conf:
-                suffix = side_conf["mac_address"]
-                if suffix[0] == '!':
-                    suffix = f'!= {suffix[1:]}'
-                output.append(f'ether {prefix}addr {suffix}')
+                suffix = side_conf['mac_address']
+                operator = ''
+                exclude = suffix[0] == '!'
+                if exclude:
+                    operator = '!= '
+                    suffix = suffix[1:]
+                if mac_address_mask:
+                    operator = '!=' if exclude else '=='
+                    operator = f'& {mac_address_mask} {operator} '
+                output.append(f'ether {prefix}addr {operator}{suffix}')
 
             if 'port' in side_conf:
                 proto = rule_conf['protocol']
@@ -403,7 +440,7 @@ def parse_rule(rule_conf, hook, fw_name, rule_id, ip_name):
         output.append(f'ip{def_suffix} length != {{{negated_lengths_str}}}')
 
     if 'packet_type' in rule_conf:
-        output.append(f'pkttype ' + rule_conf['packet_type'])
+        output.append('pkttype ' + rule_conf['packet_type'])
 
     if 'dscp' in rule_conf:
         dscp_str = ','.join(rule_conf['dscp'])
@@ -542,6 +579,9 @@ def parse_rule(rule_conf, hook, fw_name, rule_id, ip_name):
                 if 'snapshot_length' in rule_conf['log_options']:
                     log_snaplen = rule_conf['log_options']['snapshot_length']
                     output.append(f'snaplen {log_snaplen}')
+
+    if 'last_used' in rule_conf:
+        output.append('last')
 
     output.append('counter')
 

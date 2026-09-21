@@ -30,16 +30,15 @@ class WiFiIf(Interface):
     }
     def _create(self):
         # all interfaces will be added in monitor mode
-        cmd = 'iw phy {physical_device} interface add {ifname} type monitor'
-        self._cmd(cmd.format(**self.config))
+        cmd = ['iw', 'phy', self.config['physical_device'], 'interface', 'add',
+               self.ifname, 'type', 'monitor']
+        self._cmdl(cmd)
 
         # wireless interface is administratively down by default
         self.set_admin_state('down')
 
     def _delete(self):
-        cmd = 'iw dev {ifname} del' \
-            .format(**self.config)
-        self._cmd(cmd)
+        self._cmdl(['iw', 'dev', self.ifname, 'del'])
 
     def update(self, config):
         """ General helper function which works on a dictionary retrieved by
@@ -47,7 +46,7 @@ class WiFiIf(Interface):
         interface setup code and provide a single point of entry when working
         on any interface. """
 
-        # We can not call add_to_bridge() until wpa_supplicant is running, thus
+        # We cannot call add_to_bridge() until wpa_supplicant is running, thus
         # we will remove the key from the config dict and react to this special
         # case in this derived class.
         # re-add ourselves to any bridge we might have fallen out of

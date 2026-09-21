@@ -19,7 +19,6 @@ import sys
 import typing
 
 from datetime import datetime
-from datetime import timezone
 from glob import glob
 from ipaddress import ip_address
 from tabulate import tabulate
@@ -64,6 +63,7 @@ sort_valid_inet = [
 sort_valid_inet6 = [
     'end',
     'duid',
+    'hostname',
     'ip',
     'last_communication',
     'pool',
@@ -71,7 +71,7 @@ sort_valid_inet6 = [
     'state',
     'type',
 ]
-mapping_sort_valid = ['mac', 'ip', 'pool', 'duid']
+mapping_sort_valid = ['mac', 'hostname', 'ip', 'pool', 'duid']
 
 stale_warn_msg = 'DHCP server is configured but not started. Data may be stale.'
 
@@ -92,9 +92,9 @@ def _get_raw_server_leases(
 
     if sorted:
         if sorted == 'ip':
-            mappings.sort(key=lambda x: ip_address(x['ip']))
+            mappings.sort(key=lambda x: ip_address(val) if (val := x.get('ip')) else '')
         else:
-            mappings.sort(key=lambda x: x[sorted])
+            mappings.sort(key=lambda x: x.get(sorted) or '')
     return mappings
 
 
@@ -105,12 +105,8 @@ def _get_formatted_server_leases(raw_data, family='inet'):
             ipaddr = lease.get('ip')
             hw_addr = lease.get('mac')
             state = lease.get('state')
-            start = datetime.fromtimestamp(lease.get('start'), timezone.utc)
-            end = (
-                datetime.fromtimestamp(lease.get('end'), timezone.utc)
-                if lease.get('end')
-                else '-'
-            )
+            start = datetime.fromtimestamp(lease.get('start'))
+            end = datetime.fromtimestamp(lease.get('end')) if lease.get('end') else '-'
             remain = lease.get('remaining')
             pool = lease.get('pool')
             hostname = lease.get('hostname')
@@ -136,14 +132,8 @@ def _get_formatted_server_leases(raw_data, family='inet'):
             ipaddr = lease.get('ip')
             hw_addr = lease.get('mac')
             state = lease.get('state')
-            start = datetime.fromtimestamp(
-                lease.get('last_communication'), timezone.utc
-            )
-            end = (
-                datetime.fromtimestamp(lease.get('end'), timezone.utc)
-                if lease.get('end')
-                else '-'
-            )
+            start = datetime.fromtimestamp(lease.get('last_communication'))
+            end = datetime.fromtimestamp(lease.get('end')) if lease.get('end') else '-'
             remain = lease.get('remaining')
             lease_type = lease.get('type')
             pool = lease.get('pool')
@@ -237,9 +227,9 @@ def _get_raw_server_static_mappings(config, family='inet', pool=None, sorted=Non
 
     if sorted:
         if sorted == 'ip':
-            mappings.sort(key=lambda x: ip_address(x['ip']))
+            mappings.sort(key=lambda x: ip_address(val) if (val := x.get('ip')) else '')
         else:
-            mappings.sort(key=lambda x: x[sorted])
+            mappings.sort(key=lambda x: x.get(sorted) or '')
     return mappings
 
 
@@ -250,10 +240,11 @@ def _get_formatted_server_static_mappings(raw_data):
         pool = entry.get('pool')
         subnet = entry.get('subnet')
         hostname = entry.get('hostname')
-        ip_addr = entry.get('ip', 'N/A')
-        mac_addr = entry.get('mac', 'N/A')
-        duid = entry.get('duid', 'N/A')
-        desc = entry.get('description', 'N/A')
+        # These fields may be either None or '', display 'N/A' in both cases
+        ip_addr = entry.get('ip') or 'N/A'
+        mac_addr = entry.get('mac') or 'N/A'
+        duid = entry.get('duid') or 'N/A'
+        desc = entry.get('description') or 'N/A'
         data_entries.append([pool, subnet, hostname, ip_addr, mac_addr, duid, desc])
 
     headers = [

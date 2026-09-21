@@ -18,6 +18,9 @@ import ipaddress
 from vyos.config import Config
 from vyos.configdict import get_interface_dict
 from vyos.configdict import is_node_changed
+from vyos.configdict import is_vrf_changed
+from vyos.configdep import set_dependents
+from vyos.configdep import call_dependents
 from vyos.configverify import verify_address
 from vyos.configverify import verify_bridge_delete
 from vyos.configverify import verify_source_interface
@@ -78,6 +81,10 @@ def get_config(config=None):
     if 'encapsulation' in tunnel and tunnel['encapsulation'] not in ['erspan', 'ip6erspan']:
         del tunnel['parameters']['erspan']
 
+    # Check vrf membership, to ensure firewall is updated
+    if is_vrf_changed(conf, ifname):
+        set_dependents('firewall', conf)
+
     return tunnel
 
 def verify(tunnel):
@@ -85,7 +92,7 @@ def verify(tunnel):
         verify_bridge_delete(tunnel)
 
         if 'nhrp' in tunnel and tunnel['ifname'] in tunnel['nhrp']:
-            raise ConfigError('Tunnel used for NHRP, it can not be deleted!')
+            raise ConfigError('Tunnel used for NHRP, it cannot be deleted!')
 
         return None
     if 'nhrp' in tunnel:
@@ -148,7 +155,7 @@ def verify(tunnel):
                 their_source_if = dict_search('source_interface', o_tunnel_conf)
                 our_remote = dict_search('remote', tunnel)
                 their_remote = dict_search('remote', o_tunnel_conf)
-                # If no IP GRE key is defined we can not have more then one GRE tunnel
+                # If no IP GRE key is defined we cannot have more then one GRE tunnel
                 # bound to any one interface/IP address and the same remote. This will
                 # result in a OS  PermissionError: add tunnel "gre0" failed: File exists
                 if our_remote == their_remote:
@@ -186,7 +193,7 @@ def verify(tunnel):
         if dict_search('parameters.ip.ttl', tunnel) != '0':
             raise ConfigError('Disabled PMTU requires TTL set to "0"!')
         if tunnel['encapsulation'] in ['ipip6', 'ip6ip6', 'ip6gre']:
-            raise ConfigError('Can not disable PMTU discovery for given encapsulation')
+            raise ConfigError('Cannot disable PMTU discovery for given encapsulation')
 
     if dict_search('parameters.ip.ignore_df', tunnel) != None:
         if tunnel['encapsulation'] not in ['gretap']:
@@ -201,7 +208,7 @@ def generate(tunnel):
 
 def apply(tunnel):
     interface = tunnel['ifname']
-    # If a gretap tunnel is already existing we can not "simply" change local or
+    # If a gretap tunnel is already existing we cannot "simply" change local or
     # remote addresses. This returns "Operation not supported" by the Kernel.
     # There is no other solution to destroy and recreate the tunnel.
     encap = ''
@@ -218,10 +225,15 @@ def apply(tunnel):
             tmp = Interface(interface)
             tmp.remove()
         if 'deleted' in tunnel:
+            # run the dependents and return
+            call_dependents()
             return None
 
     tun = TunnelIf(**tunnel)
     tun.update(tunnel)
+
+    # run the dependents
+    call_dependents()
 
     return None
 

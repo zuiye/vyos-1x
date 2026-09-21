@@ -92,27 +92,28 @@ class VXLANIf(Interface):
             remote_list = self.config['remote'][1:]
             self.config['remote'] = self.config['remote'][0]
 
-        cmd = 'ip link add {ifname} type vxlan dstport {port}'
+        cmd = ['ip', 'link', 'add', self.ifname, 'type', 'vxlan',
+               'dstport', str(self.config['port'])]
         for vyos_key, iproute2_key in mapping.items():
             # dict_search will return an empty dict "{}" for valueless nodes like
             # "parameters.nolearning" - thus we need to test the nodes existence
             # by using isinstance()
             tmp = dict_search(vyos_key, self.config)
             if isinstance(tmp, dict):
-                cmd += f' {iproute2_key}'
+                cmd += [iproute2_key]
             elif tmp != None:
-                cmd += f' {iproute2_key} {tmp}'
+                cmd += [iproute2_key, str(tmp)]
 
-        self._cmd(cmd.format(**self.config))
+        self._cmdl(cmd)
         # interface is always A/D down. It needs to be enabled explicitly
         self.set_admin_state('down')
 
         # VXLAN tunnel is always recreated on any change - see interfaces_vxlan.py
         if remote_list:
             for remote in remote_list:
-                cmd = f'bridge fdb append to 00:00:00:00:00:00 dst {remote} ' \
-                       'port {port} dev {ifname}'
-                self._cmd(cmd.format(**self.config))
+                cmd = ['bridge', 'fdb', 'append', 'to', '00:00:00:00:00:00',
+                       'dst', remote, 'port', str(self.config['port']), 'dev', self.ifname]
+                self._cmdl(cmd)
 
     def set_neigh_suppress(self, state):
         """
@@ -158,8 +159,8 @@ class VXLANIf(Interface):
                 if cur_vni_filter != None:
                     vni = vlan_config['vni']
                     if vni in cur_vni_filter:
-                        self._cmd(f'bridge vni delete dev {self.ifname} vni {vni}')
-                self._cmd(f'bridge vlan del dev {self.ifname} vid {vlan}')
+                        self._cmdl(['bridge', 'vni', 'delete', 'dev', self.ifname, 'vni', str(vni)])
+                self._cmdl(['bridge', 'vlan', 'del', 'dev', self.ifname, 'vid', str(vlan)])
 
         # Determine current OS Kernel vlan_tunnel setting - only adjust when needed
         tmp = get_interface_config(self.ifname)
@@ -181,13 +182,13 @@ class VXLANIf(Interface):
 
                 vni = vlan_config['vni']
                 # The following commands must be run one after another,
-                # they can not be combined with linux 6.1 and iproute2 6.1
-                self._cmd(f'bridge vlan add dev {self.ifname} vid {vlan}')
-                self._cmd(f'bridge vlan add dev {self.ifname} vid {vlan} tunnel_info id {vni}')
+                # they cannot be combined with linux 6.1 and iproute2 6.1
+                self._cmdl(['bridge', 'vlan', 'add', 'dev', self.ifname, 'vid', str(vlan)])
+                self._cmdl(['bridge', 'vlan', 'add', 'dev', self.ifname, 'vid', str(vlan), 'tunnel_info', 'id', str(vni)])
 
                 # If VNI filtering is enabled, install matching VNI filter
                 if dict_search('parameters.vni_filter', self.config) != None:
-                    self._cmd(f'bridge vni add dev {self.ifname} vni {vni}')
+                    self._cmdl(['bridge', 'vni', 'add', 'dev', self.ifname, 'vni', str(vni)])
 
     def update(self, config):
         """ General helper function which works on a dictionary retrieved by

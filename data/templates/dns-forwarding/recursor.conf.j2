@@ -20,6 +20,15 @@ max-cache-entries={{ cache_size }}
 # negative TTL for NXDOMAIN
 max-negative-ttl={{ negative_ttl }}
 
+# TTL refresh percentage
+refresh-on-ttl-perc={{ ttl_percent }}
+
+# nothing-below-nxdomain
+nothing-below-nxdomain={{ nothing_below_nxdomain }}
+
+# minimum-ttl-override
+minimum-ttl-override={{ minimum_ttl_override }}
+
 # timeout
 network-timeout={{ timeout }}
 
@@ -38,6 +47,11 @@ dnssec={{ dnssec }}
 {% if dns64_prefix is vyos_defined %}
 # dns64-prefix
 dns64-prefix={{ dns64_prefix }}
+{% endif %}
+
+{% if recursion_exclude_address is vyos_defined %}
+# dont-query
+dont-query+={{ recursion_exclude_address | join(',') }}
 {% endif %}
 
 {% if exclude_throttle_address is vyos_defined %}
@@ -70,4 +84,3 @@ ecs-ipv4-bits={{ options.ecs_ipv4_bits }}
 {% if options.edns_subnet_allow_list is vyos_defined %}
 edns-subnet-allow-list={{ options.edns_subnet_allow_list | join(',') }}
 {% endif %}
-

@@ -23,13 +23,13 @@ from base_vyostest_shim import VyOSUnitTestSHIM
 from vyos.configsession import ConfigSessionError
 from vyos.ifconfig import Section, Interface
 from vyos.qos import CAKE
-from vyos.utils.process import cmd
+from vyos.utils.process import cmdl
 
 base_path = ['qos']
 
 
 def get_tc_qdisc_json(interface, all=False) -> dict:
-    tmp = cmd(f'tc -detail -json qdisc show dev {interface}')
+    tmp = cmdl(['tc', '-detail', '-json', 'qdisc', 'show', 'dev', interface])
     tmp = loads(tmp)
 
     if all:
@@ -42,11 +42,11 @@ def get_tc_filter_json(interface, direction=None) -> list:
     if direction not in ['ingress', 'egress', None]:
         raise ValueError()
 
-    cmd_stmt = f'tc -detail -json filter show dev {interface}'
+    cmd_stmt = ['tc', '-detail', '-json', 'filter', 'show', 'dev', interface]
     if direction:
-        cmd_stmt += f' {direction}'
+        cmd_stmt += [direction]
 
-    tmp = cmd(cmd_stmt)
+    tmp = cmdl(cmd_stmt)
     tmp = loads(tmp)
     return tmp
 
@@ -56,11 +56,11 @@ def get_tc_filter_details(interface, direction=None) -> list:
     if direction not in ['ingress', 'egress', None]:
         raise ValueError()
 
-    cmd_stmt = f'tc -details filter show dev {interface}'
+    cmd_stmt = ['tc', '-details', 'filter', 'show', 'dev', interface]
     if direction:
-        cmd_stmt += f' {direction}'
+        cmd_stmt += [direction]
 
-    tmp = cmd(cmd_stmt)
+    tmp = cmdl(cmd_stmt)
     return tmp
 
 
@@ -356,9 +356,16 @@ class TestQoS(VyOSUnitTestSHIM.TestCase):
                         self.assertEqual(f'{dport:x}', filter['options']['match']['value'])
 
             tc_details = get_tc_filter_details(interface, 'ingress')
-            self.assertTrue('filter parent ffff: protocol all pref 20 u32 chain 0' in tc_details)
+            # the tc filter pref is a dense evaluation-order rank, not the CLI
+            # priority: class 1 (priority 15) is pref 1, class 2 (priority 20,
+            # the default) is pref 2 - ranked by priority, not equal to it (T9134)
+            self.assertTrue(
+                'filter parent ffff: protocol all pref 2 u32 chain 0' in tc_details
+            )
             self.assertTrue('rate 1Gbit burst 15Kb mtu 2Kb action drop overhead 0b linklayer ethernet' in tc_details)
-            self.assertTrue('filter parent ffff: protocol all pref 15 u32 chain 0' in tc_details)
+            self.assertTrue(
+                'filter parent ffff: protocol all pref 1 u32 chain 0' in tc_details
+            )
             self.assertTrue('rate 3Gbit burst 100Kb mtu 1600b action pipe/continue overhead 0b linklayer ethernet' in tc_details)
             self.assertTrue('rate 500Mbit burst 200Kb mtu 3000b action drop overhead 0b linklayer ethernet' in tc_details)
             self.assertTrue('filter parent ffff: protocol all pref 255 basic chain 0' in tc_details)
@@ -614,15 +621,23 @@ class TestQoS(VyOSUnitTestSHIM.TestCase):
 
         for interface in self._interfaces:
             shaper_name = f'qos-shaper-{interface}'
+            shaper_path = base_path + ['policy', 'shaper', shaper_name]
+            class_path = shaper_path + ['class', '23']
 
             self.cli_set(base_path + ['interface', interface, 'egress', shaper_name])
-            self.cli_set(base_path + ['policy', 'shaper', shaper_name, 'bandwidth', f'{bandwidth}mbit'])
-            self.cli_set(base_path + ['policy', 'shaper', shaper_name, 'default', 'bandwidth', f'{default_bandwidth}mbit'])
-            self.cli_set(base_path + ['policy', 'shaper', shaper_name, 'default', 'ceiling', f'{default_ceil}mbit'])
-            self.cli_set(base_path + ['policy', 'shaper', shaper_name, 'default', 'queue-type', 'fair-queue'])
-            self.cli_set(base_path + ['policy', 'shaper', shaper_name, 'class', '23', 'bandwidth', f'{class_bandwidth}mbit'])
-            self.cli_set(base_path + ['policy', 'shaper', shaper_name, 'class', '23', 'ceiling', f'{class_ceil}mbit'])
-            self.cli_set(base_path + ['policy', 'shaper', shaper_name, 'class', '23', 'match', '10', 'ip', 'destination', 'address', dst_address])
+            self.cli_set(shaper_path + ['bandwidth', f'{bandwidth}mbit'])
+            self.cli_set(
+                shaper_path + ['default', 'bandwidth', f'{default_bandwidth}mbit']
+            )
+            self.cli_set(shaper_path + ['default', 'ceiling', f'{default_ceil}mbit'])
+            self.cli_set(shaper_path + ['default', 'queue-type', 'fair-queue'])
+            self.cli_set(shaper_path + ['default', 'set-dscp', 'AF11'])
+            self.cli_set(class_path + ['bandwidth', f'{class_bandwidth}mbit'])
+            self.cli_set(class_path + ['ceiling', f'{class_ceil}mbit'])
+            self.cli_set(
+                class_path
+                + ['match', '10', 'ip', 'destination', 'address', dst_address]
+            )
 
             bandwidth += 1
             default_bandwidth += 1
@@ -646,10 +661,20 @@ class TestQoS(VyOSUnitTestSHIM.TestCase):
                 f'prio 7 rate {default_bandwidth}Mbit ceil {default_ceil}Mbit'
             )
 
-            output = cmd(f'tc class show dev {interface}')
+            output = cmdl(['tc', 'class', 'show', 'dev', interface])
 
             for config_entry in config_entries:
                 self.assertIn(config_entry, output)
+
+            # set-dscp on default class: catch-all filters with pedit
+            # AF11 = DSCP 10 << 2 = 0x28
+            filter_output = get_tc_filter_details(interface)
+            self.assertIn('pedit', filter_output)
+            self.assertIn('protocol ip pref 255', filter_output)
+            self.assertIn('at ipv4+0: val 00280000', filter_output)
+            self.assertIn('csum (iph)', filter_output)
+            self.assertIn('protocol ipv6 pref 256', filter_output)
+            self.assertIn('at ipv6+0: val 02800000', filter_output)
 
             bandwidth += 1
             default_bandwidth += 1
@@ -680,7 +705,7 @@ class TestQoS(VyOSUnitTestSHIM.TestCase):
         self.cli_commit()
 
         # check root htb config
-        output = cmd(f'tc class show dev {interface}')
+        output = cmdl(['tc', 'class', 'show', 'dev', interface])
 
         config_entries = (
             f'prio 0 rate {class_bandwidth}Mbit ceil 50Mbit burst 15Kb',  # specified class
@@ -689,7 +714,7 @@ class TestQoS(VyOSUnitTestSHIM.TestCase):
         for config_entry in config_entries:
             self.assertIn(config_entry, output)
 
-        output = cmd(f'tc -d qdisc show dev {interface}')
+        output = cmdl(['tc', '-d', 'qdisc', 'show', 'dev', interface])
         config_entries = (
             'qdisc red',  # use random detect
             'limit 72Kb min 9Kb max 18Kb ewma 3 probability 0.1',  # default config for random detect
@@ -711,7 +736,7 @@ class TestQoS(VyOSUnitTestSHIM.TestCase):
 
         self.cli_commit()
 
-        output = cmd(f'tc -d qdisc show dev {interface}')
+        output = cmdl(['tc', '-d', 'qdisc', 'show', 'dev', interface])
         config_entries = (
             'qdisc red',  # use random detect
             'limit 1Mb min 16Kb max 32Kb ewma 3 probability 0.1',  # default config for random detect
@@ -744,7 +769,7 @@ class TestQoS(VyOSUnitTestSHIM.TestCase):
         # commit changes
         self.cli_commit()
         # check root htb config
-        output = cmd(f'tc class show dev {interface}')
+        output = cmdl(['tc', 'class', 'show', 'dev', interface])
 
         config_entries = (
             f'prio 5 rate {class_bandwidth}Mbit ceil {class_ceiling}Mbit burst 15Kb',  # specified class
@@ -753,11 +778,11 @@ class TestQoS(VyOSUnitTestSHIM.TestCase):
         for config_entry in config_entries:
             self.assertIn(config_entry, output)
 
-        self.assertTrue('' != cmd(f'tc filter show dev {interface}'))
+        self.assertTrue('' != cmdl(['tc', 'filter', 'show', 'dev', interface]))
         # self.cli_delete(base_path + ['policy', 'shaper', shaper_name, 'class', '30', 'match', 'ADDRESS30'])
         self.cli_delete(base_path + ['policy', 'shaper', shaper_name, 'class', '30', 'match', 'ADDRESS30', 'ip', 'source', 'address', src_address])
         self.cli_commit()
-        self.assertEqual('', cmd(f'tc filter show dev {interface}'))
+        self.assertEqual('', cmdl(['tc', 'filter', 'show', 'dev', interface]))
 
     def test_14_policy_limiter_marked_traffic(self):
         policy_name = 'smoke_test'
@@ -772,9 +797,10 @@ class TestQoS(VyOSUnitTestSHIM.TestCase):
         self.cli_set(base_policy_path + ['default', 'burst', '125000000b'])
         self.cli_commit()
 
-        tc_filters = cmd(f'tc filter show dev {self._interfaces[0]} ingress')
-        # class 100
-        self.assertIn('filter parent ffff: protocol all pref 20 fw chain 0', tc_filters)
+        tc_filters = cmdl(['tc', 'filter', 'show', 'dev', self._interfaces[0], 'ingress'])
+        # class 100 has priority 20, but the tc filter pref is a dense
+        # evaluation-order rank (1 here), not the CLI priority value (T9134)
+        self.assertIn('filter parent ffff: protocol all pref 1 fw chain 0', tc_filters)
         self.assertIn('action order 1:  police 0x1 rate 20Gbit burst 3760Kb mtu 2Kb action drop overhead 0b', tc_filters)
         # default
         self.assertIn('filter parent ffff: protocol all pref 255 basic chain 0', tc_filters)
@@ -803,7 +829,7 @@ class TestQoS(VyOSUnitTestSHIM.TestCase):
         self.cli_set(base_policy_path + ['default', 'queue-type', 'fair-queue'])
         self.cli_commit()
 
-        tc_filters_old = cmd(f'tc -details filter show dev {interface}')
+        tc_filters_old = cmdl(['tc', '-details', 'filter', 'show', 'dev', interface])
         self.assertIn('match 00280000/00ff0000', tc_filters_old)
         self.assertIn('match 00880000/00ff0000', tc_filters_old)
         self.assertIn('match 00980000/00ff0000', tc_filters_old)
@@ -814,7 +840,7 @@ class TestQoS(VyOSUnitTestSHIM.TestCase):
         self.cli_delete(base_policy_path)
         self.cli_delete(['qos', 'interface', interface, 'egress', 'VyOS-HTB'])
         self.cli_commit()
-        self.assertEqual('', cmd(f'tc -s filter show dev {interface}'))
+        self.assertEqual('', cmdl(['tc', '-s', 'filter', 'show', 'dev', interface]))
 
         self.cli_set(['qos', 'interface', interface, 'egress', 'VyOS-HTB'])
         # prepare traffic match group
@@ -845,13 +871,13 @@ class TestQoS(VyOSUnitTestSHIM.TestCase):
         self.cli_set(base_policy_path + ['default', 'queue-type', 'fair-queue'])
         self.cli_commit()
 
-        self.assertEqual(tc_filters_old, cmd(f'tc -details filter show dev {interface}'))
+        self.assertEqual(tc_filters_old, cmdl(['tc', '-details', 'filter', 'show', 'dev', interface]))
 
     def test_16_wrong_traffic_match_group(self):
         interface = self._interfaces[0]
         self.cli_set(['qos', 'interface', interface])
 
-        # Can not use both IPv6 and IPv4 in one match
+        # Cannot use both IPv6 and IPv4 in one match
         self.cli_set(['qos', 'traffic-match-group', '1', 'match', 'one', 'ip', 'dscp', 'EF'])
         self.cli_set(['qos', 'traffic-match-group', '1', 'match', 'one', 'ipv6', 'dscp', 'EF'])
         with self.assertRaises(ConfigSessionError) as e:
@@ -1138,7 +1164,7 @@ class TestQoS(VyOSUnitTestSHIM.TestCase):
         self.cli_commit()
 
         # use raw because tc json is incorrect here
-        tmp = cmd(f'tc -details qdisc show dev {interface}')
+        tmp = cmdl(['tc', '-details', 'qdisc', 'show', 'dev', interface])
         for rec in tmp.split('\n'):
             rec = rec.strip()
             if 'root' in rec:
@@ -1149,7 +1175,7 @@ class TestQoS(VyOSUnitTestSHIM.TestCase):
                     r'qdisc sfq \S+: parent 1:2 limit 127p quantum 1514b depth 127 flows 128 divisor 1024 perturb 10sec',
                 )
         # use raw because tc json is incorrect here
-        tmp = cmd(f'tc -details class show dev {interface}')
+        tmp = cmdl(['tc', '-details', 'class', 'show', 'dev', interface])
         for rec in tmp.split('\n'):
             rec = rec.strip().lower()
             if 'root' in rec:
@@ -1172,7 +1198,7 @@ class TestQoS(VyOSUnitTestSHIM.TestCase):
             )
         self.cli_commit()
 
-        tmp = cmd(f'tc -details class show dev {interface}')
+        tmp = cmdl(['tc', '-details', 'class', 'show', 'dev', interface])
         for rec in tmp.split('\n'):
             rec = rec.strip().lower()
             if 'hfsc 1:2' in rec:
@@ -1200,10 +1226,10 @@ class TestQoS(VyOSUnitTestSHIM.TestCase):
         )
         self.cli_commit()
 
-        tmp = cmd(f'tc -details qdisc show dev {interface}')
+        tmp = cmdl(['tc', '-details', 'qdisc', 'show', 'dev', interface])
         self.assertEqual(4, len(tmp.split('\n')))
 
-        tmp = cmd(f'tc -details class show dev {interface}')
+        tmp = cmdl(['tc', '-details', 'class', 'show', 'dev', interface])
         tmp = tmp.lower()
 
         self.assertTrue(
@@ -1248,10 +1274,13 @@ class TestQoS(VyOSUnitTestSHIM.TestCase):
         self.cli_commit()
 
         iif = Interface(self._interfaces[0]).get_ifindex()
-        tc_filters = cmd(f'tc filter show dev {self._interfaces[0]} ingress')
+        tc_filters = cmdl(['tc', 'filter', 'show', 'dev', self._interfaces[0], 'ingress'])
 
-        # class 100
-        self.assertIn('filter parent ffff: protocol all pref 20 basic chain 0', tc_filters)
+        # class 100 has priority 20, but the tc filter pref is a dense
+        # evaluation-order rank (1 here), not the CLI priority value (T9134)
+        self.assertIn(
+            'filter parent ffff: protocol all pref 1 basic chain 0', tc_filters
+        )
         self.assertIn(f'meta(rt_iif eq {iif})', tc_filters)
         self.assertIn('action order 1:  police 0x1 rate 20Gbit burst 3760Kb mtu 2Kb action drop overhead 0b', tc_filters)
         # default
@@ -1288,7 +1317,7 @@ class TestQoS(VyOSUnitTestSHIM.TestCase):
             f'prio 7 rate {default_bandwidth}Mbit ceil {default_ceil}Mbit'
         )
 
-        output = cmd(f'tc class show dev {interface}')
+        output = cmdl(['tc', 'class', 'show', 'dev', interface])
 
         for config_entry in config_entries:
             self.assertIn(config_entry, output)
@@ -1323,6 +1352,235 @@ class TestQoS(VyOSUnitTestSHIM.TestCase):
             else:
                 self.assertIn(f'filter parent 1: protocol {proto} pref',
                               get_tc_filter_details(interface))
+
+    def test_25_policy_shaper_mixed_ether_protocol(self):
+        # T9134: a tc filter priority is bound to a single protocol, so two
+        # classes matching on different protocols (here the default "all" and
+        # an explicit "arp") must not share a filter priority - otherwise tc
+        # rejects the second filter and the commit crashes.
+        interface = self._interfaces[0]
+        shaper_name = f'qos-shaper-{interface}'
+        shaper_path = base_path + ['policy', 'shaper', shaper_name]
+        cls10 = shaper_path + ['class', '10']
+        cls20 = shaper_path + ['class', '20']
+
+        self.cli_set(base_path + ['interface', interface, 'egress', shaper_name])
+        self.cli_set(shaper_path + ['bandwidth', '100mbit'])
+        self.cli_set(shaper_path + ['default', 'bandwidth', '50mbit'])
+        self.cli_set(cls10 + ['bandwidth', '50mbit'])
+        self.cli_set(
+            cls10 + ['match', 'RULE-1', 'ip', 'source', 'address', '10.10.0.0/24']
+        )
+        self.cli_set(cls20 + ['bandwidth', '10mbit'])
+        self.cli_set(cls20 + ['match', 'RULE-2', 'ether', 'protocol', 'arp'])
+
+        # commit changes
+        self.cli_commit()
+
+        filters = get_tc_filter_details(interface)
+        # the "all" protocol filter (class 10) and the "arp" protocol filter
+        # (class 20) must both be installed with distinct priorities
+        self.assertIn('filter parent 1: protocol all pref 1 u32', filters)
+        self.assertIn('filter parent 1: protocol arp pref 2 u32', filters)
+
+        # The class "priority" is not reused verbatim as the tc filter priority
+        # (it is not unique): both classes share priority "3" and match
+        # different protocols, yet each still gets a distinct tc filter priority
+        # and the commit succeeds. The class "priority" still drives the HTB
+        # class scheduling priority.
+        self.cli_set(cls10 + ['priority', '3'])
+        self.cli_set(cls20 + ['priority', '3'])
+        self.cli_commit()
+
+        filters = get_tc_filter_details(interface)
+        self.assertIn('filter parent 1: protocol all pref 1 u32', filters)
+        self.assertIn('filter parent 1: protocol arp pref 2 u32', filters)
+        # the class priority is applied to the HTB class scheduling prio
+        self.assertIn('prio 3', cmdl(['tc', 'class', 'show', 'dev', interface]))
+
+    def test_26_policy_shaper_match_order(self):
+        # T9134: giving every match a unique tc filter priority must not change
+        # match evaluation order - neither the default order nor the order set
+        # by the class "priority".
+        interface = self._interfaces[0]
+        shaper_name = f'qos-shaper-{interface}'
+        shaper_path = base_path + ['policy', 'shaper', shaper_name]
+        cls10 = shaper_path + ['class', '10']
+        cls20 = shaper_path + ['class', '20']
+
+        self.cli_set(base_path + ['interface', interface, 'egress', shaper_name])
+        self.cli_set(shaper_path + ['bandwidth', '100mbit'])
+        self.cli_set(shaper_path + ['default', 'bandwidth', '40mbit'])
+        self.cli_set(cls10 + ['bandwidth', '20mbit'])
+        self.cli_set(
+            cls10 + ['match', 'A', 'ip', 'destination', 'address', '10.99.9.0/24']
+        )
+        self.cli_set(
+            cls10 + ['match', 'B', 'ip', 'destination', 'address', '10.99.1.0/24']
+        )
+        self.cli_set(cls20 + ['bandwidth', '20mbit'])
+        self.cli_set(
+            cls20 + ['match', 'C', 'ip', 'destination', 'address', '10.99.1.5/32']
+        )
+        self.cli_commit()
+
+        # Default order follows the per-class match index: A (0a630900) and C
+        # (0a630105) are each the first match in their class, B (0a630100) is
+        # second - so evaluation order is A, C, B. The specific /32 (C) must
+        # precede the overlapping broad /24 (B), and A precedes C.
+        filters = get_tc_filter_details(interface)
+        self.assertLess(filters.index('0a630900'), filters.index('0a630105'))
+        self.assertLess(filters.index('0a630105'), filters.index('0a630100'))
+
+        # The class "priority" reorders evaluation: class 20 (C) gets the
+        # lowest priority number, so C now precedes A as well - which only
+        # happens if the priority is honoured (by default A came first).
+        self.cli_set(cls10 + ['priority', '5'])
+        self.cli_set(cls20 + ['priority', '1'])
+        self.cli_commit()
+
+        filters = get_tc_filter_details(interface)
+        self.assertLess(filters.index('0a630105'), filters.index('0a630900'))
+        self.assertLess(filters.index('0a630105'), filters.index('0a630100'))
+
+    def test_27_policy_limiter_mixed_protocol(self):
+        # T9134: limiter classes default to priority 20, so two classes
+        # matching different protocols (here "arp" and the implicit "all")
+        # would share a tc filter priority and tc would reject the second
+        # filter. Each match must instead get a unique tc filter priority.
+        interface = self._interfaces[0]
+        policy_name = 'smoke_test'
+        limiter_path = ['qos', 'policy', 'limiter', policy_name]
+        cls10 = limiter_path + ['class', '10']
+        cls20 = limiter_path + ['class', '20']
+
+        self.cli_set(['qos', 'interface', interface, 'ingress', policy_name])
+        self.cli_set(limiter_path + ['default', 'bandwidth', '500mbit'])
+        self.cli_set(cls10 + ['bandwidth', '100mbit'])
+        self.cli_set(cls10 + ['match', 'R1', 'ether', 'protocol', 'arp'])
+        self.cli_set(cls20 + ['bandwidth', '50mbit'])
+        self.cli_set(cls20 + ['match', 'R2', 'ip', 'source', 'address', '10.0.0.0/8'])
+
+        # used to crash: both classes default to priority 20 with different
+        # protocols
+        self.cli_commit()
+
+        filters = get_tc_filter_details(interface, 'ingress')
+        self.assertIn('filter parent ffff: protocol arp pref 1 u32', filters)
+        self.assertIn('filter parent ffff: protocol all pref 2 u32', filters)
+
+    def test_28_policy_shaper_match_order_declaration(self):
+        # T9134: without an explicit "priority" the filter order falls back to
+        # the per-class match index, i.e. declaration order - it is not aware of
+        # match specificity. Here the broad /24 is the FIRST match of class 10
+        # and the specific /32 is the SECOND match of class 20, so by default
+        # the broad match is evaluated first; an explicit "priority" is required
+        # to make the specific match win.
+        interface = self._interfaces[0]
+        shaper_name = f'qos-shaper-{interface}'
+        shaper_path = base_path + ['policy', 'shaper', shaper_name]
+        cls10 = shaper_path + ['class', '10']
+        cls20 = shaper_path + ['class', '20']
+
+        self.cli_set(base_path + ['interface', interface, 'egress', shaper_name])
+        self.cli_set(shaper_path + ['bandwidth', '100mbit'])
+        self.cli_set(shaper_path + ['default', 'bandwidth', '40mbit'])
+        self.cli_set(cls10 + ['bandwidth', '20mbit'])
+        # broad /24 (0a630100) is the first match of class 10
+        self.cli_set(
+            cls10 + ['match', 'BROAD', 'ip', 'destination', 'address', '10.99.1.0/24']
+        )
+        self.cli_set(cls20 + ['bandwidth', '20mbit'])
+        # specific /32 (0a630105) is the second match of class 20
+        self.cli_set(
+            cls20 + ['match', 'OTHER', 'ip', 'destination', 'address', '10.99.9.0/24']
+        )
+        self.cli_set(
+            cls20 + ['match', 'SPEC', 'ip', 'destination', 'address', '10.99.1.5/32']
+        )
+        self.cli_commit()
+
+        # default fallback is index-major: the broad /24 (index 1) precedes the
+        # specific /32 (index 2), regardless of specificity
+        filters = get_tc_filter_details(interface)
+        self.assertLess(filters.index('0a630100'), filters.index('0a630105'))
+
+        # an explicit priority on the specific match's class overrides the
+        # declaration-order fallback, so the specific /32 is evaluated first
+        self.cli_set(cls10 + ['priority', '5'])
+        self.cli_set(cls20 + ['priority', '1'])
+        self.cli_commit()
+
+        filters = get_tc_filter_details(interface)
+        self.assertLess(filters.index('0a630105'), filters.index('0a630100'))
+
+
+    def test_25_shaper_set_dscp(self):
+        interface = self._interfaces[0]
+        shaper_name = f'qos-shaper-{interface}'
+        shaper_path = base_path + ['policy', 'shaper', shaper_name]
+        class_path = shaper_path + ['class', '10']
+
+        self.cli_set(base_path + ['interface', interface, 'egress', shaper_name])
+        self.cli_set(shaper_path + ['bandwidth', '100mbit'])
+        self.cli_set(shaper_path + ['default', 'bandwidth', '10mbit'])
+        self.cli_set(class_path + ['bandwidth', '50mbit'])
+        self.cli_set(class_path + ['set-dscp', 'CS4'])
+
+        # IPv4 match: pedit should target ipv4+0
+        self.cli_set(
+            class_path + ['match', 'RULE', 'ip', 'source', 'address', '172.17.1.2/32']
+        )
+        self.cli_commit()
+
+        # CS4 = DSCP 32 << 2 = 0x80
+        filter_output = get_tc_filter_details(interface)
+        self.assertIn('action order 1:  pedit', filter_output)
+        self.assertIn('at ipv4+0: val 00800000', filter_output)
+        self.assertIn('csum (iph)', filter_output)
+        self.assertNotIn('at ipv6+0', filter_output)
+
+        # IPv6 match: pedit should target ipv6+0
+        self.cli_delete(class_path + ['match', 'RULE'])
+        self.cli_set(
+            class_path + ['match', 'RULE', 'ipv6', 'source', 'address', '2001:db8::/32']
+        )
+        self.cli_set(class_path + ['set-dscp', 'AF21'])
+        self.cli_commit()
+
+        # AF21 = DSCP 18 << 2 = 0x48
+        filter_output = get_tc_filter_details(interface)
+        self.assertIn('action order 1:  pedit', filter_output)
+        self.assertIn('at ipv6+0: val 04800000', filter_output)
+        self.assertNotIn('at ipv4+0', filter_output)
+
+        # Ether match with protocol all: pedit is skipped to avoid
+        # corrupting non-IP packets
+        self.cli_delete(class_path + ['match', 'RULE'])
+        self.cli_set(class_path + ['match', 'RULE', 'ether', 'protocol', 'all'])
+        self.cli_set(class_path + ['set-dscp', '46'])
+        self.cli_commit()
+
+        filter_output = get_tc_filter_details(interface)
+        self.assertNotIn('pedit', filter_output)
+
+        # Ether match with protocol ip: pedit targets ipv4+0 only
+        self.cli_set(class_path + ['match', 'RULE', 'ether', 'protocol', 'ip'])
+        self.cli_commit()
+
+        # numeric 46 << 2 = 0xb8
+        filter_output = get_tc_filter_details(interface)
+        self.assertIn('action order 1:  pedit', filter_output)
+        self.assertIn('at ipv4+0: val 00b80000', filter_output)
+        self.assertIn('csum (iph)', filter_output)
+        self.assertNotIn('at ipv6+0', filter_output)
+
+        # Removing set-dscp: no pedit should remain
+        self.cli_delete(class_path + ['set-dscp'])
+        self.cli_commit()
+
+        filter_output = get_tc_filter_details(interface)
+        self.assertNotIn('pedit', filter_output)
 
 
 if __name__ == '__main__':

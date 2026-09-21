@@ -24,18 +24,17 @@ from ipaddress import ip_interface
 
 from vyos.configsession import ConfigSessionError
 from vyos.utils.network import get_interface_vrf
-from vyos.utils.process import cmd
+from vyos.utils.process import cmdl
 from vyos.utils.process import process_named_running
 
 base_path = ['container']
 PROCESS_NAME = 'conmon'
-PROCESS_PIDFILE = '/run/vyos-container-{0}.service.pid'
 
 busybox_image = 'busybox:stable'
 busybox_image_path = '/usr/share/vyos/busybox-stable.tar'
 
 def cmd_to_json(command):
-    c = cmd(command + ' --format=json')
+    c = cmdl(['podman'] + command + ['--format=json'], sudo=True)
     data = json.loads(c)[0]
     return data
 
@@ -47,7 +46,7 @@ class TestContainer(VyOSUnitTestSHIM.TestCase):
         # Load image for smoketest provided in vyos-1x-smoketest
         if not os.path.exists(busybox_image_path):
             cls.fail(cls, f'{busybox_image} image not available')
-        cmd(f'sudo podman load -i {busybox_image_path}')
+        cmdl(['podman', 'load', '-i', busybox_image_path], sudo=True)
 
         # ensure we can also run this test on a live system - so lets clean
         # out the current configuration :)
@@ -58,7 +57,7 @@ class TestContainer(VyOSUnitTestSHIM.TestCase):
     def tearDownClass(cls):
         super(TestContainer, cls).tearDownClass()
         # Cleanup podman image
-        cmd(f'sudo podman image rm -f {busybox_image}')
+        cmdl(['podman', 'image', 'rm', '-f', busybox_image], sudo=True)
 
     def tearDown(self):
         self.cli_delete(base_path)
@@ -68,59 +67,64 @@ class TestContainer(VyOSUnitTestSHIM.TestCase):
         self.assertIsNone(process_named_running(PROCESS_NAME))
 
         # Ensure systemd units are removed
-        units = glob.glob('/run/systemd/system/vyos-container-*')
+        units = glob.glob('/run/containers/systemd/vyos*')
         self.assertEqual(units, [])
         # always forward to base class
         super().tearDown()
 
+    def is_running(self, name):
+        command = ['systemctl', 'show', f'vyos-container-{name}', '--property=ActiveState', '--value']
+        return cmdl(command).strip() == 'active'
+
     def test_basic(self):
         cont_name = 'c1'
+        env_key = 'TestKey'
+        env_key1 = 'TestKey1'
+        env_value = 'TestValue,*'
+        env_value1 = 'Test Spaced Values'
 
         self.cli_set(['interfaces', 'ethernet', 'eth0', 'address', '10.0.2.15/24'])
-        self.cli_set(
-            ['protocols', 'static', 'route', '0.0.0.0/0', 'next-hop', '10.0.2.2']
-        )
+        self.cli_set(['protocols', 'static', 'route', '0.0.0.0/0',
+                      'next-hop', '10.0.2.2', 'distance', '230'])
         self.cli_set(['system', 'name-server', '1.1.1.1'])
         self.cli_set(['system', 'name-server', '8.8.8.8'])
 
         self.cli_set(base_path + ['name', cont_name, 'image', busybox_image])
         self.cli_set(base_path + ['name', cont_name, 'allow-host-networks'])
-        self.cli_set(
-            base_path
-            + [
-                'name',
-                cont_name,
-                'sysctl',
-                'parameter',
-                'kernel.msgmax',
-                'value',
-                '4096',
-            ]
-        )
+        self.cli_set(base_path + ['name', cont_name, 'sysctl', 'parameter',
+                                  'kernel.msgmax', 'value', '4096'])
         self.cli_set(base_path + ['name', cont_name, 'log-driver', 'journald'])
+        self.cli_set(base_path + ['name', cont_name, 'allow-host-cgroups'])
+        self.cli_set(base_path + ['name', cont_name, 'stop-timeout', '1'])
+        self.cli_set(base_path + ['name', cont_name, 'environment', env_key, 'value', env_value])
+        self.cli_set(base_path + ['name', cont_name, 'environment', env_key1, 'value', env_value1])
         # commit changes
         self.cli_commit()
 
-        pid = 0
-        with open(PROCESS_PIDFILE.format(cont_name), 'r') as f:
-            pid = int(f.read())
-
-        # Check for running process
-        self.assertEqual(process_named_running(PROCESS_NAME), pid)
+        self.assertTrue(self.is_running(cont_name))
 
         # verify
-        tmp = cmd(f'sudo podman exec -it {cont_name} sysctl kernel.msgmax')
+        tmp = cmdl(['podman', 'exec', '-it', cont_name, 'sysctl', 'kernel.msgmax'], sudo=True)
         self.assertEqual(tmp, 'kernel.msgmax = 4096')
 
-        l = cmd_to_json(f'sudo podman container inspect {cont_name}')
+        l = cmd_to_json(['container', 'inspect', cont_name])
         self.assertEqual(l['HostConfig']['LogConfig']['Type'], 'journald')
         self.assertEqual(l['Config']['Healthcheck']['Test'], ['NONE'])
+        self.assertEqual(l['HostConfig']['CgroupMode'], 'host')
+        self.assertIn(f'{env_key}={env_value}', l['Config']['Env'])
+        self.assertIn(f'{env_key1}={env_value1}', l['Config']['Env'])
+
+        # cleanup
+        self.cli_delete(['interfaces', 'ethernet', 'eth0', 'address'])
+        self.cli_delete(['protocols', 'static'])
+        self.cli_delete(['system', 'name-server'])
 
     def test_healthcheck(self):
         cont_name = 'health-test'
 
         self.cli_set(base_path + ['name', cont_name, 'allow-host-networks'])
         self.cli_set(base_path + ['name', cont_name, 'image', busybox_image])
+        self.cli_set(base_path + ['name', cont_name, 'stop-timeout', '1'])
 
         self.cli_set(base_path + ['name', cont_name, 'health-check', 'command', 'true'])
         self.cli_set(base_path + ['name', cont_name, 'health-check', 'interval', '10'])
@@ -128,7 +132,7 @@ class TestContainer(VyOSUnitTestSHIM.TestCase):
         self.cli_set(base_path + ['name', cont_name, 'health-check', 'retry', '2'])
         self.cli_commit()
 
-        l = cmd_to_json(f'sudo podman container inspect {cont_name}')
+        l = cmd_to_json(['container', 'inspect', cont_name])
         self.assertEqual(l['HostConfig']['LogConfig']['Type'], 'journald')
         self.assertEqual(l['Config']['Healthcheck']['Test'], ['CMD-SHELL', 'true'])
         self.assertEqual(l['Config']['Healthcheck']['Interval'], 10000000000)
@@ -144,6 +148,7 @@ class TestContainer(VyOSUnitTestSHIM.TestCase):
         self.cli_set(base_path + ['network', net_name, 'prefix', prefix])
 
         self.cli_set(base_path + ['name', cont_name, 'image', busybox_image])
+        self.cli_set(base_path + ['name', cont_name, 'stop-timeout', '1'])
         for name_server in name_servers:
             self.cli_set(base_path + ['name', cont_name, 'name-server', name_server])
         self.cli_set(
@@ -165,10 +170,10 @@ class TestContainer(VyOSUnitTestSHIM.TestCase):
         self.cli_set(base_path + ['network', net_name, 'no-name-server'])
         self.cli_commit()
 
-        n = cmd_to_json(f'sudo podman inspect {cont_name}')
+        n = cmd_to_json(['inspect', cont_name])
         self.assertEqual(n['HostConfig']['Dns'], name_servers)
 
-        tmp = cmd(f'sudo podman exec -it {cont_name} cat /etc/resolv.conf')
+        tmp = cmdl(['podman', 'exec', '-it', cont_name, 'cat', '/etc/resolv.conf'], sudo=True)
         self.assertIn(name_server, tmp)
 
     def test_cpu_limit(self):
@@ -177,15 +182,11 @@ class TestContainer(VyOSUnitTestSHIM.TestCase):
         self.cli_set(base_path + ['name', cont_name, 'allow-host-networks'])
         self.cli_set(base_path + ['name', cont_name, 'image', busybox_image])
         self.cli_set(base_path + ['name', cont_name, 'cpu-quota', '1.25'])
+        self.cli_set(base_path + ['name', cont_name, 'stop-timeout', '1'])
 
         self.cli_commit()
 
-        pid = 0
-        with open(PROCESS_PIDFILE.format(cont_name), 'r') as f:
-            pid = int(f.read())
-
-        # Check for running process
-        self.assertEqual(process_named_running(PROCESS_NAME), pid)
+        self.assertTrue(self.is_running(cont_name))
 
     def test_network_types(self):
         self.cli_set(['interfaces', 'ethernet', 'eth0', 'vif', '100'])
@@ -212,38 +213,46 @@ class TestContainer(VyOSUnitTestSHIM.TestCase):
 
         self.cli_commit()
 
-        n = cmd_to_json(f'sudo podman network inspect macvlan1')
+        # Force-start the network quadlets, as not mapped to containers
+        for network in ['macvlan1', 'macvlan2', 'macvlan3', 'bridge1', 'bridge2']:
+            systemd_unit = f'vyos-{network}-network.service'
+            cmdl(['systemctl', 'start', systemd_unit], sudo=True)
+
+        n = cmd_to_json(['network', 'inspect', 'macvlan1'])
         self.assertEqual(n['driver'], 'macvlan')
         self.assertEqual(n['network_interface'], 'eth0')
         self.assertEqual(n['options']['mode'], 'bridge')
         self.assertEqual(n['subnets'][0]['subnet'], '10.0.0.0/24')
         self.assertEqual(n['subnets'][0]['gateway'], '10.0.0.1')
 
-        n = cmd_to_json(f'sudo podman network inspect macvlan2')
+        n = cmd_to_json(['network', 'inspect', 'macvlan2'])
         self.assertEqual(n['driver'], 'macvlan')
         self.assertEqual(n['network_interface'], 'eth0.100')
         self.assertEqual(n['options']['mode'], 'private')
         self.assertEqual(n['subnets'][0]['subnet'], '10.0.100.0/24')
         self.assertEqual(n['subnets'][0]['gateway'], '10.0.100.5')
 
-        n = cmd_to_json(f'sudo podman network inspect macvlan3')
+        n = cmd_to_json(['network', 'inspect', 'macvlan3'])
         self.assertEqual(n['driver'], 'macvlan')
         self.assertEqual(n['network_interface'], 'eth0.101')
         self.assertEqual(n['options']['mode'], 'vepa')
         self.assertEqual(n['subnets'][0]['subnet'], '2001::/64')
         self.assertEqual(n['subnets'][0]['gateway'], '2001::1')
 
-        n = cmd_to_json(f'sudo podman network inspect bridge1')
+        n = cmd_to_json(['network', 'inspect', 'bridge1'])
         self.assertEqual(n['driver'], 'bridge')
         self.assertEqual(n['network_interface'], 'pod-bridge1')
         self.assertEqual(n['subnets'][0]['subnet'], '10.0.1.0/24')
         self.assertEqual(n['subnets'][0]['gateway'], '10.0.1.1')
 
-        n = cmd_to_json(f'sudo podman network inspect bridge2')
+        n = cmd_to_json(['network', 'inspect', 'bridge2'])
         self.assertEqual(n['driver'], 'bridge')
         self.assertEqual(n['network_interface'], 'pod-bridge2')
         self.assertEqual(n['subnets'][0]['subnet'], '10.0.2.0/24')
         self.assertEqual(n['subnets'][0]['gateway'], '10.0.2.1')
+
+        # Cleanup
+        self.cli_delete(['interfaces', 'ethernet', 'eth0', 'vif'])
 
     def test_user_defined_mac(self):
         # Bridge Network
@@ -253,16 +262,71 @@ class TestContainer(VyOSUnitTestSHIM.TestCase):
         self.cli_set(base_path + ['name', "test1", 'image', busybox_image])
         self.cli_set(base_path + ['name', "test1", 'network', 'bridge1', 'address', '10.0.1.11'])
         self.cli_set(base_path + ['name', "test1", 'network', 'bridge1', 'mac', '02:00:00:00:00:01'])
+        self.cli_set(base_path + ['name', "test1", 'stop-timeout', '1'])
 
         self.cli_set(base_path + ['name', "test2", 'image', busybox_image])
         self.cli_set(base_path + ['name', "test2", 'network', 'bridge1', 'address', '10.0.1.12'])
         self.cli_set(base_path + ['name', "test2", 'network', 'bridge1', 'mac', '02:00:00:00:00:02'])
+        self.cli_set(base_path + ['name', "test2", 'stop-timeout', '1'])
         self.cli_commit()
 
-        n = cmd_to_json(f'sudo podman container inspect test1')
+        n = cmd_to_json(['container', 'inspect', 'test1'])
         self.assertEqual(n['NetworkSettings']['Networks']['bridge1']['MacAddress'], '02:00:00:00:00:01')
-        n = cmd_to_json(f'sudo podman container inspect test2')
+        n = cmd_to_json(['container', 'inspect', 'test2'])
         self.assertEqual(n['NetworkSettings']['Networks']['bridge1']['MacAddress'], '02:00:00:00:00:02')
+
+    def test_long_name_host_interface_uniqueness(self):
+        # T7736: the deterministic host-side veth interface name derived
+        # from a container name is truncated to fit IFNAMSIZ. Two distinct
+        # but similarly-prefixed long names must not truncate to the same
+        # interface name - Podman would then refuse to attach the second
+        # container's network, and its systemd unit would fail to start.
+        net_name = 'longiftest'
+        prefix = '192.0.2.0/24'
+        name_1 = 'abcdefghij-1'
+        name_2 = 'abcdefghij-2'
+
+        self.cli_set(base_path + ['network', net_name, 'prefix', prefix])
+        self.cli_set(base_path + ['name', name_1, 'image', busybox_image])
+        self.cli_set(base_path + ['name', name_1, 'network', net_name, 'address', str(ip_interface(prefix).ip + 2)])
+        self.cli_set(base_path + ['name', name_1, 'stop-timeout', '1'])
+        self.cli_set(base_path + ['name', name_2, 'image', busybox_image])
+        self.cli_set(base_path + ['name', name_2, 'network', net_name, 'address', str(ip_interface(prefix).ip + 3)])
+        self.cli_set(base_path + ['name', name_2, 'stop-timeout', '1'])
+        self.cli_commit()
+
+        # Both containers run a "conmon" process at once, so checking by
+        # process name alone can't distinguish which container it belongs
+        # to - verify each container's own recorded PID is still alive
+        for name in (name_1, name_2):
+            self.assertTrue(self.is_running(name))
+
+    def test_colliding_host_interface_names(self):
+        # T7736: the host-side veth name is "veth-<name[:5]>-<hash[:4]>" for
+        # long container names - two distinct names can still (rarely) hash
+        # to the same result. These two are a confirmed real collision
+        # (both produce "veth-aaaa9-4ded") - verify() must reject the
+        # commit with a clear error instead of leaving it to Podman to fail
+        # obscurely when the second container's network attachment clashes
+        # with the first's interface name.
+        net_name = 'collidetest'
+        prefix = '192.0.2.0/24'
+        name_1 = 'aaaa9000005'
+        name_2 = 'aaaa9000336'
+
+        self.cli_set(base_path + ['network', net_name, 'prefix', prefix])
+        self.cli_set(base_path + ['name', name_1, 'image', busybox_image])
+        self.cli_set(base_path + ['name', name_1, 'network', net_name, 'address', str(ip_interface(prefix).ip + 2)])
+        self.cli_set(base_path + ['name', name_1, 'stop-timeout', '1'])
+        self.cli_set(base_path + ['name', name_2, 'image', busybox_image])
+        self.cli_set(base_path + ['name', name_2, 'network', net_name, 'address', str(ip_interface(prefix).ip + 3)])
+        self.cli_set(base_path + ['name', name_2, 'stop-timeout', '1'])
+
+        with self.assertRaises(ConfigSessionError):
+            self.cli_commit()
+
+        self.cli_delete(base_path + ['name', name_2])
+        self.cli_commit()
 
     def test_ipv4_network(self):
         prefix = '192.0.2.0/24'
@@ -274,6 +338,7 @@ class TestContainer(VyOSUnitTestSHIM.TestCase):
         for ii in range(1, 6):
             name = f'{base_name}-{ii}'
             self.cli_set(base_path + ['name', name, 'image', busybox_image])
+            self.cli_set(base_path + ['name', name, 'stop-timeout', '1'])
             self.cli_set(
                 base_path
                 + [
@@ -286,7 +351,7 @@ class TestContainer(VyOSUnitTestSHIM.TestCase):
                 ]
             )
 
-        # verify() - first IP address of a prefix can not be used by a container
+        # verify() - first IP address of a prefix cannot be used by a container
         with self.assertRaises(ConfigSessionError):
             self.cli_commit()
 
@@ -294,13 +359,13 @@ class TestContainer(VyOSUnitTestSHIM.TestCase):
         self.cli_delete(base_path + ['name', tmp])
         self.cli_commit()
 
-        n = cmd_to_json(f'sudo podman network inspect {net_name}')
+        n = cmd_to_json(['network', 'inspect', net_name])
         self.assertEqual(n['subnets'][0]['subnet'], prefix)
 
         # skip first container, it was never created
         for ii in range(2, 6):
             name = f'{base_name}-{ii}'
-            c = cmd_to_json(f'sudo podman container inspect {name}')
+            c = cmd_to_json(['container', 'inspect', name])
             self.assertEqual(
                 c['NetworkSettings']['Networks'][net_name]['Gateway'],
                 str(ip_interface(prefix).ip + 1),
@@ -320,6 +385,7 @@ class TestContainer(VyOSUnitTestSHIM.TestCase):
         for ii in range(1, 6):
             name = f'{base_name}-{ii}'
             self.cli_set(base_path + ['name', name, 'image', busybox_image])
+            self.cli_set(base_path + ['name', name, 'stop-timeout', '1'])
             self.cli_set(
                 base_path
                 + [
@@ -332,7 +398,7 @@ class TestContainer(VyOSUnitTestSHIM.TestCase):
                 ]
             )
 
-        # verify() - first IP address of a prefix can not be used by a container
+        # verify() - first IP address of a prefix cannot be used by a container
         with self.assertRaises(ConfigSessionError):
             self.cli_commit()
 
@@ -340,13 +406,13 @@ class TestContainer(VyOSUnitTestSHIM.TestCase):
         self.cli_delete(base_path + ['name', tmp])
         self.cli_commit()
 
-        n = cmd_to_json(f'sudo podman network inspect {net_name}')
+        n = cmd_to_json(['network', 'inspect', net_name])
         self.assertEqual(n['subnets'][0]['subnet'], prefix)
 
         # skip first container, it was never created
         for ii in range(2, 6):
             name = f'{base_name}-{ii}'
-            c = cmd_to_json(f'sudo podman container inspect {name}')
+            c = cmd_to_json(['container', 'inspect', name])
             self.assertEqual(
                 c['NetworkSettings']['Networks'][net_name]['IPv6Gateway'],
                 str(ip_interface(prefix).ip + 1),
@@ -368,6 +434,7 @@ class TestContainer(VyOSUnitTestSHIM.TestCase):
         for ii in range(1, 6):
             name = f'{base_name}-{ii}'
             self.cli_set(base_path + ['name', name, 'image', busybox_image])
+            self.cli_set(base_path + ['name', name, 'stop-timeout', '1'])
             self.cli_set(
                 base_path
                 + [
@@ -391,7 +458,7 @@ class TestContainer(VyOSUnitTestSHIM.TestCase):
                 ]
             )
 
-        # verify() - first IP address of a prefix can not be used by a container
+        # verify() - first IP address of a prefix cannot be used by a container
         with self.assertRaises(ConfigSessionError):
             self.cli_commit()
 
@@ -399,14 +466,14 @@ class TestContainer(VyOSUnitTestSHIM.TestCase):
         self.cli_delete(base_path + ['name', tmp])
         self.cli_commit()
 
-        n = cmd_to_json(f'sudo podman network inspect {net_name}')
+        n = cmd_to_json(['network', 'inspect', net_name])
         self.assertEqual(n['subnets'][0]['subnet'], prefix4)
         self.assertEqual(n['subnets'][1]['subnet'], prefix6)
 
         # skip first container, it was never created
         for ii in range(2, 6):
             name = f'{base_name}-{ii}'
-            c = cmd_to_json(f'sudo podman container inspect {name}')
+            c = cmd_to_json(['container', 'inspect', name])
             self.assertEqual(
                 c['NetworkSettings']['Networks'][net_name]['IPv6Gateway'],
                 str(ip_interface(prefix6).ip + 1),
@@ -434,6 +501,7 @@ class TestContainer(VyOSUnitTestSHIM.TestCase):
 
         name = f'{base_name}-2'
         self.cli_set(base_path + ['name', name, 'image', busybox_image])
+        self.cli_set(base_path + ['name', name, 'stop-timeout', '1'])
         self.cli_set(
             base_path
             + [
@@ -447,7 +515,7 @@ class TestContainer(VyOSUnitTestSHIM.TestCase):
         )
         self.cli_commit()
 
-        n = cmd_to_json(f'sudo podman network inspect {net_name}')
+        n = cmd_to_json(['network', 'inspect', net_name])
         self.assertEqual(n['dns_enabled'], False)
 
     def test_network_mtu(self):
@@ -460,6 +528,7 @@ class TestContainer(VyOSUnitTestSHIM.TestCase):
 
         name = f'{base_name}-2'
         self.cli_set(base_path + ['name', name, 'image', busybox_image])
+        self.cli_set(base_path + ['name', name, 'stop-timeout', '1'])
         self.cli_set(
             base_path
             + [
@@ -473,7 +542,7 @@ class TestContainer(VyOSUnitTestSHIM.TestCase):
         )
         self.cli_commit()
 
-        n = cmd_to_json(f'sudo podman network inspect {net_name}')
+        n = cmd_to_json(['network', 'inspect', net_name])
         self.assertEqual(n['options']['mtu'], '1280')
 
     def test_uid_gid(self):
@@ -484,6 +553,7 @@ class TestContainer(VyOSUnitTestSHIM.TestCase):
         self.cli_set(base_path + ['name', cont_name, 'allow-host-networks'])
         self.cli_set(base_path + ['name', cont_name, 'image', busybox_image])
         self.cli_set(base_path + ['name', cont_name, 'gid', gid])
+        self.cli_set(base_path + ['name', cont_name, 'stop-timeout', '1'])
 
         # verify() - GID can only be set if UID is set
         with self.assertRaises(ConfigSessionError):
@@ -493,9 +563,9 @@ class TestContainer(VyOSUnitTestSHIM.TestCase):
         self.cli_commit()
 
         # verify
-        tmp = cmd(f'sudo podman exec -it {cont_name} id -u')
+        tmp = cmdl(['podman', 'exec', '-it', cont_name, 'id', '-u'], sudo=True)
         self.assertEqual(tmp, uid)
-        tmp = cmd(f'sudo podman exec -it {cont_name} id -g')
+        tmp = cmdl(['podman', 'exec', '-it', cont_name, 'id', '-g'], sudo=True)
         self.assertEqual(tmp, gid)
 
     def test_api_socket(self):
@@ -506,12 +576,16 @@ class TestContainer(VyOSUnitTestSHIM.TestCase):
             name = f'{base_name}-{ii}'
             self.cli_set(base_path + ['name', name, 'image', busybox_image])
             self.cli_set(base_path + ['name', name, 'allow-host-networks'])
+            self.cli_set(base_path + ['name', name, 'stop-timeout', '1'])
 
         self.cli_commit()
 
         # Query API about running containers
-        tmp = cmd(
-            "sudo curl --unix-socket /run/podman/podman.sock -H 'content-type: application/json' -sf http://localhost/containers/json"
+        tmp = cmdl(
+            ['curl', '--unix-socket', '/run/podman/podman.sock', '-H',
+             'content-type: application/json', '-sf',
+             'http://localhost/containers/json'],
+            sudo=True,
         )
         tmp = json.loads(tmp)
 
@@ -528,6 +602,7 @@ class TestContainer(VyOSUnitTestSHIM.TestCase):
 
         self.cli_set(base_path + ['name', cont_name, 'image', busybox_image])
         self.cli_set(base_path + ['name', cont_name, 'network', net_name])
+        self.cli_set(base_path + ['name', cont_name, 'stop-timeout', '1'])
         self.cli_set(base_path + ['network', net_name, 'prefix', '192.168.0.0/24'])
         self.cli_set(base_path + ['network', net_name, 'vrf', vrf_name])
 

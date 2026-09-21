@@ -119,7 +119,7 @@ def verify(lb):
         if 'http_check' in back_config:
             http_check = back_config['http_check']
             if 'expect' in http_check and 'status' in http_check['expect'] and 'string' in http_check['expect']:
-                raise ConfigError('"expect status" and "expect string" can not be configured together!')
+                raise ConfigError('"expect status" and "expect string" cannot be configured together!')
 
         if 'health_check' in back_config:
             if back_config['mode'] != 'tcp':
@@ -149,7 +149,12 @@ def verify(lb):
     for group in ['service', 'backend']:
         for config_name, config in lb[group].items():
             if 'http_response_headers' in config and config['mode'] != 'http':
-                raise ConfigError(f'{group} {config_name} must be set to http mode to use http_response_headers!')
+                raise ConfigError(f'{group} {config_name} must be set to http mode to use http-response headers!')
+
+    # Check if http-server-close is configured in any backend where mode != http
+    for config_name, config in lb['backend'].items():
+        if 'http_server_close' in config and config['mode'] != 'http':
+            raise ConfigError(f'backend {config_name} must be set to http mode to use http-server-close!')
 
 
 def generate(lb):

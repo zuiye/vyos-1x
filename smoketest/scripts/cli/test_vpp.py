@@ -34,7 +34,9 @@ from vyos.utils.process import rc_cmd
 from vyos.utils.system import sysctl_read
 from vyos.utils.network import interface_exists
 from vyos.system import image
+from vyos.ifconfig import Interface
 from vyos.vpp import VPPControl
+from vyos.vpp.utils import vpp_ip_addresses_by_index
 from vyos.vpp.utils import vpp_iface_name_transform
 from vyos.vpp.config_resource_checks.resource_defaults import default_resource_map
 
@@ -101,6 +103,9 @@ class TestVPP(VyOSUnitTestSHIM.TestCase):
         # out the current configuration :)
         cls.cli_delete(cls, base_path)
         cls.cli_delete(cls, interfaces_path)
+        # drop any pre-existing custom MAC so the MAC test baseline is the
+        # interface hardware address (hw-id)
+        cls.cli_delete(cls, ['interfaces', 'ethernet', interface, 'mac'])
 
     def setUp(self):
         # always forward to base class
@@ -119,8 +124,9 @@ class TestVPP(VyOSUnitTestSHIM.TestCase):
             self.cli_delete(interfaces_path)
             self.cli_commit()
 
-            # delete address for Ethernet interface
+            # delete address and any custom MAC for the Ethernet interface
             self.cli_delete(['interfaces', 'ethernet', interface, 'address'])
+            self.cli_delete(['interfaces', 'ethernet', interface, 'mac'])
             self.cli_commit()
 
         self.assertFalse(os.path.exists(VPP_CONF))
@@ -181,6 +187,21 @@ class TestVPP(VyOSUnitTestSHIM.TestCase):
         self.cli_delete(['interfaces', 'ethernet', interface, 'mtu'])
         self.cli_commit()
 
+        # A custom MAC address must reach the VPP dataplane, and removing it must
+        # restore the hardware address (hw-id). Rejection of drivers that cannot
+        # change the MAC (e.g. vmxnet3) is not covered here, as the CI dataplane
+        # NIC uses a supported driver.
+        hw_mac = VPPControl().get_mac(interface)
+        mac = '02:00:de:ad:be:01'
+        self.cli_set(['interfaces', 'ethernet', interface, 'mac', mac])
+        self.cli_commit()
+        self.assertEqual(VPPControl().get_mac(interface), mac)
+
+        # removing the custom MAC reverts to the hardware address (hw-id)
+        self.cli_delete(['interfaces', 'ethernet', interface, 'mac'])
+        self.cli_commit()
+        self.assertEqual(VPPControl().get_mac(interface), hw_mac)
+
         # set interface address as dhcp
         self.cli_set(['interfaces', 'ethernet', interface, 'address', 'dhcp'])
         self.cli_commit()
@@ -208,6 +229,59 @@ class TestVPP(VyOSUnitTestSHIM.TestCase):
                 arc_name=arc_name,
             )
             self.assertTrue(icmpv6_ra_punt_feature.is_enabled)
+
+        # DHCP/DHCPv6 must also work on VLAN sub-interfaces
+        vlan = '10'
+        vif_interface = f'{interface}.{vlan}'
+        self.cli_set(
+            ['interfaces', 'ethernet', interface, 'vif', vlan, 'address', 'dhcp']
+        )
+        self.cli_set(
+            ['interfaces', 'ethernet', interface, 'vif', vlan, 'address', 'dhcpv6']
+        )
+        self.cli_commit()
+
+        # check 'ip4-dhcp-client-detect' feature is enabled
+        vif_client_detect_feature = vpp.api.feature_is_enabled(
+            sw_if_index=vpp.get_sw_if_index(vif_interface),
+            feature_name='ip4-dhcp-client-detect',
+            arc_name='ip4-unicast',
+        )
+        self.assertTrue(vif_client_detect_feature.is_enabled)
+
+        # check 'ip6-icmp-ra-punt' feature is enabled
+        # for ip6-unicast and ip6-multicast arcs
+        for arc_name in ['ip6-unicast', 'ip6-multicast']:
+            vif_icmpv6_ra_punt_feature = vpp.api.feature_is_enabled(
+                sw_if_index=vpp.get_sw_if_index(vif_interface),
+                feature_name='ip6-icmp-ra-punt',
+                arc_name=arc_name,
+            )
+            self.assertTrue(vif_icmpv6_ra_punt_feature.is_enabled)
+
+        # remove DHCP/DHCPv6 from the VLAN sub-interface
+        self.cli_delete(['interfaces', 'ethernet', interface, 'vif', vlan, 'address'])
+        self.cli_commit()
+
+        # check 'ip4-dhcp-client-detect' feature is disabled
+        vif_client_detect_feature = vpp.api.feature_is_enabled(
+            sw_if_index=vpp.get_sw_if_index(vif_interface),
+            feature_name='ip4-dhcp-client-detect',
+            arc_name='ip4-unicast',
+        )
+        self.assertFalse(vif_client_detect_feature.is_enabled)
+
+        # check 'ip6-icmp-ra-punt' feature is disabled
+        for arc_name in ['ip6-unicast', 'ip6-multicast']:
+            vif_icmpv6_ra_punt_feature = vpp.api.feature_is_enabled(
+                sw_if_index=vpp.get_sw_if_index(vif_interface),
+                feature_name='ip6-icmp-ra-punt',
+                arc_name=arc_name,
+            )
+            self.assertFalse(vif_icmpv6_ra_punt_feature.is_enabled)
+
+        # cleanup: delete the VLAN sub-interface
+        self.cli_delete(['interfaces', 'ethernet', interface, 'vif', vlan])
 
     def test_02_vpp_vxlan(self):
         vxlan_path = interfaces_path + ['vxlan']
@@ -347,6 +421,7 @@ class TestVPP(VyOSUnitTestSHIM.TestCase):
         loopback_path = interfaces_path + ['loopback']
         interface_loopback = 'vpplo11'
         address = '192.0.2.54'
+        mac = '00:50:00:00:00:11'
 
         self.cli_set(loopback_path + [interface_loopback])
         self.cli_set(loopback_path + [interface_loopback, 'address', f'{address}/25'])
@@ -363,6 +438,14 @@ class TestVPP(VyOSUnitTestSHIM.TestCase):
         _, out = rc_cmd('sudo vppctl show interface loop11')
         required_str = 'loop11'
         self.assertIn(required_str, out)
+
+        # check explicit MAC
+        self.cli_set(loopback_path + [interface_loopback, 'mac', mac])
+        self.cli_commit()
+
+        _, out = rc_cmd('sudo vppctl show hardware-interfaces loop11')
+        self.assertIn(f'Ethernet address {mac}', out)
+        self.assertEqual(mac, Interface(interface_loopback).get_mac())
 
         # delete loopback interface
         self.cli_delete(loopback_path + [interface_loopback])
@@ -393,6 +476,10 @@ class TestVPP(VyOSUnitTestSHIM.TestCase):
             r'BondEthernet23\s+\d+\s+up',
             "Interface BondEthernet23 is not in the expected state 'up'.",
         )
+
+        # promiscuous mode must be enabled on a member interface
+        _, out = rc_cmd(f'sudo vppctl show hardware-interfaces {interface}')
+        self.assertRegex(out, r'flags:.*\bpromisc\b')
 
         self.cli_set(bond_path + [interface_bond, 'description', description])
         for vlan in vlans:
@@ -443,6 +530,29 @@ class TestVPP(VyOSUnitTestSHIM.TestCase):
         self.cli_commit()
         self.assertFalse(os.path.isdir(f'/sys/class/net/{interface_bond}.{vlan}'))
 
+        # a member with its own VLAN (vif) must keep promiscuous mode
+        # enabled after being detached from the bond
+        member_vlan = '789'
+        self.cli_set(['interfaces', 'ethernet', interface, 'vif', member_vlan])
+        self.cli_commit()
+
+        self.cli_delete(bond_path + [interface_bond, 'member', 'interface', interface])
+        self.cli_commit()
+
+        _, out = rc_cmd(f'sudo vppctl show hardware-interfaces {interface}')
+        self.assertRegex(out, r'flags:.*\bpromisc\b')
+
+        # remove the member's VLAN too: promiscuous mode must now be disabled
+        self.cli_delete(['interfaces', 'ethernet', interface, 'vif', member_vlan])
+        self.cli_commit()
+
+        _, out = rc_cmd(f'sudo vppctl show hardware-interfaces {interface}')
+        self.assertNotRegex(out, r'flags:.*\bpromisc\b')
+
+        # re-add the member for the remaining bond-deletion checks below
+        self.cli_set(bond_path + [interface_bond, 'member', 'interface', interface])
+        self.cli_commit()
+
         # delete bonding interface
         self.cli_delete(bond_path)
         self.cli_commit()
@@ -450,6 +560,11 @@ class TestVPP(VyOSUnitTestSHIM.TestCase):
         # check deleting bonding interface
         _, out = rc_cmd('sudo vppctl show interface')
         self.assertNotIn('BondEthernet23', out)
+
+        # promiscuous mode must be disabled once the member is
+        # detached from the bond (bond deletion detaches all members)
+        _, out = rc_cmd(f'sudo vppctl show hardware-interfaces {interface}')
+        self.assertNotRegex(out, r'flags:.*\bpromisc\b')
 
     def test_06_vpp_bridge(self):
         bridge_path = interfaces_path + ['bridge']
@@ -569,6 +684,25 @@ class TestVPP(VyOSUnitTestSHIM.TestCase):
 
         self.assertRegex(normalized_out, r'10 1 \d+ off')
         self.assertRegex(out, r'\bloop23\s+\d+\s+\d+\s+\d+\s+\*\s+')
+
+        # A loopback is fully deleted and recreated in VPP on every apply,
+        # getting a new sw_if_index - reconfiguring it must reattach it to
+        # the bridge as BVI rather than leaving the bridge pointing at the
+        # stale, now-deleted interface
+        self.cli_set(
+            interfaces_path + ['loopback', f'vpplo{vni}', 'mac', '00:50:00:00:00:23']
+        )
+        self.cli_commit()
+
+        _, out = rc_cmd('sudo vppctl show bridge-domain 10 detail')
+        normalized_out = re.sub(r'\s+', ' ', out)
+        self.assertRegex(normalized_out, r'10 1 \d+ off')
+        self.assertRegex(out, r'\bloop23\s+\d+\s+\d+\s+\d+\s+\*\s+')
+
+        # cannot remove loopback interface while it is used as BVI
+        self.cli_delete(interfaces_path + ['loopback', f'vpplo{vni}'])
+        with self.assertRaises(ConfigSessionError):
+            self.cli_commit()
 
     def test_07_vpp_ipip(self):
         ipip_path = interfaces_path + ['ipip']
@@ -1473,7 +1607,10 @@ class TestVPP(VyOSUnitTestSHIM.TestCase):
         # Ensure that VPP process is active
         self.assertTrue(process_named_running(PROCESS_NAME))
 
-    def test_23_vpp_acl_subinterface(self):
+        # Cleanup
+        self.cli_delete(['interfaces', 'ethernet', interface, 'vif', vlan])
+
+    def test_23_1_vpp_acl_subinterface(self):
         base_acl = base_path + ['acl', 'ip']
         vlan = '200'
         subif = f'{interface}.{vlan}'
@@ -1512,6 +1649,190 @@ class TestVPP(VyOSUnitTestSHIM.TestCase):
         self.assertEqual(
             list(acl_interfaces[0].acls)[: acl_interfaces[0].count], [acl_index]
         )
+
+        # Cleanup
+        self.cli_delete(['interfaces', 'ethernet', interface, 'vif', vlan])
+
+    def test_23_2_vpp_acl_bond_with_vif(self):
+        base_acl = base_path + ['acl', 'ip']
+        base_bond = interfaces_path + ['bonding']
+        bond = 'vppbond0'
+        acl_name = 'TEST_ACL'
+        vif = '111'
+        bond_vif = f'{bond}.{vif}'
+        bond_vif_vpp = vpp_iface_name_transform(bond_vif)
+
+        self.cli_set(base_bond + [bond, 'member', 'interface', interface])
+        self.cli_set(base_bond + [bond, 'vif', vif])
+
+        self.cli_set(
+            base_acl + ['tag-name', acl_name, 'rule', '10', 'action', 'permit']
+        )
+        self.cli_set(
+            base_acl
+            + ['interface', bond_vif, 'input', 'acl-tag', '10', 'tag-name', acl_name]
+        )
+        self.cli_commit()
+
+        # Verify the VIF interface exists in VPP and the ACL was created
+        vpp = VPPControl()
+        iface_index = vpp.get_sw_if_index(bond_vif_vpp)
+        self.assertIsNotNone(iface_index)
+
+        acl_index = None
+        for acl in vpp.api.acl_dump(acl_index=0xFFFFFFFF):
+            if acl.tag == acl_name:
+                acl_index = acl.acl_index
+                break
+        self.assertIsNotNone(acl_index)
+
+        # Verify the ACL is assigned to the VIF interface
+        acl_interfaces = [
+            entry
+            for entry in vpp.api.acl_interface_list_dump()
+            if entry.sw_if_index == iface_index and entry.count != 0
+        ]
+        self.assertEqual(len(acl_interfaces), 1)
+        self.assertEqual(
+            list(acl_interfaces[0].acls)[: acl_interfaces[0].count], [acl_index]
+        )
+
+        # Change bond mode — this recreates the bond interface and must re-trigger
+        # the ACL dependency so the ACL is reapplied to the VIF
+        self.cli_set(base_bond + [bond, 'mode', '802.3ad'])
+        self.cli_commit()
+
+        # Verify the ACL is still correctly assigned after bond reconfiguration
+        vpp = VPPControl()
+        iface_index = vpp.get_sw_if_index(bond_vif_vpp)
+        self.assertIsNotNone(iface_index)
+
+        acl_interfaces = [
+            entry
+            for entry in vpp.api.acl_interface_list_dump()
+            if entry.sw_if_index == iface_index and entry.count != 0
+        ]
+        self.assertEqual(len(acl_interfaces), 1)
+        self.assertEqual(
+            list(acl_interfaces[0].acls)[: acl_interfaces[0].count], [acl_index]
+        )
+
+    def test_24_vpp_lcp_vrf_table_sync(self):
+        vlan = '20'
+        subif = f'{interface}.{vlan}'
+        address = '100.100.100.1/24'
+        fib_route = '100.100.100.1/32'
+        mgmt_vrf = 'mgmt'
+        test_vrf = 'test1'
+
+        def assert_vpp_lcp_table(table_id):
+            vpp = VPPControl()
+            subif_index = vpp.get_sw_if_index(subif)
+            self.assertIsNotNone(subif_index)
+            self.assertEqual(vpp.get_interface_ip_table(subif), table_id)
+            self.assertIn(address, vpp_ip_addresses_by_index(vpp.api, subif_index))
+
+        def assert_fib_route(table_id, expected=True):
+            _, out = rc_cmd(f'sudo vppctl show ip fib table {table_id}')
+            if expected:
+                self.assertIn(fib_route, out)
+            else:
+                self.assertNotIn(fib_route, out)
+
+        self.cli_set(['vrf', 'name', mgmt_vrf, 'table', '1000'])
+        self.cli_set(
+            ['interfaces', 'ethernet', interface, 'vif', vlan, 'address', address]
+        )
+        self.cli_set(
+            ['interfaces', 'ethernet', interface, 'vif', vlan, 'vrf', mgmt_vrf]
+        )
+        self.cli_commit()
+
+        assert_vpp_lcp_table(1000)
+        assert_fib_route(0, expected=False)
+        assert_fib_route(1000)
+
+        self.cli_delete(['interfaces', 'ethernet', interface, 'vif', vlan, 'address'])
+        self.cli_commit()
+
+        vpp = VPPControl()
+        subif_index = vpp.get_sw_if_index(subif)
+        self.assertIsNotNone(subif_index)
+        self.assertEqual(vpp.get_interface_ip_table(subif), 1000)
+        self.assertNotIn(address, vpp_ip_addresses_by_index(vpp.api, subif_index))
+        assert_fib_route(0, expected=False)
+        assert_fib_route(1000, expected=False)
+
+        self.cli_set(
+            ['interfaces', 'ethernet', interface, 'vif', vlan, 'address', address]
+        )
+        self.cli_commit()
+
+        assert_vpp_lcp_table(1000)
+        assert_fib_route(0, expected=False)
+        assert_fib_route(1000)
+
+        self.cli_delete(['interfaces', 'ethernet', interface, 'vif', vlan, 'vrf'])
+        self.cli_commit()
+
+        assert_vpp_lcp_table(0)
+        assert_fib_route(0)
+        assert_fib_route(1000, expected=False)
+
+        self.cli_set(
+            ['interfaces', 'ethernet', interface, 'vif', vlan, 'vrf', mgmt_vrf]
+        )
+        self.cli_commit()
+
+        assert_vpp_lcp_table(1000)
+        assert_fib_route(0, expected=False)
+        assert_fib_route(1000)
+
+        self.cli_set(['vrf', 'name', test_vrf, 'table', '2000'])
+        self.cli_set(
+            ['interfaces', 'ethernet', interface, 'vif', vlan, 'vrf', test_vrf]
+        )
+        self.cli_commit()
+
+        assert_vpp_lcp_table(2000)
+        assert_fib_route(0, expected=False)
+        assert_fib_route(1000, expected=False)
+        assert_fib_route(2000)
+
+        self.cli_delete(['interfaces', 'ethernet', interface, 'vif', vlan])
+        self.cli_delete(['vrf', 'name', test_vrf])
+        self.cli_delete(['vrf', 'name', mgmt_vrf])
+        self.cli_commit()
+
+    def test_25_vpp_promisc_vlan(self):
+        # T9018: promiscuous mode must be enabled automatically when VLANs
+        # are configured on a VPP interface and disabled when removed.
+        vlan = '100'
+        address = '192.168.10.1/24'
+
+        self.cli_commit()
+
+        # Verify promisc is off initially
+        _, out = rc_cmd(f'sudo vppctl show hardware-interfaces {interface}')
+        self.assertNotRegex(out, r'flags:.*\bpromisc\b')
+
+        # Add VLAN sub-interface
+        self.cli_set(
+            ['interfaces', 'ethernet', interface, 'vif', vlan, 'address', address]
+        )
+        self.cli_commit()
+
+        # Verify promisc is enabled
+        _, out = rc_cmd(f'sudo vppctl show hardware-interfaces {interface}')
+        self.assertRegex(out, r'flags:.*\bpromisc\b')
+
+        # Remove VLAN sub-interface
+        self.cli_delete(['interfaces', 'ethernet', interface, 'vif'])
+        self.cli_commit()
+
+        # Verify promisc is disabled
+        _, out = rc_cmd(f'sudo vppctl show hardware-interfaces {interface}')
+        self.assertNotRegex(out, r'flags:.*\bpromisc\b')
 
 
 if __name__ == '__main__':

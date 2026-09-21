@@ -24,6 +24,7 @@ from vyos.configdep import set_dependents
 from vyos.configdep import call_dependents
 from vyos.configdict import get_interface_dict
 from vyos.configdict import is_node_changed
+from vyos.configdict import is_vrf_changed
 from vyos.configverify import verify_authentication
 from vyos.configverify import verify_interface_exists
 from vyos.configverify import verify_mirror_redirect
@@ -32,7 +33,7 @@ from vyos.configverify import verify_mtu_ipv6
 from vyos.ifconfig import WWANIf
 from vyos.utils.dict import dict_search
 from vyos.utils.network import is_wwan_connected
-from vyos.utils.process import cmd
+from vyos.utils.process import cmdl
 from vyos.utils.process import call
 from vyos.utils.process import DEVNULL
 from vyos.utils.process import is_systemd_service_active
@@ -93,6 +94,10 @@ def get_config(config=None):
     if 'static_arp' in wwan:
         set_dependents('static_arp', conf)
 
+    # Check vrf membership, to ensure firewall is updated
+    if is_vrf_changed(conf, ifname):
+        set_dependents('firewall', conf)
+
     return wwan
 
 def verify(wwan):
@@ -133,13 +138,13 @@ def apply(wwan):
     # required to serve all modems. Activate ModemManager on first invocation
     # of any WWAN interface.
     if not is_systemd_service_active(service_name):
-        cmd(f'systemctl start {service_name}')
+        cmdl(['systemctl', 'start', service_name])
 
         counter = 100
         # Wait until a modem is detected and then we can continue
         while counter > 0:
             counter -= 1
-            tmp = cmd('mmcli -L')
+            tmp = cmdl(['mmcli', '-L'])
             if tmp != 'No modems were found':
                 break
             sleep(0.250)
@@ -149,20 +154,29 @@ def apply(wwan):
         modem = wwan['ifname'].lstrip('wwan')
         base_cmd = f'mmcli --modem {modem}'
         # Number of bearers is limited - always disconnect first
-        cmd(f'{base_cmd} --simple-disconnect')
+        call(f'{base_cmd} --simple-disconnect')
 
     w = WWANIf(wwan['ifname'])
+
+    # We cannot proceed with the configuration if the modem is not detected - so we bail out
+    # and wait for the next cronjob run to re-apply the configuration.
+    if not w.exists(wwan['ifname']):
+        return None
+
     if 'deleted' in wwan or 'disable' in wwan:
         w.remove()
 
         # We are the last WWAN interface - there are no other WWAN interfaces
         # remaining, thus we can stop ModemManager and free resources.
         if 'other_interfaces' not in wwan:
-            cmd(f'systemctl stop {service_name}')
+            cmdl(['systemctl', 'stop', service_name])
             # Clean CRON helper script which is used for to re-connect when
             # RF signal is lost
             if os.path.exists(cron_script):
                 os.unlink(cron_script)
+
+        # run the dependents
+        call_dependents()
 
         return None
 
@@ -186,8 +200,8 @@ def apply(wwan):
 
     w.update(wwan)
 
-    if 'static_arp' in wwan:
-        call_dependents()
+    # run the dependents
+    call_dependents()
 
     return None
 

@@ -32,12 +32,18 @@ from vyos.base import DeprecationWarning
 from vyos.config import Config
 from vyos.configdict import get_interface_dict
 from vyos.configdict import is_node_changed
+from vyos.configdict import is_vrf_changed
 from vyos.configdiff import get_config_diff
+from vyos.configdep import set_dependents
+from vyos.configdep import call_dependents
 from vyos.configverify import verify_vrf
 from vyos.configverify import verify_bridge_delete
 from vyos.configverify import verify_mirror_redirect
 from vyos.configverify import verify_bond_bridge_member
 from vyos.ifconfig import VTunIf
+from vyos.netlink.ovpn import get_ovpn_mode
+from vyos.netlink.ovpn import OVPN_MODE_MP
+from vyos.netlink.ovpn import OVPN_MODE_P2P
 from vyos.pki import load_dh_parameters
 from vyos.pki import load_private_key
 from vyos.pki import sort_ca_chain
@@ -57,12 +63,12 @@ from vyos.utils.file import makedir
 from vyos.utils.file import read_file
 from vyos.utils.file import write_file
 from vyos.utils.kernel import check_kmod
-from vyos.utils.kernel import unload_kmod
 from vyos.utils.process import call
 from vyos.utils.permission import chown
-from vyos.utils.process import cmd
+from vyos.utils.process import cmdl
 from vyos.utils.network import is_addr_assigned
 from vyos.utils.network import interface_exists
+from vyos.utils.network import get_interface_config
 
 from vyos import ConfigError
 from vyos import airbag
@@ -73,10 +79,60 @@ group = 'openvpn'
 
 cfg_dir = '/run/openvpn'
 cfg_file = '/run/openvpn/{ifname}.conf'
+# Ciphers implemented by the in-tree "ovpn" Kernel module. Any other cipher
+# must be handled in userspace and thus rules out DCO. The module also does
+# ChaCha20-Poly1305, which the CLI does not offer.
+dco_ciphers = ['aes128gcm', 'aes192gcm', 'aes256gcm']
+# Raw options that make OpenVPN fall back to the userspace data path, taken
+# from dco_check_option() and dco_check_option_ce()
+dco_incompatible_options = [
+    'comp-lzo',
+    'disable-dco',
+    'fragment',
+    'http-proxy',
+    'management-query-proxy',
+    'socks-proxy',
+]
+# these rule out the offload for every value but one - notably "compress
+# migrate", which is what OpenVPN suggests to keep it
+dco_conditional_options = {
+    'allow-compression': 'no',
+    'compress': 'migrate',
+    'dev-type': 'tun',
+}
+# Cipher negotiation lists a raw option can override, "ncp-ciphers" being the
+# 2.4 spelling OpenVPN still accepts. A raw list wins over the one rendered
+# from "encryption data-ciphers", so it needs the very same check.
+dco_cipher_options = ['data-ciphers', 'data-ciphers-fallback', 'ncp-ciphers']
+# dco_ciphers again, spelled the way OpenVPN reports them in
+# dco_get_supported_ciphers()
+dco_raw_ciphers = ['AES-128-GCM', 'AES-192-GCM', 'AES-256-GCM', 'CHACHA20-POLY1305']
 otp_path = '/config/auth/openvpn'
 otp_file = '/config/auth/openvpn/{ifname}-otp-secrets'
 secret_chars = list('ABCDEFGHIJKLMNOPQRSTUVWXYZ234567')
 service_file = '/run/systemd/system/openvpn@{ifname}.service.d/20-override.conf'
+
+def _only_client_config_changed(conf, base, ifname):
+    """
+    Return True when the sole diff under this interface is a change to
+    `server.client` entries (i.e. CCD files).
+    """
+
+    iface_path = base + [ifname]
+    diff = get_config_diff(conf)
+
+    def _has_only_changes(path, node):
+        changes = diff.node_changed_children(path)
+        return len(changes) == 1 and changes[0] == node
+
+    # Something outside of 'server' also changed - not a CCD-only change
+    if _has_only_changes(iface_path, 'server'):
+        # Something outside of 'server.client' also changed - not a CCD-only change
+        if _has_only_changes(iface_path + ['server'], 'client'):
+            return True
+
+    return False
+
 
 def get_config(config=None):
     """
@@ -91,6 +147,18 @@ def get_config(config=None):
 
     ifname, openvpn = get_interface_dict(conf, base, with_pki=True)
     openvpn['auth_user_pass_file'] = '/run/openvpn/{ifname}.pw'.format(**openvpn)
+
+    # OpenVPN Data-Channel-Offload (DCO) is a Kernel module. If loaded it applies to all
+    # OpenVPN interfaces. Check if DCO is used by any other interface instance.
+    tmp = conf.get_config_dict(base, key_mangling=('-', '_'), get_first_key=True)
+    for interface, interface_config in tmp.items():
+        # If one interface has DCO configured, enable it. No need to further check
+        # all other OpenVPN interfaces. We must use a dedicated key to indicate
+        # the Kernel module must be loaded or not. The per interface "offload.dco"
+        # key is required per OpenVPN interface instance.
+        if dict_search('offload.dco', interface_config) != None:
+            openvpn['module_load_dco'] = {}
+            break
 
     if 'deleted' in openvpn:
         return openvpn
@@ -114,11 +182,21 @@ def get_config(config=None):
 
     if is_node_changed(conf, base + [ifname, 'openvpn-option']):
         openvpn.update({'restart_required': {}})
-    if is_node_changed(conf, base + [ifname, 'enable-dco']):
-        openvpn.update({'restart_required': {}})
+    # the offload, the operating mode and the device type all decide what kind
+    # of interface the data path needs, which can only change on a restart
+    for node in [['offload', 'dco'], ['mode'], ['device-type']]:
+        if is_node_changed(conf, base + [ifname] + node):
+            openvpn.update({'restart_required': {}})
+            break
+
+    # Detect changes that are limited to per-client CCD entries (T6478).
+    # OpenVPN reads client-config-dir files at connect time, so adding or
+    # updating them requires neither a SIGHUP nor a service restart.
+    if 'restart_required' not in openvpn and openvpn['mode'] == 'server':
+        openvpn['client_only_changed'] = _only_client_config_changed(conf, base, ifname)
 
     # We have to get the dict using 'get_config_dict' instead of 'get_interface_dict'
-    # as 'get_interface_dict' merges the defaults in, so we can not check for defaults in there.
+    # as 'get_interface_dict' merges the defaults in, so we cannot check for defaults in there.
     tmp = conf.get_config_dict(base + [openvpn['ifname']], get_first_key=True)
 
     # We have to cleanup the config dict, as default values could enable features
@@ -128,18 +206,6 @@ def get_config(config=None):
     # need to check this first and drop those keys
     if dict_search('server.mfa.totp', tmp) == None:
         del openvpn['server']['mfa']
-
-    # OpenVPN Data-Channel-Offload (DCO) is a Kernel module. If loaded it applies to all
-    # OpenVPN interfaces. Check if DCO is used by any other interface instance.
-    tmp = conf.get_config_dict(base, key_mangling=('-', '_'), get_first_key=True)
-    for interface, interface_config in tmp.items():
-        # If one interface has DCO configured, enable it. No need to further check
-        # all other OpenVPN interfaces. We must use a dedicated key to indicate
-        # the Kernel module must be loaded or not. The per interface "offload.dco"
-        # key is required per OpenVPN interface instance.
-        if dict_search('offload.dco', interface_config) != None:
-            openvpn['module_load_dco'] = {}
-            break
 
     # Calculate the protocol modifier. This is concatenated to the protocol string to direct
     # OpenVPN to use a specific IP protocol version. If unspecified, the kernel decides which
@@ -152,6 +218,10 @@ def get_config(config=None):
         openvpn['protocol_modifier']  = '6'
     else:
         openvpn['protocol_modifier'] = ''
+
+    # Check vrf membership, to ensure firewall is updated
+    if is_vrf_changed(conf, ifname):
+        set_dependents('firewall', conf)
 
     return openvpn
 
@@ -173,6 +243,85 @@ def verify_data_ciphers_fallback(openvpn):
     if openvpn['mode'] != 'site-to-site':
         if dict_search('encryption.data_ciphers_fallback', openvpn):
             raise ConfigError('Cipher fallback is valid only in site-to-site mode')
+
+
+def unoffloadable_cipher(value):
+    """The first cipher of a raw negotiation list DCO can not serve, if any."""
+    for cipher in value.split(':'):
+        # "DEFAULT" stands for the built-in list, which OpenVPN expands - case
+        # sensitively, and only as a bare token - to AEAD ciphers alone before
+        # it weighs the offload
+        if cipher == 'DEFAULT':
+            continue
+        # it strips exactly one "?", and drops such a cipher only when it does
+        # not know it at all, so an optional one still has to be offloadable
+        name = cipher[1:] if cipher.startswith('?') else cipher
+        if name.upper() not in dco_raw_ciphers:
+            return cipher
+    return None
+
+
+def verify_dco(openvpn):
+    if dict_search('offload.dco', openvpn) is None:
+        return
+
+    if openvpn['device_type'] != 'tun':
+        raise ConfigError('DCO requires "device-type tun"')
+
+    if openvpn['mode'] == 'server':
+        topology = dict_search('server.topology', openvpn)
+        if topology != 'subnet':
+            raise ConfigError(
+                f'DCO requires "server topology subnet", got "{topology}"'
+            )
+
+    if 'shared_secret_key' in openvpn:
+        raise ConfigError('DCO is incompatible with "shared-secret-key"')
+
+    if 'use_lzo_compression' in openvpn:
+        raise ConfigError('DCO is incompatible with "use-lzo-compression"')
+
+    ciphers = dict_search('encryption.data_ciphers', openvpn) or []
+    fallback = dict_search('encryption.data_ciphers_fallback', openvpn)
+    if fallback:
+        ciphers = ciphers + [fallback]
+
+    for cipher in ciphers:
+        if cipher not in dco_ciphers:
+            raise ConfigError(f'DCO does not support cipher "{cipher}"')
+
+    # Outside server and pull mode OpenVPN takes a raw "--cipher" as the
+    # fallback cipher, which decides the offload just like a negotiation list
+    # does - and site-to-site is the mode that renders neither
+    cipher_options = dco_cipher_options
+    if openvpn['mode'] == 'site-to-site':
+        cipher_options = cipher_options + ['cipher']
+
+    # "topology" only reaches OpenVPN's decision in server mode
+    conditional_options = dco_conditional_options
+    if openvpn['mode'] == 'server':
+        conditional_options = {**conditional_options, 'topology': 'subnet'}
+
+    # A raw option OpenVPN refuses to offload leaves the daemon on the
+    # userspace data path, where it can not use the interface it was given
+    for option in dict_search('openvpn_option', openvpn) or []:
+        tmp = option.split()
+        if not tmp:
+            continue
+        keyword = tmp[0].lstrip('-')
+        if keyword in dco_incompatible_options:
+            raise ConfigError(f'DCO is incompatible with "openvpn-option {keyword}"')
+        if keyword in conditional_options:
+            keep = conditional_options[keyword]
+            if tmp[1:] != [keep]:
+                raise ConfigError(f'DCO requires "openvpn-option {keyword} {keep}"')
+        # only an AF_UNIX node rules out the offload, a real one is fine
+        if keyword == 'dev-node' and tmp[1:] and tmp[1].startswith('unix:'):
+            raise ConfigError('DCO is incompatible with an AF_UNIX "dev-node"')
+        if keyword in cipher_options and tmp[1:]:
+            cipher = unoffloadable_cipher(tmp[1])
+            if cipher is not None:
+                raise ConfigError(f'DCO does not support cipher "{cipher}"')
 
 def verify_pki(openvpn):
     pki = openvpn['pki']
@@ -351,7 +500,7 @@ def verify(openvpn):
                 raise ConfigError('"local-address" cannot be the same as "local-host"')
 
             if dict_search('remote_host', openvpn) in dict_search('remote_address', openvpn):
-                raise ConfigError('"remote-address" and "remote-host" can not be the same')
+                raise ConfigError('"remote-address" and "remote-host" cannot be the same')
 
         if openvpn['device_type'] == 'tap' and 'local_address' in openvpn:
             # we can only have one local_address, this is ensured above
@@ -384,6 +533,27 @@ def verify(openvpn):
     if openvpn['mode'] == 'server':
         if openvpn['protocol'] == 'tcp-active':
             raise ConfigError('Protocol "tcp-active" is not valid in server mode')
+
+        # The rendered "keepalive" timeout is interval * failure-count. OpenVPN
+        # limits ping and keepalive to 24 hours and doubles the timeout on the
+        # server, so the rendered value can not exceed 12 hours.
+        keep_alive = openvpn['keep_alive']
+        interval = int(keep_alive['interval'])
+        failure_count = int(keep_alive['failure_count'])
+        timeout = interval * failure_count
+
+        # A zero interval turns keepalive off and renders no directive at
+        # all, so only an enabled one has to satisfy them
+        if interval > 0:
+            # the timeout has to be at least twice the interval, which the CLI
+            # ranges do not enforce
+            if failure_count < 2:
+                raise ConfigError('Keepalive "failure-count" must be at least 2')
+
+            if timeout > 43200:
+                raise ConfigError(
+                    f'Keepalive timeout of {timeout} seconds cannot exceed 43200'
+                )
 
         if dict_search('authentication.username', openvpn) or dict_search('authentication.password', openvpn):
             raise ConfigError('Cannot specify "authentication" in server mode')
@@ -627,6 +797,7 @@ def verify(openvpn):
     verify_mirror_redirect(openvpn)
 
     verify_data_ciphers_fallback(openvpn)
+    verify_dco(openvpn)
 
     return None
 
@@ -774,11 +945,11 @@ def generate(openvpn):
     # we need to support quoting of raw parameters from OpenVPN CLI
     # see https://vyos.dev/T1632
     render(cfg_file.format(**openvpn), 'openvpn/server.conf.j2', openvpn,
-           formater=lambda _: _.replace("&quot;", '"'), user=user, group=group)
+           formatter=lambda _: _.replace("&quot;", '"'), user=user, group=group)
 
     # Render 20-override.conf for OpenVPN service
     render(service_file.format(**openvpn), 'openvpn/service-override.conf.j2', openvpn,
-           formater=lambda _: _.replace("&quot;", '"'), user=user, group=group)
+           formatter=lambda _: _.replace("&quot;", '"'), user=user, group=group)
     # Reload systemd services config to apply an override
     call(f'systemctl daemon-reload')
 
@@ -797,12 +968,11 @@ def apply(openvpn):
         if interface_exists(interface):
             VTunIf(interface).remove()
 
-    # dynamically load/unload DCO Kernel extension if requested
+    # dynamically load the DCO Kernel extension if requested. It is never
+    # unloaded: like vxlan, geneve or l2tpv3 we leave the module in place
     dco_module = 'ovpn'
     if 'module_load_dco' in openvpn:
         check_kmod(dco_module)
-    else:
-        unload_kmod(dco_module)
 
     # Now bail out early if interface is disabled or got deleted
     if 'deleted' in openvpn or 'disable' in openvpn:
@@ -813,12 +983,37 @@ def apply(openvpn):
     # or if address will be assign later
     if 'local_host' in openvpn:
         if not is_addr_assigned(openvpn['local_host']):
-            cmd('sysctl -w net.ipv4.ip_nonlocal_bind=1')
+            cmdl(['sysctl', '-w', 'net.ipv4.ip_nonlocal_bind=1'])
+
+    # The interface type follows the data path, and OpenVPN adopts whatever it
+    # finds - including an "ovpn" device in the wrong operating mode, which
+    # then rejects every peer. Drop a leftover that no longer matches. Only do
+    # so when the daemon is restarted below, or a commit that leaves it running
+    # would take the interface away from underneath it.
+    if 'restart_required' in openvpn and interface_exists(interface):
+        if dict_search('offload.dco', openvpn) is None:
+            drop = get_ovpn_mode(interface) is not None
+        elif openvpn['mode'] == 'server':
+            drop = get_ovpn_mode(interface) != OVPN_MODE_MP
+        else:
+            drop = get_ovpn_mode(interface) != OVPN_MODE_P2P
+
+        # The Kernel pins tun against tap when the device is made and refuses
+        # to hand a "tap" device to a daemon asking for a "tun" one. An "ovpn"
+        # device carries no such type, hence the None.
+        if not drop:
+            tmp = dict_search(
+                'linkinfo.info_data.type', get_interface_config(interface)
+            )
+            drop = tmp is not None and tmp != openvpn['device_type']
+
+        if drop:
+            VTunIf(interface).remove()
 
     # No matching OpenVPN process running - maybe it got killed or none
     # existed - nevertheless, spawn new OpenVPN process
 
-    if not openvpn.get('no_restart_crl'):
+    if not openvpn.get('no_restart_crl') and not openvpn.get('client_only_changed'):
         action = 'reload-or-restart'
         if 'restart_required' in openvpn:
             action = 'restart'
@@ -826,6 +1021,9 @@ def apply(openvpn):
 
     o = VTunIf(**openvpn)
     o.update(openvpn)
+
+    # run the dependents
+    call_dependents()
 
     return None
 

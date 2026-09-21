@@ -25,6 +25,7 @@ from vyos.config import Config
 from vyos.configdep import set_dependents
 from vyos.configdep import call_dependents
 from vyos.configdict import get_interface_dict
+from vyos.configdict import is_vrf_changed
 from vyos.configdict import dict_merge
 from vyos.configverify import verify_address
 from vyos.configverify import verify_bridge_delete
@@ -92,7 +93,7 @@ def get_config(config=None):
         conf = Config()
     base = ['interfaces', 'wireless']
 
-    _, wifi = get_interface_dict(conf, base)
+    ifname, wifi = get_interface_dict(conf, base)
 
     # retrieve global Wireless regulatory domain setting
     if conf.exists(country_code_path):
@@ -105,7 +106,7 @@ def get_config(config=None):
         if wifi.from_defaults(['security', 'wpa']): # if not set by user
             del wifi['security']['wpa']
 
-    # XXX: Jinja2 can not operate on a dictionary key when it starts of with a number
+    # XXX: Jinja2 cannot operate on a dictionary key when it starts of with a number
     if '40mhz_incapable' in (dict_search('capabilities.ht', wifi) or []):
         wifi['capabilities']['ht']['fourtymhz_incapable'] = wifi['capabilities']['ht']['40mhz_incapable']
         del wifi['capabilities']['ht']['40mhz_incapable']
@@ -144,6 +145,10 @@ def get_config(config=None):
     # Protocols static arp dependency
     if 'static_arp' in wifi:
         set_dependents('static_arp', conf)
+
+    # Check vrf membership, to ensure firewall is updated
+    if is_vrf_changed(conf, ifname):
+        set_dependents('firewall', conf)
 
     return wifi
 
@@ -317,7 +322,11 @@ def apply(wifi):
     call(f'systemctl stop wpa_supplicant@{interface}.service')
 
     if 'deleted' in wifi:
-        WiFiIf(**wifi).remove()
+        if interface_exists(interface):
+            WiFiIf(**wifi).remove()
+
+        # run the dependents and return
+        call_dependents()
         return None
 
     while (is_systemd_service_running(f'hostapd@{interface}.service') or \
@@ -393,8 +402,8 @@ def apply(wifi):
         elif wifi['type'] == 'station':
             call(f'systemctl start wpa_supplicant@{interface}.service')
 
-    if 'static_arp' in wifi:
-        call_dependents()
+    # run the dependents
+    call_dependents()
 
     return None
 

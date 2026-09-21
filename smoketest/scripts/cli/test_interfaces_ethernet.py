@@ -35,7 +35,7 @@ from vyos.ifconfig import Section
 from vyos.utils.file import read_file
 from vyos.utils.network import is_intf_addr_assigned
 from vyos.utils.network import is_ipv6_link_local
-from vyos.utils.process import cmd
+from vyos.utils.process import cmdl
 from vyos.utils.process import process_named_running
 from vyos.utils.process import popen
 
@@ -183,7 +183,7 @@ class EthernetInterfaceTest(BasicInterfaceTest.TestCase):
         for interface in self._interfaces:
             # We do not use vyos.ethtool here to not have any chance
             # for invalid testcases. Re-gain data by hand
-            tmp = cmd(f'sudo ethtool --json --show-ring {interface}')
+            tmp = cmdl(['ethtool', '--json', '--show-ring', interface], sudo=True)
             tmp = loads(tmp)
             max_rx = str(tmp[0]['rx-max'])
             max_tx = str(tmp[0]['tx-max'])
@@ -194,7 +194,7 @@ class EthernetInterfaceTest(BasicInterfaceTest.TestCase):
         self.cli_commit()
 
         for interface in self._interfaces:
-            tmp = cmd(f'sudo ethtool --json --show-ring {interface}')
+            tmp = cmdl(['ethtool', '--json', '--show-ring', interface], sudo=True)
             tmp = loads(tmp)
             max_rx = str(tmp[0]['rx-max'])
             max_tx = str(tmp[0]['tx-max'])
@@ -229,6 +229,10 @@ class EthernetInterfaceTest(BasicInterfaceTest.TestCase):
                     msg = 'Driver does not fully support coalesce configuration'
                     with self.assertRaisesRegex(ConfigSessionError, msg):
                         self.cli_commit()
+                    # the failed commit leaves rx-usecs/tx-usecs staged in
+                    # the candidate config (commit() does not auto-rollback) -
+                    # discard it so it doesn't leak into the next interface
+                    self.cli_discard()
                     continue
 
                 # To find out the supported features
@@ -246,9 +250,9 @@ class EthernetInterfaceTest(BasicInterfaceTest.TestCase):
                 # Force adaptive to be disabled if it is already enabled
                 params = coalesce.get_coalesce(interface)
                 if supported_rx_usecs and params['adaptive_rx']:
-                    cmd(f'sudo ethtool --coalesce {interface} adaptive-rx off')
+                    cmdl(['ethtool', '--coalesce', interface, 'adaptive-rx', 'off'], sudo=True)
                 if supported_tx_usecs and params['adaptive_tx']:
-                    cmd(f'sudo ethtool --coalesce {interface} adaptive-tx off')
+                    cmdl(['ethtool', '--coalesce', interface, 'adaptive-tx', 'off'], sudo=True)
 
                 # Commit CLI configuration to apply coalescing
                 self.cli_commit()
@@ -287,17 +291,25 @@ class EthernetInterfaceTest(BasicInterfaceTest.TestCase):
 
     def test_ethtool_flow_control(self):
         for interface in self._interfaces:
+            ethtool = Ethtool(interface)
             # Disable flow-control
             self.cli_set(self._base_path + [interface, 'disable-flow-control'])
-            # Check current flow-control state on ethernet interface
-            out, err = popen(f'sudo ethtool --json --show-pause {interface}')
-            # Flow-control not supported - test if it bails out with a proper
-            # this is a dynamic path where err = 1 on VMware, but err = 0 on
-            # a physical box.
-            if bool(err):
+
+            # Ask the same capability check the CLI commit itself uses,
+            # rather than a raw ethtool --show-pause probe: some drivers
+            # (virtio_net, vmxnet3, xen_netfront, ...) support querying
+            # pause parameters but not changing them, so a bare --show-pause
+            # exit code is not a reliable predictor of whether the commit
+            # will succeed.
+            if not ethtool.check_flow_control():
                 with self.assertRaises(ConfigSessionError):
                     self.cli_commit()
+                # the failed commit leaves disable-flow-control staged in
+                # the candidate config (commit() does not auto-rollback) -
+                # discard it so it doesn't leak into the next interface
+                self.cli_discard()
             else:
+                out, err = popen(f'sudo ethtool --json --show-pause {interface}')
                 out = loads(out)
                 # Flow control is on
                 self.assertTrue(out[0]['autonegotiate'])
@@ -318,6 +330,31 @@ class EthernetInterfaceTest(BasicInterfaceTest.TestCase):
         for interface in self._interfaces:
             frrconfig = self.getFRRconfig(f'interface {interface}', stop_section='^exit')
             self.assertIn(' evpn mh uplink', frrconfig)
+
+    def test_ethtool_offload_rx(self):
+        for interface in self._interfaces:
+            ethtool = Ethtool(interface)
+            active, fixed = ethtool.get_rx_checksumming()
+            
+            # Skip if adapter does not support changing rx checksumming
+            if fixed:
+                continue
+
+            # Enable rx offload
+            self.cli_set(self._base_path + [interface, 'offload', 'rx'])
+            self.cli_commit()
+
+            ethtool = Ethtool(interface)
+            active, _ = ethtool.get_rx_checksumming()
+            self.assertTrue(active)
+
+            # Disable rx offload
+            self.cli_delete(self._base_path + [interface, 'offload', 'rx'])
+            self.cli_commit()
+
+            ethtool = Ethtool(interface)
+            active, _ = ethtool.get_rx_checksumming()
+            self.assertFalse(active)
 
     def test_switchdev(self):
         interface = self._interfaces[0]

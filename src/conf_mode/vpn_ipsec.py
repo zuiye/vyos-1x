@@ -50,7 +50,6 @@ from vyos.utils.network import interface_exists
 from vyos.utils.dict import dict_search
 from vyos.utils.dict import dict_search_args
 from vyos.utils.process import call
-from vyos.utils.vti_updown_db import vti_updown_db_exists
 from vyos.utils.vti_updown_db import open_vti_updown_db_for_create_or_update
 from vyos.utils.vti_updown_db import remove_vti_updown_db
 from vyos import ConfigError
@@ -66,6 +65,7 @@ charon_conf        = '/etc/strongswan.d/charon.conf'
 charon_dhcp_conf   = '/etc/strongswan.d/charon/dhcp.conf'
 charon_radius_conf = '/etc/strongswan.d/charon/eap-radius.conf'
 charon_systemd_conf = '/etc/strongswan.d/charon-systemd.conf'
+charon_logging_conf = '/etc/strongswan.d/charon-logging.conf'
 interface_conf     = '/etc/strongswan.d/interfaces_use.conf'
 swanctl_conf       = f'{swanctl_dir}/swanctl.conf'
 
@@ -441,14 +441,14 @@ def verify(ipsec):
 
                 if 'pool' in ra_conf:
                     if {'dhcp', 'radius'} <= set(ra_conf['pool']):
-                        raise ConfigError(f'Can not use both DHCP and RADIUS for address allocation '\
+                        raise ConfigError(f'Cannot use both DHCP and RADIUS for address allocation '\
                                           f'at the same time for "{name}"!')
 
                     if 'dhcp' in ra_conf['pool'] and len(ra_conf['pool']) > 1:
-                        raise ConfigError(f'Can not use DHCP and a predefined address pool for "{name}"!')
+                        raise ConfigError(f'Cannot use DHCP and a predefined address pool for "{name}"!')
 
                     if 'radius' in ra_conf['pool'] and len(ra_conf['pool']) > 1:
-                        raise ConfigError(f'Can not use RADIUS and a predefined address pool for "{name}"!')
+                        raise ConfigError(f'Cannot use RADIUS and a predefined address pool for "{name}"!')
 
                     for pool in ra_conf['pool']:
                         if pool == 'dhcp':
@@ -710,6 +710,22 @@ def verify(ipsec):
                         f'Childless IKE SAs be used with IKEv2! Please configure IKEv2 key-exchange in ike-group "{ike}".'
                     )
 
+            # Get the referenced IKE group config
+            ike_group_name = peer_conf.get('ike_group')
+            ike_group = ipsec['ike_group'].get(ike_group_name, {})
+
+            # 'ikev2-reauth' only valid for IKEv2
+            peer_reauth = peer_conf.get('ikev2_reauth')
+            reauth_ike_group_configured = (
+                peer_reauth == 'inherit' and 'ikev2_reauth' in ike_group
+            )
+            if peer_reauth == 'yes' or reauth_ike_group_configured:
+                if ike_group.get('key_exchange') != 'ikev2':
+                    raise ConfigError(
+                        'ikev2-reauth requires key-exchange ikev2 in IKE group! '
+                        f'Please configure IKEv2 key-exchange in ike-group "{ike_group_name}".'
+                    )
+
 
 def cleanup_pki_files():
     for path in [CERT_PATH, CA_PATH, CRL_PATH, KEY_PATH, PUBKEY_PATH]:
@@ -767,7 +783,15 @@ def generate(ipsec):
     cleanup_pki_files()
 
     if not ipsec or 'deleted' in ipsec:
-        for config_file in [charon_dhcp_conf, charon_radius_conf, interface_conf, swanctl_conf]:
+        delete_files = (
+            charon_dhcp_conf,
+            charon_radius_conf,
+            charon_systemd_conf,
+            charon_logging_conf,
+            interface_conf,
+            swanctl_conf,
+        )
+        for config_file in delete_files:
             if os.path.isfile(config_file):
                 os.unlink(config_file)
         render(charon_conf, 'ipsec/charon.j2', {'install_routes': default_install_routes})
@@ -866,6 +890,7 @@ def generate(ipsec):
     render(charon_dhcp_conf, 'ipsec/charon/dhcp.conf.j2', ipsec)
     render(charon_radius_conf, 'ipsec/charon/eap-radius.conf.j2', ipsec)
     render(charon_systemd_conf, 'ipsec/charon_systemd.conf.j2', ipsec)
+    render(charon_logging_conf, 'ipsec/charon_logging.conf.j2', ipsec)
     render(interface_conf, 'ipsec/interfaces_use.conf.j2', ipsec)
     render(swanctl_conf, 'ipsec/swanctl.conf.j2', ipsec)
 
@@ -874,8 +899,7 @@ def apply(ipsec):
     systemd_service = 'strongswan.service'
     if not ipsec or 'deleted' in ipsec:
         call(f'systemctl stop {systemd_service}')
-        if vti_updown_db_exists():
-            remove_vti_updown_db()
+        remove_vti_updown_db()
     else:
         call(f'systemctl reload-or-restart {systemd_service}')
         if ipsec['enabled_vti_interfaces']:
@@ -883,7 +907,7 @@ def apply(ipsec):
                 db.removeAllOtherInterfaces(ipsec['enabled_vti_interfaces'])
                 db.setPersistentInterfaces(ipsec['persistent_vti_interfaces'])
                 db.commit(lambda interface: ipsec['vti_interface_dicts'][interface])
-        elif vti_updown_db_exists():
+        else:
             remove_vti_updown_db()
     if ipsec:
         if ipsec.get('nhrp_exists', False):

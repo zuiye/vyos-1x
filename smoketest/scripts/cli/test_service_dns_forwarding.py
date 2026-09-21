@@ -131,6 +131,28 @@ class TestServicePowerDNS(VyOSUnitTestSHIM.TestCase):
         tmp = get_config_value('local-port')
         self.assertEqual(tmp, '53')
 
+    # PowerDNS cache-related recursor options
+    def test_recursor_cache_options(self):
+        ttl_percent = '10'
+        nothing_below_nxdomain = 'yes'
+        minimum_ttl_override = '30'
+
+        self.cli_set(base_path + ['ttl-percent', ttl_percent])
+        self.cli_set(base_path + ['nothing-below-nxdomain', nothing_below_nxdomain])
+        self.cli_set(base_path + ['minimum-ttl-override', minimum_ttl_override])
+
+        self.cli_commit()
+
+        self.assertEqual(get_config_value('refresh-on-ttl-perc'), ttl_percent)
+        self.assertEqual(get_config_value('nothing-below-nxdomain'), nothing_below_nxdomain)
+        self.assertEqual(get_config_value('minimum-ttl-override'), minimum_ttl_override)
+
+    def test_nothing_below_nxdomain(self):
+        for option in ['no', 'dnssec', 'yes']:
+            self.cli_set(base_path + ['nothing-below-nxdomain', option])
+            self.cli_commit()
+            self.assertEqual(get_config_value('nothing-below-nxdomain'), option)
+
     def test_dnssec(self):
         # DNSSEC option testing
         options = ['off', 'process-no-validate', 'process', 'log-fail', 'validate']
@@ -225,6 +247,44 @@ class TestServicePowerDNS(VyOSUnitTestSHIM.TestCase):
         # verify dns64-prefix configuration
         tmp = get_config_value('dns64-prefix')
         self.assertEqual(tmp, dns_prefix)
+
+    def test_recursion_exclude_address(self):
+        recursion_exclude_address = [
+            '198.18.0.0/15',
+            '!127.0.0.0/8',
+            '2001:db8:ffff::1',
+            '!2001:db8::/32',
+        ]
+        for network in recursion_exclude_address:
+            self.cli_set(base_path + ['recursion-exclude-address', network])
+
+        self.cli_commit()
+
+        self.assertEqual(
+            get_config_value(r'dont-query\+'), ','.join(recursion_exclude_address)
+        )
+
+        # Removing all configured values must remove the incremental setting,
+        # allowing PowerDNS to use its native defaults again.
+        self.cli_delete(base_path + ['recursion-exclude-address'])
+        self.cli_commit()
+        config = read_file(CONFIG_FILE)
+        self.assertNotIn('\ndont-query=', config)
+        self.assertNotIn('\ndont-query+=', config)
+
+    def test_recursion_exclude_address_conflicting_entry_order(self):
+        self.cli_set(base_path + ['recursion-exclude-address', '1.0.0.0/8'])
+        self.cli_set(base_path + ['recursion-exclude-address', '!1.0.0.0/8'])
+        self.cli_commit()
+        self.assertEqual(get_config_value(r'dont-query\+'), '1.0.0.0/8,!1.0.0.0/8')
+
+        self.cli_delete(base_path + ['recursion-exclude-address'])
+        self.cli_commit()
+
+        self.cli_set(base_path + ['recursion-exclude-address', '!1.0.0.0/8'])
+        self.cli_set(base_path + ['recursion-exclude-address', '1.0.0.0/8'])
+        self.cli_commit()
+        self.assertEqual(get_config_value(r'dont-query\+'), '!1.0.0.0/8,1.0.0.0/8')
 
     def test_exclude_throttle_adress(self):
         exclude_throttle_adress_examples = [

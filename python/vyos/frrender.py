@@ -31,12 +31,10 @@ from vyos.config import config_dict_merge
 from vyos.configdict import get_dhcp_interfaces
 from vyos.configdict import get_pppoe_interfaces
 from vyos.defaults import frr_debug_enable
-from vyos.defaults import static_route_dhcp_interfaces_path
 from vyos.utils.dict import dict_search
 from vyos.utils.dict import dict_set_nested
-from vyos.utils.file import read_file
 from vyos.utils.file import write_file
-from vyos.utils.process import cmd
+from vyos.utils.process import cmdl
 from vyos.utils.process import rc_cmd
 from vyos.template import get_dhcp_router
 from vyos.template import render_to_string
@@ -467,7 +465,9 @@ def get_frrender_dict(conf: Config, argv=None) -> dict:
                                   no_tag_node_value_mangle=True)
         dict.update({'static' : static})
     elif conf.exists_effective(static_cli_path):
-        dict.update({'static' : deleted_protocol})
+        # Use a copy - static.dhcp/static.pppoe below may be merged in,
+        # and deleted_protocol is shared by reference with other protocols
+        dict.update({'static' : deleted_protocol.copy()})
 
     # We need to check the CLI if the NHRP node is present and thus load in all the default
     # values present on the CLI - that's why we have if conf.exists()
@@ -487,6 +487,12 @@ def get_frrender_dict(conf: Config, argv=None) -> dict:
 
     tmp = get_pppoe_interfaces(conf)
     if tmp: dict_set_nested('static.pppoe', tmp, dict)
+
+    # T6991/T9054: "protocols static" may have been deleted while a DHCP or
+    # PPPoE interface still contributes a default route - in that case the
+    # static section must still be rendered, so drop the deletion marker
+    if 'static' in dict and ('dhcp' in dict['static'] or 'pppoe' in dict['static']):
+        dict['static'].pop('deleted', None)
 
     # keep a re-usable list of dependent VRFs
     dependent_vrfs_default = {}
@@ -615,7 +621,9 @@ def get_frrender_dict(conf: Config, argv=None) -> dict:
                                               no_tag_node_value_mangle=True)
                 dict_set_nested(f'{protocol_dict_path}.static', static, vrf)
             elif conf.exists_effective(static_vrf_path):
-                dict_set_nested(f'{protocol_dict_path}.static', deleted_protocol, vrf)
+                # Use a copy - static.dhcp/static.pppoe below may be merged in,
+                # and deleted_protocol is shared by reference with other protocols
+                dict_set_nested(f'{protocol_dict_path}.static', deleted_protocol.copy(), vrf)
 
             # T3680 - get a list of all interfaces currently configured to use DHCP
             tmp = get_dhcp_interfaces(conf, vrf_name)
@@ -623,6 +631,14 @@ def get_frrender_dict(conf: Config, argv=None) -> dict:
 
             tmp = get_pppoe_interfaces(conf, vrf_name)
             if tmp: dict_set_nested(f'name.{vrf_name}.protocols.static.pppoe', tmp, vrf)
+
+            # T6991/T9054: "protocols static" may have been deleted while a
+            # DHCP or PPPoE interface still contributes a default route - in
+            # that case the static section must still be rendered, so drop
+            # the deletion marker
+            static_dict = dict_search(f'{protocol_dict_path}.static', vrf)
+            if static_dict and ('dhcp' in static_dict or 'pppoe' in static_dict):
+                static_dict.pop('deleted', None)
 
             vrf_vni_path = ['vrf', 'name', vrf_name, 'vni']
             if conf.exists(vrf_vni_path):
@@ -674,6 +690,52 @@ def get_frrender_dict(conf: Config, argv=None) -> dict:
 
     return dict
 
+def get_dhcp_route_interfaces(config_dict) -> set:
+    """Collect all interfaces whose static route configuration is derived from a
+    DHCP lease. Two CLI constructs end up reading the DHCP lease file via the
+    "get_dhcp_router" Jinja filter and thus depend on the current lease:
+
+    - "protocols static route <prefix> dhcp-interface <ifname>", either directly
+      or below "protocols static table <id>"
+    - the default route implied by "interfaces <type> <ifname> address dhcp"
+
+    Both variants exist in the default VRF as well as inside any named VRF.
+    """
+    interfaces = set()
+
+    def _add_from_routes(route_conf):
+        if not isinstance(route_conf, dict):
+            return
+        for prefix_options in route_conf.values():
+            interfaces.update(prefix_options.get('dhcp_interface', []))
+
+    def _add_from_static(static_conf):
+        if not isinstance(static_conf, dict):
+            return
+        _add_from_routes(static_conf.get('route'))
+        # Routes in a dedicated routing table use the same "dhcp-interface"
+        # node, thus they depend on the DHCP lease in the very same way
+        for table_config in static_conf.get('table', {}).values():
+            if isinstance(table_config, dict):
+                _add_from_routes(table_config.get('route'))
+        for ifname, if_config in static_conf.get('dhcp', {}).items():
+            # An interface explicitly opting out of the default route does not
+            # contribute a route, thus a lease change is irrelevant for it
+            if dict_search('dhcp_options.no_default_route', if_config) != None:
+                continue
+            interfaces.add(ifname)
+
+    if not isinstance(config_dict, dict):
+        return interfaces
+
+    _add_from_static(config_dict.get('static'))
+    for vrf_name in dict_search('vrf.name', config_dict) or {}:
+        _add_from_static(
+            dict_search(f'vrf.name.{vrf_name}.protocols.static', config_dict)
+        )
+
+    return interfaces
+
 class FRRender:
     cached_config_dict = {}
     cached_dhcp_gateways = {}
@@ -689,9 +751,14 @@ class FRRender:
             tmp = type(config_dict)
             raise ValueError(f'Config must be of type "dict" and not "{tmp}"!')
 
+        # T8465: the rendered configuration embeds the current DHCP gateway,
+        # which changes independently of the CLI configuration. The interface
+        # list must be derived from the configuration itself - the DHCP hook
+        # list on disk is only written by protocols_static.py, which does not
+        # run on an interface-only commit.
         dhcp_gateways = {
             interface: get_dhcp_router(interface)
-            for interface in read_file(static_route_dhcp_interfaces_path, '').split()
+            for interface in get_dhcp_route_interfaces(config_dict)
         }
 
         if (
@@ -778,7 +845,7 @@ class FRRender:
             return output
 
         debug('FRR:        START CONFIGURATION RENDERING')
-        # we can not reload an empty file, thus we always embed the marker
+        # we cannot reload an empty file, thus we always embed the marker
         output = '!\n'
 
         # FRR profile configuration
@@ -813,10 +880,15 @@ class FRRender:
             for vrf, vrf_config in config_dict['vrf']['name'].items():
                 if 'protocols' not in vrf_config:
                     continue
-                for protocol in vrf_config['protocols']:
-                    vrf_config['protocols'][protocol]['vrf'] = vrf
 
-                output += inline_helper(vrf_config['protocols'])
+                # Do not mutate config_dict in-place — it is also stored as
+                # cached_config_dict and in-place mutation breaks change
+                # detection on the next commit (T7931).
+                protocols = {
+                    protocol: {**proto_dict, 'vrf': vrf}
+                    for protocol, proto_dict in vrf_config['protocols'].items()
+                }
+                output += inline_helper(protocols)
 
         # remove any accidentally added empty newline to not confuse FRR
         output = os.linesep.join([s for s in output.splitlines() if s])
@@ -857,4 +929,4 @@ class FRRender:
             raise ConfigError(emsg)
 
         # T3217: Save FRR configuration to /run/frr/config/frr.conf
-        return cmd('/usr/bin/vtysh -n --writeconfig')
+        return cmdl(['/usr/bin/vtysh', '-n', '--writeconfig'])

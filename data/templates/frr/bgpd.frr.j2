@@ -1,3 +1,10 @@
+!
+{% if parameters.input_queue_limit is vyos_defined %}
+ bgp input-queue-limit {{ parameters.input_queue_limit }}
+{% endif %}
+{% if parameters.output_queue_limit is vyos_defined %}
+ bgp output-queue-limit {{ parameters.output_queue_limit }}
+{% endif %}
 {### MACRO definition for recurring peer patter, this can be either fed by a ###}
 {### peer-group or an individual BGP neighbor ###}
 {% macro bgp_neighbor(neighbor, config, peer_group=false) %}
@@ -428,14 +435,23 @@ router bgp {{ system_as }} {{ 'vrf ' ~ vrf if vrf is vyos_defined }} {{ 'as-nota
 {%         if afi_config.rd.vpn.export is vyos_defined %}
   rd vpn export {{ afi_config.rd.vpn.export }}
 {%         endif %}
+{# T8990: emit FRR's canonical "rt vpn" keyword (not the "route-target vpn" #}
+{# alias), and fold an identical import+export into "both" exactly as FRR #}
+{# does. FRR only folds on an identical, order-sensitive match, which is #}
+{# what the string compare below tests - so reordered or differing RT lists #}
+{# stay split on both sides too. This keeps the rendered config #}
+{# byte-identical to FRR's running config, so frr-reload produces no diff #}
+{# that would otherwise flap leaked routes on every commit. #}
 {%         if afi_config.route_target.vpn.both is vyos_defined %}
-  route-target vpn both {{ afi_config.route_target.vpn.both }}
+  rt vpn both {{ afi_config.route_target.vpn.both }}
+{%         elif afi_config.route_target.vpn.export is vyos_defined and afi_config.route_target.vpn.export == afi_config.route_target.vpn.import %}
+  rt vpn both {{ afi_config.route_target.vpn.export }}
 {%         else %}
 {%             if afi_config.route_target.vpn.export is vyos_defined %}
-  route-target vpn export {{ afi_config.route_target.vpn.export }}
+  rt vpn export {{ afi_config.route_target.vpn.export }}
 {%             endif %}
 {%             if afi_config.route_target.vpn.import is vyos_defined %}
-  route-target vpn import {{ afi_config.route_target.vpn.import }}
+  rt vpn import {{ afi_config.route_target.vpn.import }}
 {%             endif %}
 {%         endif %}
 {%         if afi_config.route_target.both is vyos_defined %}
@@ -529,7 +545,7 @@ router bgp {{ system_as }} {{ 'vrf ' ~ vrf if vrf is vyos_defined }} {{ 'as-nota
 {%                 endif %}
 {%             endif %}
 {%             if bmp_config.address is vyos_defined %}
-  bmp connect {{ bmp_config.address }} port {{ bmp_config.port }} min-retry {{ bmp_config.min_retry }} max-retry {{ bmp_config.max_retry }}
+  bmp connect {{ bmp_config.address }} port {{ bmp_config.port }} min-retry {{ bmp_config.min_retry }} max-retry {{ bmp_config.max_retry }} {{ 'source-interface ' ~ bmp_config.source_interface if bmp_config.source_interface is vyos_defined }}
 {%             endif %}
 {%         endfor %}
  exit
@@ -641,7 +657,7 @@ router bgp {{ system_as }} {{ 'vrf ' ~ vrf if vrf is vyos_defined }} {{ 'as-nota
  bgp network import-check
 {% endif %}
 {% if parameters.route_reflector_allow_outbound_policy is vyos_defined %}
-bgp route-reflector allow-outbound-policy
+ bgp route-reflector allow-outbound-policy
 {% endif %}
 {% if parameters.no_client_to_client_reflection is vyos_defined %}
  no bgp client-to-client reflection

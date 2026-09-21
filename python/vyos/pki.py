@@ -26,6 +26,8 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import dh
 from cryptography.hazmat.primitives.asymmetric import dsa
 from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric import ed25519
+from cryptography.hazmat.primitives.asymmetric import ed448
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.asymmetric import rsa
 
@@ -207,7 +209,16 @@ def create_certificate_revocation_list(ca_cert, ca_private_key, serial_numbers=[
     builder = x509.CertificateRevocationListBuilder() \
         .issuer_name(ca_cert.subject) \
         .last_update(datetime.datetime.today()) \
-        .next_update(datetime.datetime.today() + datetime.timedelta(1, 0, 0))
+        .next_update(datetime.datetime.today() + datetime.timedelta(1, 0, 0)) \
+        .add_extension(add_key_identifier(ca_cert), critical=False) \
+        .add_extension(
+            x509.CRLNumber(
+                int(
+                    datetime.datetime.now(datetime.timezone.utc).timestamp() * 1_000_000
+                )
+            ),
+            critical=False,
+        )
 
     for serial_number in serial_numbers:
         revoked_cert = x509.RevokedCertificateBuilder() \
@@ -381,6 +392,14 @@ def verify_certificate(cert, ca_cert):
                 cert.signature,
                 cert.tbs_certificate_bytes,
                 signature_algorithm=ec.ECDSA(cert.signature_hash_algorithm))
+        elif isinstance(ca_public_key, ed25519.Ed25519PublicKey):
+            ca_public_key.verify(
+                cert.signature,
+                cert.tbs_certificate_bytes)
+        elif isinstance(ca_public_key, ed448.Ed448PublicKey):
+            ca_public_key.verify(
+                cert.signature,
+                cert.tbs_certificate_bytes)
         else:
             return False # We cannot verify it
         return True
@@ -410,6 +429,14 @@ def verify_crl(crl, ca_cert):
                 crl.signature,
                 crl.tbs_certlist_bytes,
                 signature_algorithm=ec.ECDSA(crl.signature_hash_algorithm))
+        elif isinstance(ca_public_key, ed25519.Ed25519PublicKey):
+            ca_public_key.verify(
+                crl.signature,
+                crl.tbs_certlist_bytes)
+        elif isinstance(ca_public_key, ed448.Ed448PublicKey):
+            ca_public_key.verify(
+                crl.signature,
+                crl.tbs_certlist_bytes)
         else:
             return False # We cannot verify it
         return True
@@ -460,6 +487,72 @@ def find_chain(cert, ca_certs):
             chain.append(parent)
 
     return chain
+
+# ACME certificates are managed entirely by certbot under
+# {vyos_certbot_dir}/live/<cert_name>/ - the intermediate CA certbot
+# obtained alongside the leaf cert (chain.pem) is derived data, not
+# configuration, so it is never written to the CLI. AUTOCHAIN_<cert_name>
+# is only ever used as an in-memory dict key (see
+# Config.get_config_dict()'s with_pki handling and
+# src/op_mode/pki.py's get_config_ca_certificate()) so consumers that
+# build a full certificate chain via find_chain() - and "show pki ca" -
+# see the same data they would if it had been manually configured,
+# without it ever being a real, settable, or deletable CLI object.
+AUTOCHAIN_PREFIX = 'AUTOCHAIN_'
+
+def acme_chain_ca_entry(vyos_certbot_dir: str, cert_name: str) -> dict:
+    """Build synthetic 'pki ca <name>'-shaped dict entries
+    (`{<name>: {'certificate': <base64>}, ...}`) for every certificate in
+    an ACME certificate's chain, read live from certbot's own chain.pem.
+
+    certbot commonly writes more than just the immediate intermediate to
+    chain.pem (e.g. the intermediate's own issuing root too), and every
+    one of them is needed for find_chain() to walk the full chain - a
+    single 'pki ca' object only ever holds one certificate, so each one
+    gets its own synthetic entry here.
+
+    Returns an empty dict if chain.pem is not (yet) present - e.g. the
+    certificate has not been issued yet, or a prior request failed - so
+    callers can skip this certificate's chain gracefully instead of
+    crashing.
+    """
+    import re
+    from vyos.utils.file import read_file
+    tmp = read_file(f'{vyos_certbot_dir}/live/{cert_name}/chain.pem',
+                     defaultonfailure=None)
+    if tmp is None:
+        return {}
+
+    entries = {}
+    for block in re.findall(
+            r'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----',
+            tmp, re.DOTALL):
+        cert = load_certificate(block, wrap_tags=False)
+        if not cert:
+            continue
+        index = len(entries) + 1
+        name = f'{AUTOCHAIN_PREFIX}{cert_name}' if index == 1 else \
+               f'{AUTOCHAIN_PREFIX}{cert_name}_{index}'
+        chain_base64 = "".join(encode_certificate(cert).strip().split("\n")[1:-1])
+        entries[name] = {'certificate': chain_base64}
+    return entries
+
+def acme_chain_redundant(leaf_cert_base64: str, ca_certs: dict) -> bool:
+    """Return True if one of the already-configured CAs in ca_certs (a
+    'pki ca'-shaped dict, e.g. Config's pki_dict['ca']) directly signs the
+    given leaf certificate - meaning an explicit, manually-configured CA
+    already completes the chain, so synthesizing/showing an
+    AUTOCHAIN_<cert_name> entry (see acme_chain_ca_entry()) is redundant.
+    """
+    leaf_cert = load_certificate(leaf_cert_base64)
+    if not leaf_cert:
+        return False
+    loaded_ca_certs = [
+        load_certificate(ca['certificate'])
+        for ca in ca_certs.values() if 'certificate' in ca
+    ]
+    loaded_ca_certs = [cert for cert in loaded_ca_certs if cert]
+    return find_parent(leaf_cert, loaded_ca_certs) is not None
 
 def sort_ca_chain(ca_names, pki_node):
     def ca_cmp(ca_name1, ca_name2, pki_node):

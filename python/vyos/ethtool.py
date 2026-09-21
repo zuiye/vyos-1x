@@ -19,8 +19,6 @@ import contextlib
 from json import loads
 from vyos.utils.network import interface_exists
 from vyos.utils.process import popen
-from vyos.netlink import coalesce
-from vyos.netlink import timestamp
 
 # These drivers do not support using ethtool to change the speed, duplex, or
 # flow control settings
@@ -127,6 +125,12 @@ class Ethtool:
         if not bool(err):
             self._channels = out.lower()
 
+        # Imported here rather than at module scope: vyos.netlink.* imports
+        # pyroute2, which is by far the largest single cost on the vyos.ifconfig
+        # import path. Only code that actually constructs an Ethtool needs it.
+        from vyos.netlink import coalesce
+        from vyos.netlink import timestamp
+
         # Get information about NIC coalesce settings
         with contextlib.suppress(coalesce.CoalesceError, coalesce.GeneralNetlinkError):
             self._coalesce = coalesce.get_coalesce(ifname)
@@ -159,6 +163,9 @@ class Ethtool:
             fixed = bool(self._features[feature]['fixed'])
         return active, fixed
 
+    def get_rx_checksumming(self):
+        return self._get_generic('rx-checksumming')
+
     def get_generic_receive_offload(self):
         return self._get_generic('generic-receive-offload')
 
@@ -181,15 +188,17 @@ class Ethtool:
         # Configuration of RX/TX ring-buffers is not supported on every device,
         # thus when it's impossible return None
         if rx_tx not in ['rx', 'tx']:
-            ValueError('Ring-buffer type must be either "rx" or "tx"')
-        return str(self._ring_buffer.get(f'{rx_tx}-max', None))
+            raise ValueError('Ring-buffer type must be either "rx" or "tx"')
+        value = self._ring_buffer.get(f'{rx_tx}-max') if self._ring_buffer else None
+        return str(value) if value is not None else None
 
     def get_ring_buffer(self, rx_tx):
         # Configuration of RX/TX ring-buffers is not supported on every device,
         # thus when it's impossible return None
         if rx_tx not in ['rx', 'tx']:
-            ValueError('Ring-buffer type must be either "rx" or "tx"')
-        return str(self._ring_buffer.get(rx_tx, None))
+            raise ValueError('Ring-buffer type must be either "rx" or "tx"')
+        value = self._ring_buffer.get(rx_tx) if self._ring_buffer else None
+        return str(value) if value is not None else None
 
     def check_speed_duplex(self, speed, duplex):
         """ Check if the passed speed and duplex combination is supported by
@@ -215,6 +224,8 @@ class Ethtool:
 
     def check_flow_control(self):
         """ Check if the NIC supports flow-control """
+        if self.get_driver_name() in _drivers_without_speed_duplex_flow:
+            return False
         return bool(self._flow_control)
 
     def get_flow_control(self):

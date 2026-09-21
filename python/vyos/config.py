@@ -359,9 +359,38 @@ class Config(object):
                                             get_first_key=True)
             if pki_dict:
                 if 'certificate' in pki_dict:
+                    from vyos.defaults import directories
+                    from vyos.pki import acme_chain_ca_entry
+                    from vyos.pki import acme_chain_redundant
+                    vyos_certbot_dir = directories['certbot']
+                    # Snapshot of explicitly/manually configured CAs, taken
+                    # before any synthetic entries are added below
+                    real_ca_certs = dict(pki_dict.get('ca', {}))
+
                     for certificate in pki_dict['certificate']:
                         pki_dict['certificate'][certificate] = config_dict_mangle_acme(
                             certificate, pki_dict['certificate'][certificate])
+
+                        # If this is an ACME certificate, also make its
+                        # intermediate CA chain (read live from certbot's
+                        # own chain.pem, never persisted to the CLI)
+                        # available under pki.ca, the same way consumers
+                        # already look up any manually-configured CA, so
+                        # find_chain() can build the full chain for them -
+                        # unless an explicit, manually-configured CA
+                        # already completes the chain, making this
+                        # redundant.
+                        cert_conf = pki_dict['certificate'][certificate]
+                        leaf_cert = cert_conf.get('certificate')
+                        if leaf_cert and 'acme' in cert_conf and not acme_chain_redundant(
+                                leaf_cert, real_ca_certs):
+                            ca_dict = pki_dict.setdefault('ca', {})
+                            for autochain_name, chain_entry in acme_chain_ca_entry(
+                                    vyos_certbot_dir, certificate).items():
+                                # A real, manually-configured CLI CA object
+                                # with this name wins over the synthetic one
+                                if autochain_name not in ca_dict:
+                                    ca_dict[autochain_name] = chain_entry
 
                 conf_dict['pki'] = pki_dict
 
@@ -480,21 +509,24 @@ class Config(object):
         else:
             return(value)
 
-    def return_values(self, path, default=[]):
+    def return_values(self, path, default=None):
         """
         Retrieve all values of a multi-value leaf node in the running or proposed config
 
         Args:
             path (str): Configuration tree path
+            default (list): Value returned (as a copy) when the node does not exist or has no values. Defaults to an empty list.
 
         Returns:
             str list: Node values, if it has any
-            []: if node does not exist
+            default.copy(): if node does not exist or has no values
 
         Note:
             This function cannot be used outside a configuration session.
             In operational mode scripts, use ``return_effective_values``.
         """
+        if default is None:
+            default = []
         if self._session_config:
             try:
                 values = self._session_config.return_values(self._make_path(path))
@@ -508,17 +540,20 @@ class Config(object):
         else:
             return(values)
 
-    def list_nodes(self, path, default=[]):
+    def list_nodes(self, path, default=None):
         """
         Retrieve names of all children of a tag node in the running or proposed config
 
         Args:
             path (str): Configuration tree path
+            default (list): Value returned (as a copy) when the tag node does not exist or has no children. Defaults to an empty list.
 
         Returns:
-            string list: child node names
+            string list: child node names, or default.copy() if the node does not exist or has no children
 
         """
+        if default is None:
+            default = []
         if self._session_config:
             try:
                 nodes = self._session_config.list_nodes(self._make_path(path))
@@ -596,16 +631,19 @@ class Config(object):
         else:
             return(value)
 
-    def return_effective_values(self, path, default=[]):
+    def return_effective_values(self, path, default=None):
         """
         Retrieve all values of a multi-value node in a running (effective) config
 
         Args:
             path (str): Configuration tree path
+            default (list): Value returned (as a copy) when the node does not exist or has no values. Defaults to an empty list.
 
         Returns:
-            str list: A list of values
+            str list: A list of values, or default.copy() if the node does not exist or has no values
         """
+        if default is None:
+            default = []
         if self._running_config:
             try:
                 values = self._running_config.return_values(self._make_path(path))
@@ -619,16 +657,19 @@ class Config(object):
         else:
             return(values)
 
-    def list_effective_nodes(self, path, default=[]):
+    def list_effective_nodes(self, path, default=None):
         """
         Retrieve names of all children of a tag node in the running config
 
         Args:
             path (str): Configuration tree path
+            default (list): Value returned (as a copy) when the tag node does not exist or has no children. Defaults to an empty list.
 
         Returns:
-            str list: child node names
+            str list: child node names, or default.copy() if the node does not exist or has no children
         """
+        if default is None:
+            default = []
         if self._running_config:
             try:
                 nodes = self._running_config.list_nodes(self._make_path(path))

@@ -138,12 +138,16 @@ class TestServiceDHCPv6Server(VyOSUnitTestSHIM.TestCase):
 
         for client_suffix in range(1, 4):
             duid = f'00:01:00:01:12:34:56:78:aa:bb:cc:dd:ee:{client_suffix:02}'
-            ip = inc_ip(subnet, client_suffix)
-            prefix = inc_ip(subnet, client_suffix << 64) + '/64'
+            ip1 = inc_ip(subnet, client_suffix * 2 - 1)
+            ip2 = inc_ip(subnet, client_suffix * 2)
+            prefix1 = inc_ip(subnet, (client_suffix * 2 - 1) << 64) + '/64'
+            prefix2 = inc_ip(subnet, (client_suffix * 2) << 64) + '/64'
 
             self.cli_set(mapping + [f'client{client_suffix}', 'duid', duid])
-            self.cli_set(mapping + [f'client{client_suffix}', 'ipv6-address', ip])
-            self.cli_set(mapping + [f'client{client_suffix}', 'ipv6-prefix', prefix])
+            self.cli_set(mapping + [f'client{client_suffix}', 'ipv6-address', ip1])
+            self.cli_set(mapping + [f'client{client_suffix}', 'ipv6-address', ip2])
+            self.cli_set(mapping + [f'client{client_suffix}', 'ipv6-prefix', prefix1])
+            self.cli_set(mapping + [f'client{client_suffix}', 'ipv6-prefix', prefix2])
 
         # cannot have both mac-address and duid set
         with self.assertRaises(ConfigSessionError):
@@ -250,8 +254,10 @@ class TestServiceDHCPv6Server(VyOSUnitTestSHIM.TestCase):
 
         for client_suffix in range(1, 4):
             duid = f'00:01:00:01:12:34:56:78:aa:bb:cc:dd:ee:{client_suffix:02}'
-            ip = inc_ip(subnet, client_suffix)
-            prefix = inc_ip(subnet, client_suffix << 64) + '/64'
+            ip1 = inc_ip(subnet, client_suffix * 2 - 1)
+            ip2 = inc_ip(subnet, client_suffix * 2)
+            prefix1 = inc_ip(subnet, (client_suffix * 2 - 1) << 64) + '/64'
+            prefix2 = inc_ip(subnet, (client_suffix * 2) << 64) + '/64'
 
             self.verify_config_object(
                 obj,
@@ -259,8 +265,8 @@ class TestServiceDHCPv6Server(VyOSUnitTestSHIM.TestCase):
                 {
                     'hostname': f'client{client_suffix}',
                     'duid': duid,
-                    'ip-addresses': [ip],
-                    'prefixes': [prefix],
+                    'ip-addresses': [ip1, ip2],
+                    'prefixes': [prefix1, prefix2],
                 },
             )
 
@@ -361,6 +367,44 @@ class TestServiceDHCPv6Server(VyOSUnitTestSHIM.TestCase):
 
         # Check for running process
         self.assertTrue(process_named_running(PROCESS_NAME))
+
+    def test_static_mapping_duplicate_address_prefix(self):
+        shared_net_name = 'SMOKE-DUP'
+        pool = base_path + ['shared-network-name', shared_net_name, 'subnet', subnet]
+        mapping = pool + ['static-mapping']
+
+        self.cli_set(pool + ['subnet-id', '1'])
+        duid1 = '00:01:00:01:12:34:56:78:aa:bb:cc:dd:ee:01'
+        duid2 = '00:01:00:01:12:34:56:78:aa:bb:cc:dd:ee:02'
+        dup_addr = inc_ip(subnet, 10)
+        dup_prefix = inc_ip(subnet, 1 << 64) + '/64'
+
+        # commit valid config with a single address mapping
+        self.cli_set(mapping + ['client1', 'duid', duid1])
+        self.cli_set(mapping + ['client1', 'ipv6-address', dup_addr])
+        self.cli_commit()
+
+        # adding a second mapping with the same address must fail
+        self.cli_set(mapping + ['client2', 'duid', duid2])
+        self.cli_set(mapping + ['client2', 'ipv6-address', dup_addr])
+        with self.assertRaises(ConfigSessionError):
+            self.cli_commit()
+
+        self.cli_delete(mapping + ['client1'])
+        self.cli_commit()
+
+        # commit valid config with a single prefix mapping
+        self.cli_set(mapping + ['client1', 'duid', duid1])
+        self.cli_set(mapping + ['client1', 'ipv6-prefix', dup_prefix])
+        self.cli_commit()
+
+        # adding a second mapping with the same prefix must fail
+        self.cli_set(mapping + ['client2', 'ipv6-prefix', dup_prefix])
+        with self.assertRaises(ConfigSessionError):
+            self.cli_commit()
+
+        self.cli_delete(mapping + ['client1'])
+        self.cli_commit()
 
 
 if __name__ == '__main__':

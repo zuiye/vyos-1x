@@ -62,7 +62,7 @@ op_mode_definitions: $(op_xml_obj)
 
 	$(CURDIR)/python/vyos/xml_ref/generate_op_cache.py --xml-dir $(BUILD_DIR)/op-mode-definitions --export-json $(DATA_DIR)/op_cache.json || exit 1
 
-	# XXX: tcpdump, ping, traceroute and mtr must be able to recursivly call themselves as the
+	# XXX: tcpdump, ping, traceroute and mtr must be able to recursively call themselves as the
 	# options are provided from the scripts themselves
 	ln -s ../node.tag $(OP_TMPL_DIR)/ping/node.tag/node.tag/
 	ln -s ../node.tag $(OP_TMPL_DIR)/traceroute/node.tag/node.tag/
@@ -112,12 +112,12 @@ check_migration_scripts_executable:
 	@echo "Checking if migration scripts have executable bit set..."
 	find src/migration-scripts -type f -not -executable -print -exec false {} + || sh -c 'echo "Found files that are not executable! Add permissions." && exit 1'
 
-.PHONE: pylint
+.PHONY: pylint
 pylint: interface_definitions
 	@echo Running "pylint ..."
 	@set -e; \
-	PYTHONPATH="python/:smoketest/scripts/cli/" pylint --errors-only $(shell git ls-files python/**/*.py src/conf_mode/*.py src/op_mode/*.py src/migration-scripts src/services/vyos* smoketest/scripts); \
-	PYTHONPATH=python/ pylint --disable=all --enable=W0611 $(shell git ls-files *.py src/migration-scripts src/services)
+	PYTHONPATH="python/:smoketest/scripts/cli/" pylint --jobs 0 --errors-only $(shell git ls-files python/**/*.py src/conf_mode/*.py src/op_mode/*.py src/migration-scripts src/services/vyos* smoketest/scripts); \
+	PYTHONPATH=python/ pylint --jobs 0 --disable=all --enable=W0611 $(shell git ls-files *.py src/migration-scripts src/services)
 
 .PHONY: j2lint
 j2lint:

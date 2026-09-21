@@ -75,13 +75,54 @@ class TestMonitoringPrometheus(VyOSUnitTestSHIM.TestCase):
         self.assertTrue(process_named_running(NODE_EXPORTER_PROCESS_NAME))
 
     def test_02_frr_exporter(self):
+        optional_collectors = ['bgp-l2-vpn', 'pim']
+        collector_base = base_path + ['frr-exporter', 'collector']
         self.cli_set(base_path + ['frr-exporter', 'listen-address', listen_ip])
+
+        # commit changes
+        self.cli_commit()
+
+        # optional collectors and collector options are opt-in
+        file_content = read_file(frr_exporter_service_file)
+        self.assertNotIn('--collector.bgp.peer-descriptions', file_content)
+
+        for collector in optional_collectors:
+            self.cli_set(collector_base + [collector])
+
+        # BGP collector options
+        self.cli_set(collector_base + ['bgp', 'accept-filtered-prefixes'])
+        self.cli_set(collector_base + ['bgp', 'advertised-prefixes'])
+        self.cli_set(collector_base + ['bgp', 'peer-description', 'plain-text'])
+        self.cli_set(collector_base + ['bgp', 'peer-group'])
+        self.cli_set(collector_base + ['bgp', 'peer-hostname'])
+        self.cli_set(collector_base + ['bgp', 'peer-type'])
+        # OSPF collector options
+        self.cli_set(collector_base + ['ospf-instance', '1'])
+        self.cli_set(collector_base + ['ospf-instance', '2'])
+        # Route collector options
+        self.cli_set(collector_base + ['detailed-routes'])
 
         # commit changes
         self.cli_commit()
 
         file_content = read_file(frr_exporter_service_file)
         self.assertIn(f'{listen_ip}:9342', file_content)
+        # bgp6 collector is always enabled
+        self.assertIn('--collector.bgp6', file_content)
+        for collector in ['bgpl2vpn', 'pim']:
+            self.assertIn(f'--collector.{collector}', file_content)
+        for flag in [
+            '--collector.bgp.accepted-filtered-prefixes',
+            '--collector.bgp.advertised-prefixes',
+            '--collector.bgp.peer-descriptions',
+            '--collector.bgp.peer-descriptions.plain-text',
+            '--collector.bgp.peer-groups',
+            '--collector.bgp.peer-hostnames',
+            '--collector.bgp.peer-types',
+            '--collector.ospf.instances=1,2',
+            '--collector.route.detailed-routes',
+        ]:
+            self.assertIn(flag, file_content)
 
         # Check for running process
         self.assertTrue(process_named_running(FRR_EXPORTER_PROCESS_NAME))
@@ -157,6 +198,58 @@ class TestMonitoringPrometheus(VyOSUnitTestSHIM.TestCase):
 
         # Check for running process
         self.assertTrue(process_named_running(BLACKBOX_EXPORTER_PROCESS_NAME))
+
+    def test_05_blackbox_exporter_with_icmp(self):
+        vrf_name = 'bbx'
+        be_path = base_path + ['blackbox-exporter']
+        self.cli_set(be_path + ['listen-address', listen_ip])
+        self.cli_set(
+            be_path
+            + ['modules', 'icmp', 'name', 'ping4', 'preferred-ip-protocol', 'ipv4']
+        )
+
+        self.cli_commit()
+
+        # Verify CAP_NET_RAW is granted when ICMP module is configured (no VRF case)
+        file_content = read_file(blackbox_exporter_service_file)
+        self.assertIn('AmbientCapabilities=CAP_NET_RAW', file_content)
+        self.assertIn('CapabilityBoundingSet=CAP_NET_RAW', file_content)
+
+        # Check for running process
+        self.assertTrue(process_named_running(BLACKBOX_EXPORTER_PROCESS_NAME))
+
+        self.cli_delete(be_path + ['modules', 'icmp'])
+        self.cli_commit()
+
+        # Verify CAP_NET_RAW is removed when ICMP module is deleted
+        file_content = read_file(blackbox_exporter_service_file)
+        self.assertNotIn('CAP_NET_RAW', file_content)
+        self.assertTrue(process_named_running(BLACKBOX_EXPORTER_PROCESS_NAME))
+
+        # VRF + ICMP should use setpriv with net_raw capabilities
+        self.cli_set(['vrf', 'name', vrf_name, 'table', '1111'])
+        # Move the listen interface into the VRF so the exporter can bind
+        self.cli_set(['interfaces', 'dummy', listen_if, 'vrf', vrf_name])
+        self.cli_set(be_path + ['vrf', vrf_name])
+        self.cli_set(
+            be_path
+            + ['modules', 'icmp', 'name', 'ping4', 'preferred-ip-protocol', 'ipv4']
+        )
+        self.cli_commit()
+
+        # Verify VRF uses setpriv instead of systemd capabilities
+        file_content = read_file(blackbox_exporter_service_file)
+        self.assertIn('setpriv', file_content)
+        self.assertIn('--ambient-caps=+net_raw', file_content)
+        self.assertIn('--inh-caps=+net_raw', file_content)
+        self.assertNotIn('AmbientCapabilities=CAP_NET_RAW', file_content)
+
+        # Ensure the exporter actually started under setpriv in the VRF
+        self.assertTrue(process_named_running(BLACKBOX_EXPORTER_PROCESS_NAME))
+
+        # Cleanup VRF
+        self.cli_delete(['interfaces', 'dummy', listen_if, 'vrf'])
+        self.cli_delete(['vrf', 'name', vrf_name])
 
 
 if __name__ == '__main__':

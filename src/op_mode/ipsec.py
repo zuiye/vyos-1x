@@ -23,7 +23,7 @@ from tabulate import tabulate
 
 from vyos.utils.convert import convert_data
 from vyos.utils.convert import seconds_to_human
-from vyos.utils.process import cmd
+from vyos.utils.process import cmdl
 from vyos.configquery import ConfigTreeQuery
 from vyos.base import Warning
 
@@ -60,7 +60,7 @@ def _get_output_swanctl_sas_from_list(ra_output_list: list) -> str:
     output = ''
     for sa_val in ra_output_list:
         for sa in sa_val.values():
-            swanctl_output: str = cmd(f'sudo swanctl -l --ike-id {sa["uniqueid"]}')
+            swanctl_output: str = cmdl(['swanctl', '-l', '--ike-id', str(sa["uniqueid"])], sudo=True)
         output = f'{output}{swanctl_output}\n\n'
     return output
 
@@ -412,7 +412,7 @@ def _get_raw_connections_summary(list_conn, list_sas):
     return tun_dict
 
 
-def _get_formatted_output_conections(data):
+def _get_formatted_output_connections(data):
     from tabulate import tabulate
 
     connections = []
@@ -813,7 +813,7 @@ def show_connections(raw: bool):
         return _get_raw_data_connections(list_conns, list_sas)
 
     connections = _get_raw_data_connections(list_conns, list_sas)
-    return _get_formatted_output_conections(connections)
+    return _get_formatted_output_connections(connections)
 
 
 def show_connections_summary(raw: bool):

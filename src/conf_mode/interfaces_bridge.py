@@ -18,6 +18,7 @@ from sys import exit
 
 from vyos.config import Config
 from vyos.configdict import get_interface_dict
+from vyos.configdict import is_vrf_changed
 from vyos.configdict import node_changed
 from vyos.configdict import is_member
 from vyos.configdict import is_source_interface
@@ -129,6 +130,11 @@ def get_config(config=None):
     if 'static_arp' in bridge:
         set_dependents('static_arp', conf)
 
+    # Check vrf membership, to ensure firewall is updated
+    if is_vrf_changed(conf, ifname):
+        bridge.update({'vrf_changed': {}})
+        set_dependents('firewall', conf)
+
     bridge['vpp_ifaces'] = cli_ifaces_list(conf)
 
     return bridge
@@ -159,7 +165,7 @@ def verify(bridge):
             error_msg = f'Cannot add interface "{interface}" to bridge, '
 
             if interface == 'lo':
-                raise ConfigError('Loopback interface "lo" can not be added to a bridge')
+                raise ConfigError('Loopback interface "lo" cannot be added to a bridge')
 
             if 'is_bridge_member' in interface_config:
                 tmp = next(iter(interface_config['is_bridge_member']))
@@ -188,7 +194,7 @@ def verify(bridge):
             else:
                 for option in ['allowed_vlan', 'native_vlan']:
                     if option in interface_config:
-                        raise ConfigError('Can not use VLAN options on non VLAN aware bridge')
+                        raise ConfigError('Cannot use VLAN options on non VLAN aware bridge')
 
             if interface.startswith('vtun') and not interface_config['valid_ovpn']:
                 raise ConfigError(error_msg + 'OpenVPN device-type must be set to "tap"')
@@ -233,7 +239,7 @@ def apply(bridge):
         if iface.startswith(('vxlan', 'wlan')) and interface_exists(iface)
     ]
 
-    if interfaces_need_update or 'static_arp' in bridge:
+    if interfaces_need_update or 'static_arp' in bridge or 'vrf_changed' in bridge:
         try:
             call_dependents()
         except ConfigError:

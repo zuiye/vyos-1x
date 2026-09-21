@@ -25,7 +25,7 @@ from base_vyostest_shim import VyOSUnitTestSHIM
 from vyos.configsession import ConfigSessionError
 from vyos.kea import kea_add_lease
 from vyos.kea import kea_delete_lease
-from vyos.utils.process import cmd
+from vyos.utils.process import cmdl
 from vyos.utils.process import process_named_running
 from vyos.utils.file import read_file
 from vyos.template import inc_ip
@@ -44,6 +44,8 @@ router = inc_ip(subnet, 1)
 dns_1 = inc_ip(subnet, 2)
 dns_2 = inc_ip(subnet, 3)
 domain_name = 'vyos.net'
+ha_ipv6_local = '2001:db8:9166::1'
+ha_ipv6_remote = '2001:db8:9166::2'
 
 
 class TestServiceDHCPServer(VyOSUnitTestSHIM.TestCase):
@@ -56,6 +58,9 @@ class TestServiceDHCPServer(VyOSUnitTestSHIM.TestCase):
         cidr_mask = subnet.split('/')[-1]
         cls.cli_set(
             cls, ['interfaces', 'dummy', interface, 'address', f'{router}/{cidr_mask}']
+        )
+        cls.cli_set(
+            cls, ['interfaces', 'dummy', interface, 'address', f'{ha_ipv6_local}/64']
         )
 
     @classmethod
@@ -101,7 +106,9 @@ class TestServiceDHCPServer(VyOSUnitTestSHIM.TestCase):
 
     def verify_service_running(self):
         try:
-            tmp = cmd('grep -i kea /var/log/messages | tail -n 100')
+            out = cmdl(['cat', '/var/log/messages'])
+            matched = [line for line in out.splitlines() if 'kea' in line.lower()]
+            tmp = '\n'.join(matched[-100:])
         except OSError:
             tmp = 'No relevant log entries'
         self.assertTrue(
@@ -418,7 +425,9 @@ class TestServiceDHCPServer(VyOSUnitTestSHIM.TestCase):
         server_identifier = bootfile_server
         ipv6_only_preferred = '300'
         capwap_access_controller = '192.168.2.125'
-        interface_mtu = '1420'
+        # 9216: jumbo-fabric MTU above the former arbitrary 9000 cap
+        # (DHCP option 26 is a full u16)
+        interface_mtu = '9216'
 
         pool = base_path + ['shared-network-name', shared_net_name, 'subnet', subnet]
         self.cli_set(pool + ['subnet-id', '1'])
@@ -1230,6 +1239,16 @@ class TestServiceDHCPServer(VyOSUnitTestSHIM.TestCase):
         # Check for running process
         self.verify_service_running()
 
+        # Test the IPv6 case
+        self.cli_set(base_path + ['high-availability', 'source-address', ha_ipv6_local])
+        self.cli_set(base_path + ['high-availability', 'remote', ha_ipv6_remote])
+        self.cli_commit()
+
+        config = read_file(KEA4_CONF)
+        self.assertIn(f'http://[{ha_ipv6_local}]:647/', config)
+        self.assertIn(f'http://[{ha_ipv6_remote}]:647/', config)
+        self.verify_service_running()
+
     def test_dhcp_high_availability_standby(self):
         shared_net_name = 'FAILOVER'
         failover_name = 'VyOS-Failover'
@@ -1356,16 +1375,6 @@ class TestServiceDHCPServer(VyOSUnitTestSHIM.TestCase):
                 'SXQncyBXZWRuZXNkYXkgbWFoIGR1ZGVzIQ==',
             ]
         )
-        self.cli_set(ddns + ['tsig-key', 'reverse-0-168-192', 'algorithm', 'sha256'])
-        self.cli_set(
-            ddns
-            + [
-                'tsig-key',
-                'reverse-0-168-192',
-                'secret',
-                'VGhhbmsgR29kIGl0J3MgRnJpZGF5IQ==',
-            ]
-        )
         self.cli_set(
             ddns
             + [
@@ -1413,37 +1422,6 @@ class TestServiceDHCPServer(VyOSUnitTestSHIM.TestCase):
                 '1053',
             ]
         )
-        self.cli_set(
-            ddns
-            + [
-                'reverse-domain',
-                '0.168.192.in-addr.arpa',
-                'dns-server',
-                '2',
-                'address',
-                '100.100.0.1',
-            ]
-        )
-        self.cli_set(
-            ddns
-            + [
-                'reverse-domain',
-                '0.168.192.in-addr.arpa',
-                'dns-server',
-                '2',
-                'port',
-                '1153',
-            ]
-        )
-        self.cli_set(
-            ddns
-            + [
-                'reverse-domain',
-                '0.168.192.in-addr.arpa',
-                'key-name',
-                'reverse-0-168-192',
-            ]
-        )
 
         shared = base_path + ['shared-network-name', shared_net_name]
 
@@ -1466,6 +1444,61 @@ class TestServiceDHCPServer(VyOSUnitTestSHIM.TestCase):
             pool + ['dynamic-dns-update', 'hostname-char-replacement', '_xXx_']
         )
 
+        self.cli_commit()
+
+        # DNS server without an IP address must be rejected
+        self.cli_set(
+            ddns
+            + [
+                'reverse-domain',
+                '0.168.192.in-addr.arpa',
+                'dns-server',
+                '2',
+                'port',
+                '1153',
+            ]
+        )
+        with self.assertRaises(ConfigSessionError):
+            self.cli_commit()
+
+        # Fix missing address — commit must now succeed
+        self.cli_set(
+            ddns
+            + [
+                'reverse-domain',
+                '0.168.192.in-addr.arpa',
+                'dns-server',
+                '2',
+                'address',
+                '100.100.0.1',
+            ]
+        )
+        self.cli_commit()
+
+        # key-name referencing a non-existent tsig-key must be rejected
+        self.cli_set(
+            ddns
+            + [
+                'reverse-domain',
+                '0.168.192.in-addr.arpa',
+                'key-name',
+                'reverse-0-168-192',
+            ]
+        )
+        with self.assertRaises(ConfigSessionError):
+            self.cli_commit()
+
+        # Define the missing tsig-key — commit must now succeed
+        self.cli_set(ddns + ['tsig-key', 'reverse-0-168-192', 'algorithm', 'sha256'])
+        self.cli_set(
+            ddns
+            + [
+                'tsig-key',
+                'reverse-0-168-192',
+                'secret',
+                'VGhhbmsgR29kIGl0J3MgRnJpZGF5IQ==',
+            ]
+        )
         self.cli_commit()
 
         config = read_file(KEA4_CONF)
@@ -1735,8 +1768,8 @@ class TestServiceDHCPServer(VyOSUnitTestSHIM.TestCase):
             for seq in client_range:
                 ip_addr = inc_ip(subnet, seq)
                 kea_delete_lease(4, None, ip_addr)
-                cmd(
-                    f'{HOSTSD_CLIENT} --delete-hosts --tag dhcp-server-{ip_addr} --apply'
+                cmdl(
+                    [HOSTSD_CLIENT, '--delete-hosts', '--tag', f'dhcp-server-{ip_addr}', '--apply']
                 )
 
         self.addClassCleanup(internal_cleanup)
@@ -1789,7 +1822,7 @@ class TestServiceDHCPServer(VyOSUnitTestSHIM.TestCase):
 
         # 2. Verify that leases are not available in vyos-hostsd
         tag_regex = re.escape(f'dhcp-server-{subnet.rsplit(".", 1)[0]}')
-        host_json = cmd(f'{HOSTSD_CLIENT} --get-hosts {tag_regex}')
+        host_json = cmdl([HOSTSD_CLIENT, '--get-hosts', tag_regex])
         self.assertFalse(host_json.strip('{}'))
 
         # 3. Restart the service to trigger vyos-hostsd sync and wait for it to start
@@ -1797,7 +1830,7 @@ class TestServiceDHCPServer(VyOSUnitTestSHIM.TestCase):
 
         # 4. Verify that leases are synced and available in vyos-hostsd
         tag_regex = re.escape(f'dhcp-server-{subnet.rsplit(".", 1)[0]}')
-        host_json = cmd(f'{HOSTSD_CLIENT} --get-hosts {tag_regex}')
+        host_json = cmdl([HOSTSD_CLIENT, '--get-hosts', tag_regex])
         self.assertTrue(host_json)
 
     def test_dhcp_log_level(self):

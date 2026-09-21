@@ -37,6 +37,7 @@ from vyos.qos import RateLimiter
 from vyos.qos import RoundRobin
 from vyos.qos import TrafficShaper
 from vyos.qos import TrafficShaperHFSC
+from vyos.utils.dict import dict_search_args
 from vyos.utils.dict import dict_search_recursive
 from vyos.utils.process import run
 from vyos import ConfigError
@@ -208,12 +209,12 @@ def _verify_match(cls_config: dict) -> None:
             filters = set(match_config)
             if {'ip', 'ipv6'} <= filters:
                 raise ConfigError(
-                    f'Can not use both IPv6 and IPv4 in one match ({match})!')
+                    f'Cannot use both IPv6 and IPv4 in one match ({match})!')
 
             if {'interface', 'vif'} & filters:
                 if {'ip', 'ipv6', 'ether'} & filters:
                     raise ConfigError(
-                        f'Can not combine protocol and interface or vlan tag match ({match})!')
+                        f'Cannot combine protocol and interface or vlan tag match ({match})!')
 
 
 def _verify_match_group_exist(cls_config, qos):
@@ -349,6 +350,42 @@ def generate(qos):
     return None
 
 
+def apply_interface(qos, ifname):
+    """ Clear and re-apply QoS for a single interface only. """
+    interface_config = dict_search_args(qos, 'interface', ifname)
+    if not interface_config:
+        interface_config = {}
+
+    # Only tear down the ingress qdisc if this interface actually has an
+    # ingress QoS policy bound. Otherwise this would remove an unrelated
+    # ingress redirect/mirror configuration (see set_mirror_redirect())
+    # that call_dependents() just re-created, and it would never come
+    # back as only directions present in interface_config are re-applied
+    # below.
+    if 'ingress' in interface_config:
+        run(f'tc qdisc del dev {ifname} parent ffff:')
+    run(f'tc qdisc del dev {ifname} root')
+
+    if not interface_config:
+        return None
+
+    if not verify_interface_exists(qos, ifname, state_required=True, warning_only=True):
+        # When shaper is bound to a dialup (e.g. PPPoE) interface it is
+        # possible that it is yet not available when the QoS code runs.
+        # Skip the configuration and inform the user via warning_only=True
+        return None
+
+    for direction in ['egress', 'ingress']:
+        # bail out early if shaper for given direction is not used at all
+        if direction not in interface_config:
+            continue
+
+        shaper_type, shaper_config = get_shaper(qos, interface_config, direction)
+        shaper_type(ifname).update(shaper_config, direction)
+
+    return None
+
+
 def apply(qos):
     # Always delete "old" shapers first
     for interface in interfaces():
@@ -361,21 +398,8 @@ def apply(qos):
     if not qos or 'interface' not in qos:
         return None
 
-    for interface, interface_config in qos['interface'].items():
-        if not verify_interface_exists(qos, interface, state_required=True, warning_only=True):
-            # When shaper is bound to a dialup (e.g. PPPoE) interface it is
-            # possible that it is yet not available when to QoS code runs.
-            # Skip the configuration and inform the user via warning_only=True
-            continue
-
-        for direction in ['egress', 'ingress']:
-            # bail out early if shaper for given direction is not used at all
-            if direction not in interface_config:
-                continue
-
-            shaper_type, shaper_config = get_shaper(qos, interface_config, direction)
-            tmp = shaper_type(interface)
-            tmp.update(shaper_config, direction)
+    for ifname in qos['interface']:
+        apply_interface(qos, ifname)
 
     return None
 

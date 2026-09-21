@@ -16,6 +16,7 @@
 import os
 import re
 import sys
+import json
 import weakref
 import subprocess
 from tempfile import NamedTemporaryFile
@@ -31,6 +32,9 @@ from vyos.vyconf_session import VyconfSession
 from vyos.base import Warning as Warn
 from vyos.defaults import DEFAULT_COMMIT_CONFIRM_MINUTES
 from vyos.configtree import ConfigTree
+from vyos.configtree import ConfigTreeError
+from vyos.configtree import delete_dict_from_masks
+from vyos.derivedtree import subtree_from_list_of_partial_paths
 
 # type of config file path or configtree
 ConfigObj: TypeAlias = Union[str, ConfigTree]
@@ -84,6 +88,7 @@ RENEW = ['/opt/vyatta/bin/vyatta-op-cmd-wrapper', 'renew']
 POWEROFF = ['/opt/vyatta/bin/vyatta-op-cmd-wrapper', 'poweroff']
 OP_CMD_ADD = ['/opt/vyatta/bin/vyatta-op-cmd-wrapper', 'add']
 OP_CMD_DELETE = ['/opt/vyatta/bin/vyatta-op-cmd-wrapper', 'delete']
+PING = ['/opt/vyatta/bin/vyatta-op-cmd-wrapper', 'ping']
 TRACEROUTE = [
     '/usr/libexec/vyos/op_mode/mtr_execute.py',
     'mtr',
@@ -205,30 +210,10 @@ class ConfigSession(object):
                 self, self.finalize_vyconf, self._vyconf_session
             )
 
-    def __del__(self):
-        if self.shared:
-            return
-        if not vyconf_backend():
-            try:
-                output = (
-                    subprocess.check_output(
-                        [CLI_SHELL_API, 'teardownSession'], env=self.__session_env
-                    )
-                    .decode()
-                    .strip()
-                )
-                if output:
-                    print(
-                        'cli-shell-api teardownSession output for session {0}: {1}'.format(
-                            self.__session_id, output
-                        ),
-                        file=sys.stderr,
-                    )
-            except Exception as e:
-                print(
-                    'Could not tear down session {0}: {1}'.format(self.__session_id, e),
-                    file=sys.stderr,
-                )
+        if not self.shared and not self._vyconf_session:
+            self._finalizer = weakref.finalize(
+                self, self.finalize_legacy, self.__session_env.copy()
+            )
 
     @classmethod
     def finalize_vyconf(cls, session: VyconfSession):
@@ -237,6 +222,31 @@ class ConfigSession(object):
             session.discard()
         session.exit_config_mode()
         session.teardown()
+
+    @classmethod
+    def finalize_legacy(cls, session_env):
+        try:
+            output = (
+                subprocess.check_output(
+                    [CLI_SHELL_API, 'teardownSession'], env=session_env
+                )
+                .decode()
+                .strip()
+            )
+            if output:
+                print(
+                    'cli-shell-api teardownSession output for session {0}: {1}'.format(
+                        session_env['SESSION_PID'], output
+                    ),
+                    file=sys.stderr,
+                )
+        except Exception as e:
+            print(
+                'Could not tear down session {0}: {1}'.format(
+                    session_env['SESSION_PID'], e
+                ),
+                file=sys.stderr,
+            )
 
     def __run_command(self, cmd_list):
         p = subprocess.Popen(
@@ -302,15 +312,33 @@ class ConfigSession(object):
         except (ValueError, ConfigSessionError) as e:
             raise ConfigSessionError(e)
 
-    def load_section_tree(self, mask: dict, d: dict):
+    def load_section_tree(
+        self, config_tree: ConfigTree, mask_dict: dict, config_dict: dict
+    ):
+        if (
+            not mask_dict
+            or 'inclusive' not in mask_dict
+            or 'exclusive' not in mask_dict
+        ):
+            raise ConfigSessionError(
+                "Missing mask data can damage the config: expected keys 'inclusive' and 'exclusive'"
+            )
         try:
-            if mask:
-                for p in dict_to_paths(mask):
+            mask_in = ConfigTree(internal_string=mask_dict['inclusive'])
+
+            mask_ex_list = json.loads(mask_dict['exclusive'])
+            mask_ex = subtree_from_list_of_partial_paths(config_tree, mask_ex_list)
+
+            delete_dict = delete_dict_from_masks(config_tree, mask_in, mask_ex)
+
+            if delete_dict:
+                for p in dict_to_paths(delete_dict):
                     self.delete(p)
-            if d:
-                for p in dict_to_paths(d):
+
+            if config_dict:
+                for p in dict_to_paths(config_dict):
                     self.set(p)
-        except (ValueError, ConfigSessionError) as e:
+        except (ValueError, ConfigSessionError, ConfigTreeError) as e:
             raise ConfigSessionError(e)
 
     def comment(self, path, value=None):
@@ -459,6 +487,16 @@ class ConfigSession(object):
         out = self.__run_command(SHOW + ['container', 'image'])
         return out
 
-    def traceroute(self, host):
-        out = self.__run_command(TRACEROUTE + [host])
+    def ping(self, host, count: int = 5, vrf: str | None = None):
+        cmd = PING + [host, 'count', str(count)]
+        if vrf is not None:
+            cmd += ['vrf', vrf]
+        out = self.__run_command(cmd)
+        return out
+
+    def traceroute(self, host, vrf: str | None = None):
+        cmd = TRACEROUTE + [host]
+        if vrf is not None:
+            cmd += ['--vrf', vrf]
+        out = self.__run_command(cmd)
         return out

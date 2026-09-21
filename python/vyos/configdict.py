@@ -19,8 +19,9 @@ A library for retrieving value dicts from VyOS configs in a declarative fashion.
 import os
 import json
 
+from vyos.config import Config
 from vyos.utils.dict import dict_search
-from vyos.utils.process import cmd
+from vyos.utils.process import cmdl
 
 def retrieve_config(path_hash, base_path, config):
     """
@@ -132,8 +133,13 @@ def leaf_node_changed(conf, path):
             return True
         if old is None:
             return []
+        # A multi node holding a single value is a plain string in the JSON
+        # rendering of the config tree, and only becomes a list once it holds
+        # several values. Normalize before diffing, else appending a value to a
+        # single-valued multi node reports the already configured value as gone
+        # just because its representation changed from string to list
         if isinstance(old, str):
-            return [old]
+            old = [old]
         if isinstance(old, list):
             if isinstance(new, str):
                 new = [new]
@@ -300,6 +306,34 @@ def has_vrf_configured(conf, intf):
     conf.set_level(old_level)
     return ret
 
+def is_vrf_changed(conf : Config, intf) -> bool:
+    """
+    Checks if interface has a VRF changed.
+
+    Returns True if interface has VRF changed, False if it doesn't.
+    """
+    from vyos.ifconfig import Section
+
+    # set default path for this interface
+    intfpath = ['interfaces', Section.section(intf), intf]
+
+    # Check top-level interface
+    if is_node_changed(conf, intfpath + ['vrf']):
+        return True
+
+    # check sub interfaces
+    for vif in conf.list_nodes(intfpath + ['vif']):
+        if is_node_changed(conf, intfpath + ['vif', vif, 'vrf']):
+            return True
+    for vif_s in conf.list_nodes(intfpath + ['vif-s']):
+        if is_node_changed(conf, intfpath + ['vif-s', vif_s, 'vrf']):
+            return True
+        for vif_c in conf.list_nodes(intfpath + ['vif-s', vif_s, 'vif-c']):
+            if is_node_changed(conf, intfpath + ['vif-s', vif_s, 'vif-c', vif_c, 'vrf']):
+                return True
+
+    return False
+
 def has_vlan_subinterface_configured(conf, intf):
     """
     Checks if interface has an VLAN subinterface configured.
@@ -340,7 +374,7 @@ def is_source_interface(conf, interface, intftype=None):
         raise ValueError(f'Interface type "{type(intftype)}" must be either str or list!')
 
     if not all(x in intftypes for x in intftype):
-        raise ValueError(f'unknown interface type "{intftype}" or it can not '
+        raise ValueError(f'unknown interface type "{intftype}" or it cannot '
             'have a source-interface')
 
     for it in intftype:
@@ -547,7 +581,7 @@ def get_interface_dict(config, base, ifname='', recursive_defaults=True, with_pk
         bridge = is_member(config, f'{ifname}.{vif}', 'bridge')
         if bridge: dict['vif'][vif].update({'is_bridge_member' : bridge})
 
-        # Check if any DHCP options changed which require a client restat
+        # Check if any DHCP options changed which require a client restart
         dhcp = is_node_changed(config, base + [ifname, 'vif', vif, 'dhcp-options'])
         if dhcp: dict['vif'][vif].update({'dhcp_options_changed' : {}})
         dhcpv6 = is_node_changed(config, base + [ifname, 'vif', vif, 'dhcpv6-options'])
@@ -575,7 +609,7 @@ def get_interface_dict(config, base, ifname='', recursive_defaults=True, with_pk
         bridge = is_member(config, f'{ifname}.{vif_s}', 'bridge')
         if bridge: dict['vif_s'][vif_s].update({'is_bridge_member' : bridge})
 
-        # Check if any DHCP options changed which require a client restat
+        # Check if any DHCP options changed which require a client restart
         dhcp = is_node_changed(config, base + [ifname, 'vif-s', vif_s, 'dhcp-options'])
         if dhcp: dict['vif_s'][vif_s].update({'dhcp_options_changed' : {}})
         dhcpv6 = is_node_changed(config, base + [ifname, 'vif-s', vif_s, 'dhcpv6-options'])
@@ -605,7 +639,7 @@ def get_interface_dict(config, base, ifname='', recursive_defaults=True, with_pk
             if bridge: dict['vif_s'][vif_s]['vif_c'][vif_c].update(
                 {'is_bridge_member' : bridge})
 
-            # Check if any DHCP options changed which require a client restat
+            # Check if any DHCP options changed which require a client restart
             dhcp = is_node_changed(config, base + [ifname, 'vif-s', vif_s, 'vif-c', vif_c, 'dhcp-options'])
             if dhcp: dict['vif_s'][vif_s]['vif_c'][vif_c].update({'dhcp_options_changed' : {}})
             dhcpv6 = is_node_changed(config, base + [ifname, 'vif-s', vif_s, 'vif-c', vif_c, 'dhcpv6-options'])
@@ -631,7 +665,7 @@ def get_vlan_ids(interface):
     """
     vlan_ids = set()
 
-    bridge_status = cmd('bridge -j vlan show', shell=True)
+    bridge_status = cmdl(['bridge', '-j', 'vlan', 'show'])
     vlan_filter_status = json.loads(bridge_status)
 
     if vlan_filter_status is not None:
@@ -648,7 +682,7 @@ def get_vlan_ids(interface):
 def get_vlans_ids_and_range(interface):
     vlan_ids = set()
 
-    vlan_filter_status = json.loads(cmd(f'bridge -j -d vlan show dev {interface}'))
+    vlan_filter_status = json.loads(cmdl(['bridge', '-j', '-d', 'vlan', 'show', 'dev', interface]))
 
     if vlan_filter_status is not None:
         for interface_status in vlan_filter_status:

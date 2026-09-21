@@ -25,11 +25,11 @@ from typing import Type
 from vyos import ConfigError
 from vyos.configsession import ConfigSession
 from vyos.configsession import ConfigSessionError
-from vyos.defaults import commit_lock
 from vyos.frrender import mgmt_daemon
-from vyos.utils.process import cmd
+from vyos.utils.commit import commit_in_progress2
+from vyos.utils.network import get_vrf_pids
+from vyos.utils.process import cmdl
 from vyos.utils.process import process_named_running
-from vyos.utils.process import run
 
 save_config = '/tmp/vyos-smoketest-save'
 
@@ -37,7 +37,7 @@ save_config = '/tmp/vyos-smoketest-save'
 # the Python UnitTest framework. Before every test is loaded, we dump the current
 # system configuration and reload it after the test - despite the test results.
 #
-# Using this approach we can not render a live system useless while running any
+# Using this approach we cannot render a live system useless while running any
 # kind of smoketest. In addition it adds debug capabilities like printing the
 # command used to execute the test.
 
@@ -48,10 +48,15 @@ class VyOSUnitTestSHIM:
         # certain failure condition.
         debug = False
         mgmt_daemon_pid = 0
+        smoketest_hint_file = '/tmp/vyos.smoketests.hint'
 
         @staticmethod
         def debug_on():
             return os.path.exists('/tmp/vyos.smoketest.debug')
+
+        @classmethod
+        def running_in_smoketest_harness(cls):
+            return os.path.exists(cls.smoketest_hint_file)
 
         @classmethod
         def setUpClass(cls):
@@ -78,6 +83,12 @@ class VyOSUnitTestSHIM:
                 # restore previous configuration before the test
                 cls._session.migrate_and_load_config(save_config)
                 cls._session.commit()
+                # Remove the saved config snapshot once the test is done
+                # with it - a leftover file here is owned by whichever user
+                # ran this test, and blocks a different user from running
+                # it later ("Permission denied" on save_config)
+                if os.path.exists(save_config):
+                    os.remove(save_config)
 
         def setUp(self):
             pass
@@ -86,29 +97,37 @@ class VyOSUnitTestSHIM:
             # check process health and continuity
             self.assertEqual(self.mgmt_daemon_pid, process_named_running(mgmt_daemon))
 
+        @staticmethod
+        def _wait_for_commit_lock():
+            # A concurrent commit (e.g. a previous commit asynchronous cleanup
+            # still finishing) keeps the commit lock held for a moment after
+            # control already returned to the caller.
+            while commit_in_progress2():
+                sleep(0.250)
+
         def cli_set(self, path, value=None):
             if self.debug:
                 str = f'set {" ".join(path)} {value}' if value else f'set {" ".join(path)}'
                 print(str)
+            self._wait_for_commit_lock()
             self._session.set(path, value)
 
         def cli_delete(self, config):
             if self.debug:
                 print('del ' + ' '.join(config))
+            self._wait_for_commit_lock()
             self._session.delete(config)
 
         def cli_discard(self):
             if self.debug:
                 print('DISCARD')
+            self._wait_for_commit_lock()
             self._session.discard()
 
         def cli_commit(self):
             if self.debug:
                 print('commit')
-            # During a commit there is a process opening commit_lock, and run()
-            # returns 0
-            while run(f'sudo lsof -nP {commit_lock}') == 0:
-                sleep(0.250)
+            self._wait_for_commit_lock()
             # Return the output of commit
             # Necessary for testing Warning cases
             return self._session.commit()
@@ -124,10 +143,15 @@ class VyOSUnitTestSHIM:
             """
             if self.debug:
                 print('commit')
-            path = ' '.join(path)
-            out = cmd(f'/opt/vyatta/bin/vyatta-op-cmd-wrapper {path}')
+            # some callers pass a single CLI phrase as one multi-word string
+            # (e.g. ['generate tech-support archive']) - split every element
+            # on whitespace so each CLI word becomes its own argument
+            args = []
+            for p in path:
+                args += str(p).split()
+            out = cmdl(['/opt/vyatta/bin/vyatta-op-cmd-wrapper'] + args)
             if self.debug:
-                print(f'\n\ncommand "{path}" returned:\n')
+                print(f'\n\ncommand "{" ".join(path)}" returned:\n')
                 pprint.pprint(out)
             return out
 
@@ -187,7 +211,7 @@ class VyOSUnitTestSHIM:
         def getFRRopmode(self, command : str, json : bool=False):
             from json import loads
             if json: command += f' json'
-            out = cmd(f'vtysh -c "{command}"')
+            out = cmdl(['vtysh', '-c', command])
             if json:
                 out = loads(out)
             if self.debug:
@@ -269,7 +293,7 @@ class VyOSUnitTestSHIM:
             Raises:
                 AssertionError: If expectations are not met.
             """
-            nftables_output = cmd(f'sudo nft {args} list table {table}')
+            nftables_output = cmdl(['nft'] + args.split() + ['list', 'table'] + table.split(), sudo=True)
 
             for search in nftables_search:
                 matched = False
@@ -342,7 +366,7 @@ class VyOSUnitTestSHIM:
             Raises:
                 AssertionError: If expectations are not met.
             """
-            nftables_output = cmd(f'sudo nft {args} list chain {table} {chain}')
+            nftables_output = cmdl(['nft'] + args.split() + ['list', 'chain'] + table.split() + [chain], sudo=True)
 
             for search in nftables_search:
                 matched = False
@@ -400,7 +424,7 @@ class VyOSUnitTestSHIM:
                 AssertionError: If expectations are not met.
             """
             try:
-                cmd(f'sudo nft list chain {table} {chain}')
+                cmdl(['nft', 'list', 'chain'] + table.split() + [chain], sudo=True)
                 if inverse:
                     self.fail(f'Chain exists: {table} {chain}')
             except OSError:
@@ -409,7 +433,7 @@ class VyOSUnitTestSHIM:
 
         # Verify ip rule output
         def verify_rules(self, rules_search, inverse=False, addr_family='inet'):
-            rule_output = cmd(f'ip -family {addr_family} rule show')
+            rule_output = cmdl(['ip', '-family', addr_family, 'rule', 'show'])
 
             for search in rules_search:
                 matched = False
@@ -418,6 +442,17 @@ class VyOSUnitTestSHIM:
                         matched = True
                         break
                 self.assertTrue(not matched if inverse else matched, msg=search)
+
+        def verify_process_in_vrf(self, process_name, vrf):
+            """ Verify that a process of a given name runs inside a VRF
+
+            "ip vrf pids" reports the kernel comm, which is capped at 15
+            characters and follows a process rewriting its title - ddclient
+            shows up as "ddclient - slee" - so match by prefix, not equality.
+            """
+            names = [name for _, name in get_vrf_pids(vrf)]
+            self.assertTrue(any(name.startswith(process_name) for name in names),
+                f'no {process_name} process running in VRF {vrf}: {names}')
 
         @staticmethod
         def wait_for_result(runnable, check, pause=1, timeout=10):

@@ -19,7 +19,7 @@ import unittest
 
 from base_vyostest_shim import VyOSUnitTestSHIM
 
-from vyos.utils.process import cmd
+from vyos.utils.process import cmdl
 
 base_path = ['protocols', 'static', 'arp']
 interface = 'eth0'
@@ -67,7 +67,7 @@ class TestARP(VyOSUnitTestSHIM.TestCase):
 
         self.cli_commit()
 
-        arp_table = json.loads(cmd('ip -j -4 neigh show'))
+        arp_table = json.loads(cmdl(['ip', '-j', '-4', 'neigh', 'show']))
         for host, host_config in test_data.items():
             # As we search within a list of hosts we need to mark if it was
             # found or not. This ensures all hosts from test_data are processed
@@ -85,6 +85,40 @@ class TestARP(VyOSUnitTestSHIM.TestCase):
             if found == False:
                 print(entry)
             self.assertTrue(found)
+
+    def test_static_arp_deletion(self):
+        # deleting the "protocols static arp" node must remove the
+        # previously installed PERMANENT ARP entry from the kernel
+        host = '192.0.2.10'
+        mac = '00:01:02:03:04:0a'
+
+        def get_static_arp_entry():
+            # Return our static (PERMANENT) neighbour, matched by dst + dev.
+            arp_table = json.loads(cmdl(['ip', '-j', '-4', 'neigh', 'show']))
+            for entry in arp_table:
+                if (
+                    entry['dst'] == host
+                    and entry['dev'] == interface
+                    and 'PERMANENT' in entry.get('state', [])
+                ):
+                    return entry
+            return None
+
+        self.cli_set(base_path + ['interface', interface, 'address', host, 'mac', mac])
+        self.cli_commit()
+
+        # the static PERMANENT entry must be present with all configured fields
+        entry = get_static_arp_entry()
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry['dst'], host)
+        self.assertEqual(entry['lladdr'], mac)
+        self.assertEqual(entry['dev'], interface)
+
+        # delete the whole node and verify the static entry is gone
+        self.cli_delete(base_path)
+        self.cli_commit()
+
+        self.assertIsNone(get_static_arp_entry())
 
 if __name__ == '__main__':
     unittest.main(verbosity=2, failfast=VyOSUnitTestSHIM.TestCase.debug_on())

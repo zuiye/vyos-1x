@@ -34,7 +34,8 @@ from vyos.configquery import ConfigTreeQuery
 from vyos.utils.auth import DEFAULT_PASSWORD
 from vyos.utils.auth import get_current_user
 from vyos.utils.auth import get_local_passwd_entries
-from vyos.utils.process import cmd
+from vyos.utils.cpu import cpu_arch
+from vyos.utils.process import cmdl
 from vyos.utils.file import read_file
 from vyos.utils.file import write_file
 from vyos.template import inc_ip
@@ -137,11 +138,11 @@ class TestSystemLogin(VyOSUnitTestSHIM.TestCase):
         # Load images for smoketest provided in vyos-1x-smoketest
         if not os.path.exists(tac_image_path):
             cls.fail(cls, f'{tac_image} image not available')
-        cmd(f'sudo podman load -i {tac_image_path}')
+        cmdl(['podman', 'load', '-i', tac_image_path], sudo=True)
 
         if not os.path.exists(radius_image_path):
             cls.fail(cls, f'{radius_image} image not available')
-        cmd(f'sudo podman load -i {radius_image_path}')
+        cmdl(['podman', 'load', '-i', radius_image_path], sudo=True)
 
         cls.ssh_test_command_result = cls.op_mode(cls, ['show', 'version'])
 
@@ -162,8 +163,8 @@ class TestSystemLogin(VyOSUnitTestSHIM.TestCase):
         super(TestSystemLogin, cls).tearDownClass()
 
         # Cleanup container images
-        cmd(f'sudo podman image rm -f {tac_image}')
-        cmd(f'sudo podman image rm -f {radius_image}')
+        cmdl(['podman', 'image', 'rm', '-f', tac_image], sudo=True)
+        cmdl(['podman', 'image', 'rm', '-f', radius_image], sudo=True)
 
     def tearDown(self):
         # Delete individual users from configuration
@@ -188,7 +189,7 @@ class TestSystemLogin(VyOSUnitTestSHIM.TestCase):
         system_user = 'backup'
         self.cli_set(base_path + ['user', system_user, 'authentication', 'plaintext-password', system_user])
 
-        # check validate() - can not add username which exists on the Debian
+        # check validate() - cannot add username which exists on the Debian
         # base system (UID < 1000)
         with self.assertRaises(ConfigSessionError):
             self.cli_commit()
@@ -225,14 +226,14 @@ class TestSystemLogin(VyOSUnitTestSHIM.TestCase):
         self.cli_set(base_path + ['user', locked_user, 'disable'])
         self.cli_commit()
         # check if account is locked
-        tmp = cmd(f'sudo passwd -S {locked_user}')
+        tmp = cmdl(['passwd', '-S', locked_user], sudo=True)
         self.assertIn(f'{locked_user} L ', tmp)
 
         # unlock account
         self.cli_delete(base_path + ['user', locked_user, 'disable'])
         self.cli_commit()
         # check if account is unlocked
-        tmp = cmd(f'sudo passwd -S {locked_user}')
+        tmp = cmdl(['passwd', '-S', locked_user], sudo=True)
         self.assertIn(f'{locked_user} P ', tmp)
 
     def test_system_login_weak_password_warning(self):
@@ -265,7 +266,7 @@ class TestSystemLogin(VyOSUnitTestSHIM.TestCase):
         self.cli_commit()
 
         # Check if OTP key was written properly
-        tmp = cmd(f'sudo head -1 /home/{otp_user}/.google_authenticator')
+        tmp = cmdl(['head', '-1', f'/home/{otp_user}/.google_authenticator'], sudo=True)
         self.assertIn(otp_key, tmp)
 
         self.cli_delete(base_path + ['user', otp_user])
@@ -285,21 +286,37 @@ class TestSystemLogin(VyOSUnitTestSHIM.TestCase):
         self.cli_commit()
 
         # Check that SSH key was written properly
-        tmp = cmd(f'sudo cat /home/{ssh_user}/.ssh/authorized_keys')
+        tmp = cmdl(['cat', f'/home/{ssh_user}/.ssh/authorized_keys'], sudo=True)
         key = f'{type} ' + ssh_pubkey.replace('\n','')
         self.assertIn(key, tmp)
 
         self.cli_delete(base_path + ['user', ssh_user])
 
-    def test_radius_kernel_features(self):
-        # T2886: RADIUS requires some Kernel options to be present
+    def _verify_kernel_options(self, options: list):
         kernel_config = GzipFile('/proc/config.gz').read().decode('UTF-8')
-
-        # T2886 - RADIUS authentication - check for statically compiled options
-        options = ['CONFIG_AUDIT', 'CONFIG_AUDITSYSCALL', 'CONFIG_AUDIT_ARCH']
-
         for option in options:
             self.assertIn(f'{option}=y', kernel_config)
+
+    def test_radius_kernel_features(self):
+        # T2886: RADIUS requires some Kernel options to be present
+        # Check for statically compiled options common to all architectures
+        self._verify_kernel_options(['CONFIG_AUDIT', 'CONFIG_AUDITSYSCALL'])
+
+    # The Kernel provides the audit subsystem either as an architecture
+    # specific (CONFIG_AUDIT_ARCH) or as a generic implementation
+    # (CONFIG_AUDIT_GENERIC) - "config AUDIT_GENERIC" in lib/Kconfig depends
+    # on "!AUDIT_ARCH", thus we must test for the proper one per architecture.
+    @cpu_arch('amd64')
+    def test_radius_kernel_features_amd64(self):
+        # T2886: x86 implements its own audit code
+        self._verify_kernel_options(['CONFIG_AUDIT_ARCH'])
+
+    @cpu_arch('arm64')
+    def test_radius_kernel_features_arm64(self):
+        # T2886: arm64 has no CONFIG_AUDIT_ARCH and uses the generic
+        # implementation instead
+        self._verify_kernel_options(['CONFIG_AUDIT_GENERIC',
+                                     'CONFIG_AUDIT_ARCH_COMPAT_GENERIC'])
 
     def test_system_login_radius_ipv4(self):
         radius_servers = ['100.64.0.4', '100.64.0.5']
@@ -378,7 +395,7 @@ class TestSystemLogin(VyOSUnitTestSHIM.TestCase):
         self.cli_commit()
 
         # this file must be read with higher permissions
-        pam_radius_auth_conf = cmd('sudo cat /etc/pam_radius_auth.conf')
+        pam_radius_auth_conf = cmdl(['cat', '/etc/pam_radius_auth.conf'], sudo=True)
 
         for radius_server in radius_servers:
             if is_ipv6(radius_server):

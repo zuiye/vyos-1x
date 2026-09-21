@@ -18,7 +18,6 @@ import os
 from time import time
 from datetime import datetime
 from functools import reduce
-from tabulate import tabulate
 
 from vyos.ifconfig import Control
 
@@ -162,12 +161,14 @@ class Operational(Control):
             stats[counter] = int(self.get_interface(counter))
         return stats
 
-    def formated_stats(self, indent=4):
+    def formatted_stats(self, indent=4):
         tabs = []
         stats = self.get_stats()
         for rtx in self._stats_dir:
             tabs.append([f'{rtx.upper()}:', ] + [_ for _ in self._stat_names[rtx]])
             tabs.append(['', ] + [stats[_] for _ in self._stats_dir[rtx]])
+
+        from tabulate import tabulate
 
         s = tabulate(
             tabs,

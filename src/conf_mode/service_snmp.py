@@ -15,12 +15,14 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import os
+import contextlib
 
 from sys import exit
 
 from vyos.base import Warning
 from vyos.config import Config
 from vyos.configdict import dict_merge
+from vyos.configdict import is_node_changed
 from vyos.configverify import verify_vrf
 from vyos.defaults import systemd_services
 from vyos.snmpv3_hashgen import plaintext_to_md5
@@ -33,6 +35,8 @@ from vyos.utils.dict import dict_search
 from vyos.utils.network import is_addr_assigned
 from vyos.utils.process import call
 from vyos.utils.permission import chmod_755
+from vyos.utils.file import read_file
+from vyos.utils.file import write_file
 from vyos.version import get_version_data
 from vyos import ConfigError
 from vyos import airbag
@@ -45,6 +49,34 @@ config_file_user    = r'/var/lib/snmp/snmpd.conf'
 default_script_dir  = r'/config/user-data/'
 systemd_override    = r'/run/systemd/system/snmpd.service.d/override.conf'
 systemd_service     = systemd_services['snmpd']
+
+
+def _get_engine_boots_and_bump(reset=False):
+    """
+    Read, increment, persist, and return engineBoots counter.
+    Uses /config/snmp/engineboots.count as persistent storage
+    across reboots.
+
+    If the 'reset' flag is set, zero will be stored without reading the current state.
+    """
+    persist_count_file = '/config/snmp/engineboots.count'
+
+    # Ensure directory exists atomically
+    os.makedirs(os.path.dirname(persist_count_file), exist_ok=True)
+
+    count = 0
+
+    if not reset:
+        # Read current count, default to 0 on first run or corruption
+        raw = read_file(persist_count_file, defaultonfailure=str(count))
+        with contextlib.suppress(ValueError):
+            count = int(raw)
+
+    # Persist new value with increment immediately because snmpd will increase
+    # it automatically after restart the service
+    write_file(persist_count_file, str(count + 1))
+
+    return count
 
 def get_config(config=None):
     if config:
@@ -98,6 +130,26 @@ def get_config(config=None):
 
             snmp['script_extensions']['extension_name'][key]['script'] = script_path
 
+    # Per RFC 3414 section 2.3 we should reset the engineID to 0:
+    # > Note, that whenever the local value of snmpEngineID is
+    # > changed (e.g., through discovery) or when secure communications are
+    # > first established with an authoritative SNMP engine, the local values
+    # > of snmpEngineBoots and latestReceivedEngineTime should be set to
+    # > zero.
+    # It requires to track changing of this value and reset engineBoots.
+    if is_node_changed(conf, base + ['v3', 'engineid']):
+        effective_config = conf.get_config_dict(
+            base,
+            key_mangling=('-', '_'),
+            get_first_key=True,
+            no_tag_node_value_mangle=True,
+            effective=True,
+        )
+        current_engineid = dict_search('v3.engineid', snmp)
+        prev_engineid = dict_search('v3.engineid', effective_config)
+        if prev_engineid and current_engineid != prev_engineid:
+            snmp.update({'engineid_changed': {}})
+
     return snmp
 
 
@@ -106,7 +158,7 @@ def verify(snmp):
         return None
 
     if {'deleted', 'lldp_snmp'} <= set(snmp):
-        raise ConfigError('Can not delete SNMP service, as LLDP still uses SNMP!')
+        raise ConfigError('Cannot delete SNMP service, as LLDP still uses SNMP!')
 
     ### check if the configured script actually exist
     if 'script_extensions' in snmp and 'extension_name' in snmp['script_extensions']:
@@ -183,13 +235,13 @@ def verify(snmp):
                 raise ConfigError(f'Must specify one of authentication encrypted-password or plaintext-password for trap "{trap}"!')
 
             if {'plaintext_password', 'encrypted_password'} <= set(trap_config['auth']):
-                raise ConfigError(f'Can not specify both authentication encrypted-password and plaintext-password for trap "{trap}"!')
+                raise ConfigError(f'Cannot specify both authentication encrypted-password and plaintext-password for trap "{trap}"!')
 
             if 'plaintext_password' not in trap_config['privacy'] and 'encrypted_password' not in trap_config['privacy']:
                 raise ConfigError(f'Must specify one of privacy encrypted-password or plaintext-password for trap "{trap}"!')
 
             if {'plaintext_password', 'encrypted_password'} <= set(trap_config['privacy']):
-                raise ConfigError(f'Can not specify both privacy encrypted-password and plaintext-password for trap "{trap}"!')
+                raise ConfigError(f'Cannot specify both privacy encrypted-password and plaintext-password for trap "{trap}"!')
 
             if 'type' not in trap_config:
                 raise ConfigError('SNMP v3 trap "type" must be specified!')
@@ -209,6 +261,12 @@ def generate(snmp):
 
     if 'deleted' in snmp:
         return None
+
+    # RFC 3414 compliant:
+    #   - increments by 1 on every snmpd start
+    #   - reset to zero if engineID was changed
+    with_reset = 'engineid_changed' in snmp
+    snmp['engine_boots'] = _get_engine_boots_and_bump(reset=with_reset)
 
     if 'v3' in snmp:
         # SNMPv3 uses a hashed password. If CLI defines a plaintext password,

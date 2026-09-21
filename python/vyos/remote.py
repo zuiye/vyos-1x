@@ -53,7 +53,7 @@ from vyos.utils.io import ask_yes_no
 from vyos.utils.io import is_interactive
 from vyos.utils.io import print_error
 from vyos.utils.misc import begin
-from vyos.utils.process import cmd
+from vyos.utils.process import cmdl
 from vyos.utils.process import rc_cmd
 from vyos.version import get_version
 from vyos.base import Warning
@@ -413,33 +413,46 @@ class HttpC:
             # Not only would it potentially mess up with the progress bar but
             # `shutil.copyfileobj(request.raw, file)` does not handle automatic decoding.
             s.headers.update({'Accept-Encoding': 'identity'})
+            final_urlstring = self.urlstring
+            size = None
             with s.head(self.urlstring,
                         allow_redirects=True,
                         timeout=self.timeout) as r:
-                # Abort early if the destination is inaccessible.
+                # Some servers (e.g. AbuseIPDB) reject HEAD with 405 but allow GET.
+                if r.status_code not in (405, 501):
+                    # Abort early if the destination is inaccessible.
+                    r.raise_for_status()
+                    # If the request got redirected, keep the last URL we ended up with.
+                    final_urlstring = r.url
+                    if r.history and self.progressbar:
+                        print_error('Redirecting to ' + final_urlstring)
+                    # Check for the prospective file size.
+                    try:
+                        size = int(r.headers['Content-Length'])
+                    # In case the server does not supply the header.
+                    except KeyError:
+                        size = None
+            with s.get(final_urlstring, stream=True, timeout=self.timeout) as r:
                 r.raise_for_status()
-                # If the request got redirected, keep the last URL we ended up with.
-                final_urlstring = r.url
-                if r.history and self.progressbar:
-                    print_error('Redirecting to ' + final_urlstring)
-                # Check for the prospective file size.
-                try:
-                    size = int(r.headers['Content-Length'])
-                # In case the server does not supply the header.
-                except KeyError:
-                    size = None
-            if self.check_space:
-                check_storage(location, size)
-            with s.get(final_urlstring, stream=True,
-                       timeout=self.timeout) as r, open(location, 'wb') as f:
-                if self.progressbar and size:
-                    with Progressbar(CHUNK_SIZE / size) as p:
-                        for chunk in iter(lambda: begin(p.increment(), r.raw.read(CHUNK_SIZE)), b''):
-                            f.write(chunk)
-                else:
-                    # We'll try to stream the download directly with `copyfileobj()` so that large
-                    #  files (like entire VyOS images) don't occupy much memory.
-                    shutil.copyfileobj(r.raw, f)
+                if size is None:
+                    try:
+                        size = int(r.headers['Content-Length'])
+                    except KeyError:
+                        size = None
+                if self.check_space:
+                    check_storage(location, size)
+                with open(location, 'wb') as f:
+                    if self.progressbar and size:
+                        with Progressbar(CHUNK_SIZE / size) as p:
+                            for chunk in iter(
+                                lambda: begin(p.increment(), r.raw.read(CHUNK_SIZE)),
+                                b'',
+                            ):
+                                f.write(chunk)
+                    else:
+                        # We'll try to stream the download directly with `copyfileobj()` so that large
+                        #  files (like entire VyOS images) don't occupy much memory.
+                        shutil.copyfileobj(r.raw, f)
 
     def upload(self, location: str):
         # Does not yet support progressbars.
@@ -464,22 +477,23 @@ class TftpC:
                  source_port=0,
                  timeout=10,
                  vrf=None):
-        source_option = f'--interface {source_host} --local-port {source_port}' if source_host else ''
-        progress_flag = '--progress-bar' if progressbar else '--silent'
-        self.command = f'curl {source_option} {progress_flag} --connect-timeout {timeout}'
+        self.command = ['curl']
+        if source_host:
+            self.command += ['--interface', str(source_host), '--local-port', str(source_port)]
+        self.command += ['--progress-bar'] if progressbar else ['--silent']
+        self.command += ['--connect-timeout', str(timeout)]
         self.urlstring = urllib.parse.urlunsplit(url)
         self.vrf = vrf
 
     def download(self, location: str):
         with open(location, 'wb') as f:
-            f.write(cmd(f'{self.command} "{self.urlstring}"',
-                        vrf=self.vrf).encode())
+            f.write(cmdl(self.command + [self.urlstring],
+                         vrf=self.vrf).encode())
 
     def upload(self, location: str):
-        print(f'{self.command} "{self.urlstring}"')
         with open(location, 'rb') as f:
-            cmd(f'{self.command} --upload-file - "{self.urlstring}"',
-                input=f.read(), vrf=self.vrf)
+            cmdl(self.command + ['--upload-file', '-', self.urlstring],
+                 input=f.read(), vrf=self.vrf)
 
 class GitC:
     def __init__(self,

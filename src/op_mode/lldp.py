@@ -22,7 +22,7 @@ import typing
 from tabulate import tabulate
 
 from vyos.configquery import ConfigTreeQuery
-from vyos.utils.process import cmd
+from vyos.utils.process import cmdl
 from vyos.utils.dict import dict_search
 
 import vyos.opmode
@@ -53,7 +53,7 @@ def _get_raw_data(interface=None, detail=False):
         tmp += f' details'
     if interface:
         tmp += f' ports {interface}'
-    output = cmd(tmp)
+    output = cmdl(tmp.split())
     data = json.loads(output)
     if not data:
         return []
@@ -64,7 +64,7 @@ def _get_formatted_output(raw_data):
     tmp = dict_search('lldp.interface', raw_data)
     if not tmp:
         return None
-    # One can not always ensure that "interface" is of type list, add safeguard.
+    # One cannot always ensure that "interface" is of type list, add safeguard.
     # E.G. Juniper Networks, Inc. ex2300-c-12t only has a dict, not a list of dicts
     if isinstance(tmp, dict):
         tmp = [tmp]
@@ -87,7 +87,7 @@ def _get_formatted_output(raw_data):
             # Capabilities
             cap = ''
             capabilities = jmespath.search('chassis.[*][0][0].capability', values)
-            # One can not always ensure that "capability" is of type list, add
+            # One cannot always ensure that "capability" is of type list, add
             # safeguard. E.G. Unify US-24-250W only has a dict, not a list of dicts
             if isinstance(capabilities, dict):
                 capabilities = [capabilities]
@@ -151,7 +151,7 @@ def show_neighbors(raw: bool, interface: typing.Optional[str], detail: typing.Op
         tmp = 'lldpcli -f text show neighbors details'
         if interface:
             tmp += f' ports {interface}'
-        return cmd(tmp)
+        return cmdl(tmp.split())
 
 if __name__ == "__main__":
     try:

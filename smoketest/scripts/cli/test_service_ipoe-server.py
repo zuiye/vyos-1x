@@ -22,7 +22,7 @@ from base_vyostest_shim import VyOSUnitTestSHIM
 from collections import OrderedDict
 
 from vyos.configsession import ConfigSessionError
-from vyos.utils.process import cmd
+from vyos.utils.process import cmdl
 from vyos.template import range_to_regex
 from configparser import ConfigParser
 from configparser import RawConfigParser
@@ -107,7 +107,7 @@ class TestServiceIPoEServer(BasicAccelPPPTest.TestCase):
         self.verify(conf)
 
         # check local users
-        tmp = cmd(f"sudo cat {self._chap_secrets}")
+        tmp = cmdl(['cat', self._chap_secrets], sudo=True)
         regex = f"{interface}\s+\*\s+{mac_address}\s+\*"
         tmp = re.findall(regex, tmp)
         self.assertTrue(tmp)
@@ -292,7 +292,7 @@ delegate={delegate_2_prefix},{delegate_mask},name={pool_name}"""
         self.verify(conf)
 
         # check local users
-        tmp = cmd(f'sudo cat {self._chap_secrets}')
+        tmp = cmdl(['cat', self._chap_secrets], sudo=True)
         regex = f'{interface}\s+\*\s+{mac_address}\s+{ip_address}'
         tmp = re.findall(regex, tmp)
         self.assertTrue(tmp)
@@ -318,6 +318,25 @@ delegate={delegate_2_prefix},{delegate_mask},name={pool_name}"""
         conf = ConfigParser(allow_no_value=True, delimiters='=', strict=False)
         conf.read(self._config_file)
         self.assertIn(f'start={start_session}', conf['ipoe']['interface'])
+
+    def test_ipoe_server_idle_timeout(self):
+        idle_timeout = '300'
+
+        self.basic_config()
+        self.cli_commit()
+
+        # Default: no idle-timeout emitted
+        conf = ConfigParser(allow_no_value=True, delimiters='=', strict=False)
+        conf.read(self._config_file)
+        self.assertNotIn('idle-timeout', conf['ipoe'])
+
+        # Configure idle-timeout
+        self.set(['idle-timeout', idle_timeout])
+        self.cli_commit()
+
+        conf = ConfigParser(allow_no_value=True, delimiters='=', strict=False)
+        conf.read(self._config_file)
+        self.assertEqual(conf['ipoe']['idle-timeout'], idle_timeout)
 
     @unittest.skip("PPP is not a part of IPoE")
     def test_accel_ppp_options(self):

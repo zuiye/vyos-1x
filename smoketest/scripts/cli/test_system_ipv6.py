@@ -56,11 +56,15 @@ class TestSystemIPv6(VyOSUnitTestSHIM.TestCase):
         self.assertNotIn('no ipv6 forwarding', frrconfig)
 
     def test_system_ipv6_strict_dad(self):
-        # This defaults to 1
-        self.assertEqual(sysctl_read(['net', 'ipv6', 'conf', 'all', 'accept_dad']), '1')
+        # T7736: "all" defaults to 0 (see 32-vyos-podman.conf) so that
+        # newly created interfaces outside VyOS's interface model (e.g.
+        # netavark's container bridges) skip DAD; VyOS-managed interface
+        # types always write their own explicit accept_dad on commit
+        # (XML defaultValue 1), so this does not affect them.
+        self.assertEqual(sysctl_read(['net', 'ipv6', 'conf', 'all', 'accept_dad']), '0')
 
         # Do not assign any IPv6 address on interfaces, this requires a reboot
-        # which can not be tested, but we can read the config file :)
+        # which cannot be tested, but we can read the config file :)
         self.cli_set(base_path + ['strict-dad'])
         self.cli_commit()
 
@@ -72,7 +76,7 @@ class TestSystemIPv6(VyOSUnitTestSHIM.TestCase):
         self.assertEqual(sysctl_read(['net', 'ipv6', 'fib_multipath_hash_policy']), '0')
 
         # Do not assign any IPv6 address on interfaces, this requires a reboot
-        # which can not be tested, but we can read the config file :)
+        # which cannot be tested, but we can read the config file :)
         self.cli_set(base_path + ['multipath', 'layer4-hashing'])
         self.cli_commit()
 

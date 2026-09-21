@@ -15,7 +15,6 @@ Build-Depends:
   libffi-dev,
 # For QA/Lint
   pylint,
-  python3-vici (>= 5.7.2),
   python3-fastapi,
   python3-pyudev,
   python3-systemd,
@@ -110,7 +109,11 @@ Depends:
   iproute2 (>= 6.0.0),
   linux-cpupower,
   hwloc,
+# For "system option kdump"
   kexec-tools,
+  kdump-tools,
+  makedumpfile,
+# End "system option kdump"
 # ipaddrcheck is widely used in IP value validators
   ipaddrcheck,
   ethtool (>= 6.10),
@@ -121,8 +124,11 @@ Depends:
   tuned,
   beep,
   wide-dhcpv6-client,
-# Generic colorizer
-  grc,
+# The package "whois" contains both a whois database client
+# that end users can find useful,
+# and the "mkpasswd" utility we use for generating hashed passwords
+# in the standalone password reset script
+  whois,
 ## End of System services and utilities
 ## For the installer
   fdisk,
@@ -168,7 +174,7 @@ Depends:
   libqmi-utils,
 # End "interfaces wwan"
 # For "interfaces openvpn"
-  openvpn,
+  openvpn (>= 2.7),
   openvpn-auth-ldap,
   openvpn-auth-radius,
   openvpn-otp,
@@ -236,9 +242,6 @@ Depends:
   openssh-server,
   sshguard,
 # End "service ssh"
-# For "service salt-minion"
-  salt-minion,
-# End "service salt-minion"
 # For "service snmp"
   snmp,
   snmpd,
@@ -304,14 +307,14 @@ Depends:
   nfct,
   nftables (>= 0.9.3),
 # For "vpn ipsec"
-  strongswan (>= 5.9),
-  strongswan-swanctl (>= 5.9),
-  charon-systemd,
-  libcharon-extra-plugins (>=5.9),
-  libcharon-extauth-plugins (>=5.9),
-  libstrongswan-extra-plugins (>=5.9),
-  libstrongswan-standard-plugins (>=5.9),
-  python3-vici (>= 5.7.2),
+  strongswan (>= 6.0.6),
+  strongswan-swanctl (>= 6.0.6),
+  charon-systemd (>= 6.0.6),
+  libcharon-extra-plugins (>= 6.0.6),
+  libcharon-extauth-plugins (>= 6.0.6),
+  libstrongswan-extra-plugins (>= 6.0.6),
+  libstrongswan-standard-plugins (>= 6.0.6),
+  python3-vici (>= 6.0.6),
 # End "vpn ipsec"
 # For "nat64"
   jool,
@@ -333,9 +336,9 @@ Depends:
   kbd,
 # End "system option keyboard-layout"
 # For "container"
-  podman (>=4.9.5),
-  netavark,
-  aardvark-dns,
+  podman (>=5.8),
+  netavark (>=1.14.0),
+  aardvark-dns (>=1.14.0),
 # iptables is only used for containers now, not the the firewall CLI
   iptables,
 # End container
@@ -440,7 +443,7 @@ Depends:
   aptitude,
   arpwatch,
   atop,
-  bgpq3,
+  bgpq4,
   dnsdist,
   dnsutils,
   exfat-fuse,

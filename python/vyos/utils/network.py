@@ -18,15 +18,17 @@ import hashlib
 from json import loads
 from socket import AF_INET
 from socket import AF_INET6
-from vyos.utils.process import cmd
+from vyos.utils.process import cmdl
 
 def _are_same_ip(one, two):
     from socket import inet_pton
     from vyos.template import is_ipv4
     # compare the binary representation of the IP
     f_one = AF_INET if is_ipv4(one) else AF_INET6
-    s_two = AF_INET if is_ipv4(two) else AF_INET6
-    return inet_pton(f_one, one) == inet_pton(f_one, two)
+    f_two = AF_INET if is_ipv4(two) else AF_INET6
+    if f_one != f_two:
+        return False
+    return inet_pton(f_one, one) == inet_pton(f_two, two)
 
 def get_protocol_by_name(protocol_name):
     """Get protocol number by protocol name
@@ -72,11 +74,11 @@ def get_host_identity() -> str:
     uuid_file = '/sys/class/dmi/id/product_uuid'
 
     if os.path.exists(uuid_file):
-        uuid = cmd(f"sudo cat {uuid_file}").strip().replace("-", "").lower()
+        uuid = cmdl(['cat', uuid_file], sudo=True).strip().replace("-", "").lower()
     else:
         uuid = None
 
-    host = cmd("hostname").strip().lower()
+    host = cmdl(['hostname']).strip().lower()
 
     if uuid is not None:
         return f"{uuid}:{host}"
@@ -109,7 +111,7 @@ def gen_mac(name: str, addr: str, ident: str) -> str:
     return ":".join(f"{x:02x}" for x in b)
 
 def get_netns_all() -> list:
-    tmp = loads(cmd('ip --json netns ls'))
+    tmp = loads(cmdl(['ip', '--json', 'netns', 'ls']))
     return [ netns['name'] for netns in tmp ]
 
 def get_vrf_members(vrf: str) -> list:
@@ -119,19 +121,44 @@ def get_vrf_members(vrf: str) -> list:
     :return: list
     """
     interfaces = []
+    if not interface_exists(vrf):
+        return interfaces
     try:
-        if not interface_exists(vrf):
-            raise ValueError(f'VRF "{vrf}" does not exist!')
-        output = cmd(f'ip --json --brief link show vrf {vrf}')
+        output = cmdl(['ip', '--json', '--brief', 'link', 'show', 'vrf', vrf])
         answer = loads(output)
         for data in answer:
             if 'ifname' in data:
                 # Skip PIM interfaces which appears in VRF
                 if 'pim' not in data.get('ifname'):
                     interfaces.append(data.get('ifname'))
-    except:
+    except Exception:
         pass
     return interfaces
+
+def get_vrf_pids(vrf: str) -> list[tuple[int, str]]:
+    """
+    Get list of processes running inside a given VRF
+
+    "ip vrf pids <vrf>" prints one "<pid>  <name>" pair per line:
+      44425  dhclient
+
+    :param vrf: str
+    :return: list of (pid, process_name) tuples
+    """
+    processes = []
+    if not interface_exists(vrf):
+        return processes
+    try:
+        output = cmdl(['ip', 'vrf', 'pids', vrf])
+    except Exception:
+        return processes
+    for line in output.splitlines():
+        tmp = line.split(maxsplit=1)
+        # skip blank lines and any output not of the "<pid> <name>" form
+        if len(tmp) != 2 or not tmp[0].isdigit():
+            continue
+        processes.append((int(tmp[0]), tmp[1].strip()))
+    return processes
 
 def get_interface_vrf(interface):
     """ Returns VRF of given interface """
@@ -158,13 +185,48 @@ def get_vrf_tableid(interface: str):
         table = tmp['linkinfo']['info_slave_data']['table']
     return table
 
+
+def split_interface_vlans(interface: str) -> tuple:
+    """
+    Parse a interface name (with optional VLAN suffixes) into its
+    component parts.
+
+    Handles three input forms:
+      - 'br0'         -> root bridge interface only
+      - 'br0.100'     -> root bridge interface + one VLAN sub-interface level
+      - 'br0.100.200' -> root bridge interface + two VLAN sub-interface levels (QinQ)
+
+    Returns a tuple with the following parts on success:
+      (
+        'br0',  # root interface (always present)
+        '100',  # first VLAN suffix  (None if not present)
+        '200',  # second VLAN suffix (None if not present)
+      )
+    """
+
+    parts = interface.split('.')
+
+    # Guard: we support at most bridge + 2 VLAN levels (e.g. br0.100.200)
+    if len(parts) > 3:
+        raise ValueError(
+            f'Interface "{interface}" has too many VLAN suffixes. '
+            'Only up to two levels are supported (e.g. br0.100.200).'
+        )
+
+    iface = parts[0]
+    vlan_id = parts[1] if len(parts) >= 2 else None
+    inner_vlan_id = parts[2] if len(parts) == 3 else None
+
+    return iface, vlan_id, inner_vlan_id
+
+
 def get_interface_config(interface):
     """ Returns the used encapsulation protocol for given interface.
         If interface does not exist, None is returned.
     """
     if not interface_exists(interface):
         return None
-    tmp = loads(cmd(f'ip --detail --json link show dev {interface}'))[0]
+    tmp = loads(cmdl(['ip', '--detail', '--json', 'link', 'show', 'dev', interface]))[0]
     return tmp
 
 def get_interface_address(interface):
@@ -173,7 +235,7 @@ def get_interface_address(interface):
     """
     if not interface_exists(interface):
         return None
-    tmp = loads(cmd(f'ip --detail --json addr show dev {interface}'))[0]
+    tmp = loads(cmdl(['ip', '--detail', '--json', 'addr', 'show', 'dev', interface]))[0]
     return tmp
 
 def get_interface_namespace(interface: str):
@@ -181,13 +243,14 @@ def get_interface_namespace(interface: str):
        Returns which netns the interface belongs to
     """
     # Bail out early if netns does not exist
-    tmp = cmd(f'ip --json netns ls')
-    if not tmp: return None
+    tmp = cmdl(['ip', '--json', 'netns', 'ls'])
+    if not tmp:
+        return None
 
     for ns in loads(tmp):
         netns = f'{ns["name"]}'
         # Search interface in each netns
-        data = loads(cmd(f'ip netns exec {netns} ip --json link show'))
+        data = loads(cmdl(['ip', 'netns', 'exec', netns, 'ip', '--json', 'link', 'show']))
         for tmp in data:
             if interface == tmp["ifname"]:
                 return netns
@@ -238,7 +301,11 @@ def is_wwan_connected(interface):
 
     modem = interface.lstrip('wwan')
 
-    tmp = cmd(f'mmcli --modem {modem} --output-json')
+    try:
+        tmp = cmdl(['mmcli', '--modem', modem, '--output-json'])
+    except OSError:
+        return False
+
     tmp = loads(tmp)
 
     # return True/False if interface is in connected state
@@ -248,12 +315,12 @@ def get_bridge_fdb(interface):
     """ Returns the forwarding database entries for a given interface """
     if not interface_exists(interface):
         return None
-    tmp = loads(cmd(f'bridge -j fdb show dev {interface}'))
+    tmp = loads(cmdl(['bridge', '-j', 'fdb', 'show', 'dev', interface]))
     return tmp
 
 def get_all_vrfs():
     """ Return a dictionary of all system wide known VRF instances """
-    tmp = loads(cmd('ip --json vrf list'))
+    tmp = loads(cmdl(['ip', '--json', 'vrf', 'list']))
     # Result is of type [{"name":"red","table":1000},{"name":"blue","table":2000}]
     # so we will re-arrange it to a more nicer representation:
     # {'red': {'table': 1000}, 'blue': {'table': 2000}}
@@ -298,10 +365,12 @@ def mac2eui64(mac, prefix=None):
             net = ip_network(prefix, strict=False)
             euil = int('0x{0}'.format(eui64), 16)
             return str(net[euil])
-        except:  # pylint: disable=bare-except
+        except Exception:
             return
 
-def check_port_availability(address: str=None, port: int=0, protocol: str='tcp') -> bool:
+
+def check_port_availability(address: str = None, port: int = 0,
+                            protocol: str = 'tcp', vrf: str = None) -> bool:
     """
     Check if given port is available and not used by any service.
 
@@ -311,7 +380,9 @@ def check_port_availability(address: str=None, port: int=0, protocol: str='tcp')
     Args:
       address: IPv4 or IPv6 address - if None, checks on all interfaces
       port:  TCP/UDP port number.
-
+      vrf:   VRF name to test the bind in - when set, the socket is bound
+             to the VRF master device via SO_BINDTODEVICE so that the
+             port check runs in the correct L3 domain.
 
     Returns:
       False if a port is busy or IP address does not exists
@@ -336,7 +407,7 @@ def check_port_availability(address: str=None, port: int=0, protocol: str='tcp')
     protocol = socket.SOCK_STREAM if protocol == 'tcp' else socket.SOCK_DGRAM
     try:
         addr_info = socket.getaddrinfo(address, port, socket.AF_UNSPEC, protocol)
-    except socket.gaierror as e:
+    except socket.gaierror:
         print(f'Invalid address: {address}')
         return False
 
@@ -344,12 +415,15 @@ def check_port_availability(address: str=None, port: int=0, protocol: str='tcp')
         try:
             with socket.socket(family, socktype, proto) as s:
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                # When a VRF is specified, bind the socket to the VRF master
+                # device so the address is resolved in that VRF's L3 domain.
+                if vrf:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE,
+                                 (vrf + '\0').encode())
                 s.bind(sockaddr)
-                # port is free to use
-                return True
+                return True # port is free to use
         except OSError:
-            # port is already in use
-            return False
+            return False # port is already in use
 
     # if we reach this point, no socket was tested and we assume the port is
     # already in use - better safe then sorry
@@ -452,7 +526,6 @@ def is_intf_addr_assigned(ifname: str, addr: str, netns: str=None) -> bool:
         json_out = loads(out)
         addresses = jmespath.search("[].addr_info[].{family: family, address: local, prefixlen: prefixlen}", json_out)
         for address_info in addresses:
-            family = address_info['family']
             address = address_info['address']
             prefixlen = address_info['prefixlen']
             # Remove the interface name if present in the given address
@@ -479,7 +552,7 @@ def is_wireguard_key_pair(private_key: str, public_key:str) -> bool:
     :return: If public/private keys are keypair returns True else False
     :rtype: bool
     """
-    gen_public_key = cmd('wg pubkey', input=private_key)
+    gen_public_key = cmdl(['wg', 'pubkey'], input=private_key)
     if gen_public_key == public_key:
         return True
     else:
@@ -495,7 +568,7 @@ def get_wireguard_peers(ifname: str) -> list:
     """
     if not interface_exists(ifname):
         return []
-    peers = cmd(f'wg show {ifname} peers')
+    peers = cmdl(['wg', 'show', ifname, 'peers'])
     return peers.splitlines()
 
 def is_subnet_connected(subnet, primary=False):
@@ -582,7 +655,7 @@ def get_vxlan_vlan_tunnels(interface: str) -> list:
     #     } ]
     #
     os_configured_vlan_ids = []
-    tmp = loads(cmd(f'bridge --json vlan tunnelshow dev {interface}'))
+    tmp = loads(cmdl(['bridge', '--json', 'vlan', 'tunnelshow', 'dev', interface]))
     if tmp:
         for tunnel in tmp[0].get('tunnels', {}):
             vlanStart = tunnel['vlan']
@@ -612,7 +685,7 @@ def get_vxlan_vni_filter(interface: str) -> list:
     #
     # Example output: ['10010', '10020', '10021', '10022']
     os_configured_vnis = []
-    tmp = loads(cmd(f'bridge --json vni show dev {interface}'))
+    tmp = loads(cmdl(['bridge', '--json', 'vni', 'show', 'dev', interface]))
     if tmp:
         for tunnel in tmp[0].get('vnis', {}):
             vniStart = tunnel['vni']
@@ -640,7 +713,7 @@ def ipv6_prefix_length(low, high):
     try:
         lo = bytearray(socket.inet_pton(socket.AF_INET6, low))
         hi = bytearray(socket.inet_pton(socket.AF_INET6, high))
-    except:
+    except Exception:
         return None
 
     xor = bytearray(a ^ b for a, b in zip(lo, hi))
@@ -675,7 +748,7 @@ def get_nft_vrf_zone_mapping() -> dict:
     from jmespath import search
 
     output = []
-    tmp = loads(cmd('sudo nft -j list table inet vrf_zones'))
+    tmp = loads(cmdl(['nft', '-j', 'list', 'table', 'inet', 'vrf_zones'], sudo=True))
     # {'nftables': [{'metainfo': {'json_schema_version': 1,
     #                     'release_name': 'Old Doc Yak #3',
     #                     'version': '1.0.9'}},
@@ -704,7 +777,7 @@ def is_valid_ipv4_address_or_range(addr: str) -> bool:
             return is_valid_ipv4_address_or_range(split[0]) and is_valid_ipv4_address_or_range(split[1])
         else:
             return ip_network(addr).version == 4
-    except:
+    except Exception:
         return False
 
 def is_valid_ipv6_address_or_range(addr: str) -> bool:
@@ -720,7 +793,7 @@ def is_valid_ipv6_address_or_range(addr: str) -> bool:
             return is_valid_ipv6_address_or_range(split[0]) and is_valid_ipv6_address_or_range(split[1])
         else:
             return ip_network(addr).version == 6
-    except:
+    except Exception:
         return False
 
 

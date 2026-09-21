@@ -9,13 +9,13 @@
         <properties>
           <help>Monitor last lines of messages file</help>
         </properties>
-        <command>bash -c 'SYSTEMD_COLORS=false journalctl --no-hostname --follow --boot'</command>
+        <command>SYSTEMD_COLORS=false journalctl --no-hostname --follow --boot</command>
         <children>
           <node name="color">
             <properties>
               <help>Output log in a colored fashion</help>
             </properties>
-            <command>bash -c 'SYSTEMD_COLORS=false grc journalctl --no-hostname --follow --boot'</command>
+            <command>SYSTEMD_COLORS=true journalctl --no-hostname --follow --boot</command>
           </node>
           <leafNode name="certbot">
             <properties>
@@ -111,6 +111,15 @@
               </node>
             </children>
           </node>
+          <tagNode name="facility">
+            <properties>
+              <help>Monitor last lines of messages file and filter by specified facility</help>
+              <completionHelp>
+                <list>kern user mail daemon auth syslog lpr news uucp cron authpriv ftp local0 local1 local2 local3 local4 local5 local6 local7</list>
+              </completionHelp>
+            </properties>
+            <command>SYSTEMD_COLORS=false journalctl --no-hostname --follow --boot --facility=$4</command>
+          </tagNode>
           <leafNode name="flow-accounting">
             <properties>
               <help>Monitor last lines of flow-accounting log</help>
@@ -199,6 +208,15 @@
             </properties>
             <command>journalctl --no-hostname --boot --follow --unit accel-ppp@pppoe.service</command>
           </leafNode>
+          <tagNode name="priority">
+            <properties>
+              <help>Monitor last lines of messages file and filter by minimum priority level (includes all higher severities)</help>
+              <completionHelp>
+                <list>emerg alert crit err warning notice info debug</list>
+              </completionHelp>
+            </properties>
+            <command>SYSTEMD_COLORS=false journalctl --no-hostname --follow --boot --priority=$4</command>
+          </tagNode>
           <node name="protocol">
             <properties>
               <help>Monitor routing protocol logs</help>

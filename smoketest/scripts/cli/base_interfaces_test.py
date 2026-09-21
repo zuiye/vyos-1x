@@ -16,6 +16,8 @@ import re
 import jmespath
 
 from json import loads
+from time import sleep
+from time import time
 from netifaces import ifaddresses # pylint: disable = no-name-in-module
 from socket import AF_INET
 from socket import AF_INET6
@@ -30,10 +32,11 @@ from vyos.ifconfig import Section
 from vyos.pki import CERT_BEGIN
 from vyos.utils.file import read_file
 from vyos.utils.dict import dict_search
-from vyos.utils.process import cmd
+from vyos.utils.process import cmdl
 from vyos.utils.process import process_named_running
 from vyos.utils.network import get_interface_config
 from vyos.utils.network import get_interface_vrf
+from vyos.utils.network import get_vrf_pids
 from vyos.utils.network import get_vrf_tableid
 from vyos.utils.network import interface_exists
 from vyos.utils.network import is_intf_addr_assigned
@@ -46,6 +49,19 @@ dhclient_base_dir = directories['isc_dhclient_dir']
 dhclient_process_name = 'dhclient'
 dhcp6c_base_dir = directories['dhcp6_client_dir']
 dhcp6c_process_name = 'dhcp6c'
+
+# Daemon startup/shutdown on a loaded CI runner can exceed 10 seconds. The
+# polls in process_named_running() and wait_for_result() complete as soon as
+# the expected state is reached, so a longer window only delays the failure
+# path.
+PROCESS_WAIT_TIMEOUT = 60
+
+# Re-checking which VRF a client already running sits in only has to outlast a
+# re-exec, which takes milliseconds - unlike waiting for the client to appear
+# at all. This check runs once per interface, so a long window here is
+# multiplied by the number of interfaces under test and can exhaust the
+# harness' per-testcase budget before reporting anything.
+VRF_PID_WAIT_TIMEOUT = 10
 
 MSG_TESTCASE_UNSUPPORTED = 'unsupported on interface family'
 
@@ -133,7 +149,7 @@ def is_mirrored_to(interface, mirror_if, qdisc) -> bool:
     if qdisc not in ['ffff', '1']:
         raise ValueError()
 
-    tmp = loads(cmd(f'tc -json filter ls dev {interface} parent {qdisc}:'))
+    tmp = loads(cmdl(['tc', '-json', 'filter', 'ls', 'dev', interface, 'parent', f'{qdisc}:']))
     # the following syntax looks odd but we need to filter out the first
     # result sets from tc which do not have "options.actions...".
     tmp = jmespath.search("[?options.actions[0].kind=='mirred'].options.actions[0].{mirred_action: mirred_action, to_dev: to_dev} | [0]", tmp)
@@ -208,18 +224,71 @@ class BasicInterfaceTest:
                 for map_entry in ct_map:
                      self.assertNotEqual(intf, map_entry['interface'])
 
-            # No daemon started during tests should remain running
+            # No daemon started during tests should remain running. A client
+            # daemon may still be shutting down after its config was removed,
+            # so grant a grace period before declaring a leak.
             for daemon in ['dhcp6c', 'dhclient']:
                 # if _interface list is populated do a more fine grained search
                 # by also checking the cmd arguments passed to the daemon
                 if self._interfaces:
                     for tmp in self._interfaces:
-                        self.assertFalse(process_named_running(daemon, tmp))
+                        _, pid = self.wait_for_result(
+                            lambda d=daemon, i=tmp: process_named_running(d, i), None,
+                            timeout=PROCESS_WAIT_TIMEOUT)
+                        self.assertFalse(pid)
                 else:
-                    self.assertFalse(process_named_running(daemon))
+                    _, pid = self.wait_for_result(
+                        lambda d=daemon: process_named_running(d), None,
+                        timeout=PROCESS_WAIT_TIMEOUT)
+                    self.assertFalse(pid)
 
             # always forward to base class
             super().tearDown()
+
+        def assert_process_in_vrf(self, process_name, interface, vrf_name):
+            """Assert the DHCP client for an interface runs inside a VRF.
+
+            The client re-executes itself at moments of its own choosing, so a
+            PID read a moment ago can already be gone by the time the VRF's
+            process list is read - the process is there, it simply has a new
+            PID. Resolving the PID and reading the list as one step, and
+            retrying, makes a restart cost a retry instead of a failure.
+            """
+            def running_in_vrf():
+                pid = process_named_running(process_name, cmdline=interface)
+                if not pid:
+                    return False
+                return any(p == pid for p, _ in get_vrf_pids(vrf_name))
+
+            found, _ = self.wait_for_result(running_in_vrf, True,
+                                            timeout=VRF_PID_WAIT_TIMEOUT)
+            self.assertTrue(found,
+                f'no {process_name} process for interface {interface} found '
+                f'in VRF {vrf_name}')
+
+        def get_process_cmdline(self, process_name, interface, pid):
+            # dhclient re-executes itself while daemonizing - the PID found
+            # right after commit may already be gone when /proc is read.
+            # Poll PID discovery and the /proc read together until the
+            # deadline instead of failing on a transient PID. Returns the
+            # (pid, cmdline) pair that was actually validated so callers
+            # can assert against the same process.
+            # NB: read_file() re-raises on failure unless defaultonfailure
+            # is set to a non-None value.
+            time_expire = time() + PROCESS_WAIT_TIMEOUT
+            cmdline = read_file(f'/proc/{pid}/cmdline', defaultonfailure='')
+            while not cmdline:
+                if time() > time_expire:
+                    break
+                sleep(0.250)
+                tmp = process_named_running(process_name, cmdline=interface)
+                if not tmp:
+                    continue
+                pid = tmp
+                cmdline = read_file(f'/proc/{pid}/cmdline', defaultonfailure='')
+            self.assertTrue(cmdline,
+                f'{process_name} cmdline unreadable for interface {interface}')
+            return pid, cmdline
 
         def test_dhcp_disable_interface(self):
             if not self._test_dhcp:
@@ -269,7 +338,8 @@ class BasicInterfaceTest:
 
             for interface in self._interfaces:
                 # Check if dhclient process runs
-                dhclient_pid = process_named_running(dhclient_process_name, cmdline=interface, timeout=10)
+                dhclient_pid = process_named_running(dhclient_process_name, cmdline=interface,
+                                                     timeout=PROCESS_WAIT_TIMEOUT)
                 self.assertTrue(dhclient_pid)
 
                 dhclient_config = read_file(f'{dhclient_base_dir}/dhclient_{interface}.conf')
@@ -281,7 +351,8 @@ class BasicInterfaceTest:
                 self.assertIn(f'send user-class "{user_class}";', dhclient_config)
 
                 # and the commandline has the appropriate options
-                cmdline = read_file(f'/proc/{dhclient_pid}/cmdline')
+                dhclient_pid, cmdline = self.get_process_cmdline(
+                    dhclient_process_name, interface, dhclient_pid)
                 self.assertIn(f'-e\x00IF_METRIC={distance}', cmdline)
 
         def test_dhcp_vrf(self):
@@ -309,14 +380,19 @@ class BasicInterfaceTest:
                 self.assertEqual(tmp, vrf_name)
 
                 # Check if dhclient process runs
-                dhclient_pid = process_named_running(dhclient_process_name, cmdline=interface, timeout=10)
+                dhclient_pid = process_named_running(dhclient_process_name, cmdline=interface,
+                                                     timeout=PROCESS_WAIT_TIMEOUT)
                 self.assertTrue(dhclient_pid)
-                # .. inside the appropriate VRF instance
-                vrf_pids = cmd(f'ip vrf pids {vrf_name}')
-                self.assertIn(str(dhclient_pid), vrf_pids)
-                # and the commandline has the appropriate options
-                cmdline = read_file(f'/proc/{dhclient_pid}/cmdline')
+                # The commandline must carry the appropriate options ..
+                # (get_process_cmdline() may re-resolve the PID, so it runs
+                # first and the VRF check below targets the same process)
+                dhclient_pid, cmdline = self.get_process_cmdline(
+                    dhclient_process_name, interface, dhclient_pid)
                 self.assertIn(f'-e\x00IF_METRIC={cli_default_metric}', cmdline)
+                # .. and the process must run inside the appropriate VRF
+                # instance
+                self.assert_process_in_vrf(dhclient_process_name, interface,
+                                           vrf_name)
 
             # T5103: remove interface from VRF instance and move DHCP client
             # back to default VRF. This must restart the DHCP client process
@@ -330,14 +406,19 @@ class BasicInterfaceTest:
                 tmp = get_interface_vrf(interface)
                 self.assertEqual(tmp, 'default')
                 # Check if dhclient process runs
-                dhclient_pid = process_named_running(dhclient_process_name, cmdline=interface, timeout=10)
+                dhclient_pid = process_named_running(dhclient_process_name, cmdline=interface,
+                                                     timeout=PROCESS_WAIT_TIMEOUT)
                 self.assertTrue(dhclient_pid)
-                # .. inside the appropriate VRF instance
-                vrf_pids = cmd(f'ip vrf pids {vrf_name}')
-                self.assertNotIn(str(dhclient_pid), vrf_pids)
-                # and the commandline has the appropriate options
-                cmdline = read_file(f'/proc/{dhclient_pid}/cmdline')
+                # The commandline must carry the appropriate options ..
+                # (get_process_cmdline() may re-resolve the PID, so it runs
+                # first and the VRF check below targets the same process)
+                dhclient_pid, cmdline = self.get_process_cmdline(
+                    dhclient_process_name, interface, dhclient_pid)
                 self.assertIn(f'-e\x00IF_METRIC={cli_default_metric}', cmdline)
+                # .. and the process must no longer run inside the VRF
+                # instance
+                vrf_pids = [p for p, _ in get_vrf_pids(vrf_name)]
+                self.assertNotIn(dhclient_pid, vrf_pids)
 
             self.cli_delete(['vrf', 'name', vrf_name])
 
@@ -365,11 +446,12 @@ class BasicInterfaceTest:
                 self.assertEqual(tmp, vrf_name)
 
                 # Check if dhclient process runs
-                tmp = process_named_running(dhcp6c_process_name, cmdline=interface, timeout=10)
+                tmp = process_named_running(dhcp6c_process_name, cmdline=interface,
+                                            timeout=PROCESS_WAIT_TIMEOUT)
                 self.assertTrue(tmp)
                 # .. inside the appropriate VRF instance
-                vrf_pids = cmd(f'ip vrf pids {vrf_name}')
-                self.assertIn(str(tmp), vrf_pids)
+                self.assert_process_in_vrf(dhcp6c_process_name, interface,
+                                           vrf_name)
 
             # T7135: remove interface from VRF instance and move DHCP client
             # back to default VRF. This must restart the DHCP client process
@@ -384,11 +466,12 @@ class BasicInterfaceTest:
                 self.assertEqual(tmp, 'default')
 
                 # Check if dhclient process runs
-                tmp = process_named_running(dhcp6c_process_name, cmdline=interface, timeout=10)
+                tmp = process_named_running(dhcp6c_process_name, cmdline=interface,
+                                            timeout=PROCESS_WAIT_TIMEOUT)
                 self.assertTrue(tmp)
                 # .. inside the appropriate VRF instance
-                vrf_pids = cmd(f'ip vrf pids {vrf_name}')
-                self.assertNotIn(str(tmp), vrf_pids)
+                vrf_pids = [p for p, _ in get_vrf_pids(vrf_name)]
+                self.assertNotIn(tmp, vrf_pids)
 
 
             self.cli_delete(['vrf', 'name', vrf_name])
@@ -448,7 +531,7 @@ class BasicInterfaceTest:
                     self.cli_set(self._base_path + [interface] + option.split())
                 self.cli_set(self._base_path + [interface, 'vrf', 'invalid'])
 
-            # check validate() - can not use a non-existing VRF
+            # check validate() - cannot use a non-existing VRF
             with self.assertRaises(ConfigSessionError):
                 self.cli_commit()
 
@@ -645,7 +728,7 @@ class BasicInterfaceTest:
                     self.cli_set(base + option.split())
                 self.cli_set(base + ['mtu', self._mtu])
 
-            # check validate() - can not set low MTU if 'no-default-link-local'
+            # check validate() - cannot set low MTU if 'no-default-link-local'
             # is not set on CLI
             with self.assertRaises(ConfigSessionError):
                 self.cli_commit()
@@ -1028,7 +1111,7 @@ class BasicInterfaceTest:
             for interface in self._interfaces:
                 if cli_defined(self._base_path + ['ip'], 'adjust-mss'):
                     base_options = f'oifname "{interface}"'
-                    out = cmd('sudo nft list chain raw VYOS_TCP_MSS')
+                    out = cmdl(['nft', 'list', 'chain', 'raw', 'VYOS_TCP_MSS'], sudo=True)
                     for line in out.splitlines():
                         if line.startswith(base_options):
                             self.assertIn(f'tcp option maxseg size set {mss}', line)
@@ -1073,7 +1156,7 @@ class BasicInterfaceTest:
 
                 if cli_defined(self._base_path + ['ip'], 'source-validation'):
                     base_options = f'iifname "{interface}"'
-                    out = cmd('sudo nft list chain ip raw vyos_rpfilter')
+                    out = cmdl(['nft', 'list', 'chain', 'ip', 'raw', 'vyos_rpfilter'], sudo=True)
                     for line in out.splitlines():
                         if line.startswith(base_options):
                             self.assertIn('fib saddr oif 0', line)
@@ -1119,7 +1202,7 @@ class BasicInterfaceTest:
                 proc_base = f'/proc/sys/net/ipv6/conf/{interface}'
                 if cli_defined(self._base_path + ['ipv6'], 'adjust-mss'):
                     base_options = f'oifname "{interface}"'
-                    out = cmd('sudo nft list chain ip6 raw VYOS_TCP_MSS')
+                    out = cmdl(['nft', 'list', 'chain', 'ip6', 'raw', 'VYOS_TCP_MSS'], sudo=True)
                     for line in out.splitlines():
                         if line.startswith(base_options):
                             self.assertIn(f'tcp option maxseg size set {mss}', line)
@@ -1138,14 +1221,14 @@ class BasicInterfaceTest:
 
                 if cli_defined(self._base_path + ['ipv6'], 'source-validation'):
                     base_options = f'iifname "{interface}"'
-                    out = cmd('sudo nft list chain ip6 raw vyos_rpfilter')
+                    out = cmdl(['nft', 'list', 'chain', 'ip6', 'raw', 'vyos_rpfilter'], sudo=True)
                     for line in out.splitlines():
                         if line.startswith(base_options):
                             self.assertIn('fib saddr . iif oif 0', line)
                             self.assertIn('drop', line)
 
                 if cli_defined(self._base_path + ['ipv6', 'address'], 'interface-identifier'):
-                    tmp = cmd(f'ip -j token show dev {interface}')
+                    tmp = cmdl(['ip', '-j', 'token', 'show', 'dev', interface])
                     tmp = loads(tmp)[0]
                     self.assertEqual(tmp['token'], interface_identifier)
                     self.assertEqual(tmp['ifname'], interface)
@@ -1195,11 +1278,13 @@ class BasicInterfaceTest:
                     self.assertNotIn('syntax error', entry.get('MESSAGE', ''))
 
                 # Better ask the process about it's commandline in the future
-                pid = process_named_running(dhcp6c_process_name, cmdline=interface, timeout=10)
+                pid = process_named_running(dhcp6c_process_name, cmdline=interface,
+                                            timeout=PROCESS_WAIT_TIMEOUT)
                 self.assertTrue(pid)
 
                 # DHCPv6 option "no-release" requires "-n" daemon startup option
-                dhcp6c_options = read_file(f'/proc/{pid}/cmdline')
+                pid, dhcp6c_options = self.get_process_cmdline(
+                    dhcp6c_process_name, interface, pid)
                 self.assertIn('-n', dhcp6c_options)
 
         def test_dhcpv6pd_auto_sla_id(self):
@@ -1254,7 +1339,8 @@ class BasicInterfaceTest:
                     address = str(int(address) + 1)
 
                 # Check for running process
-                self.assertTrue(process_named_running(dhcp6c_process_name, cmdline=interface, timeout=10))
+                self.assertTrue(process_named_running(dhcp6c_process_name, cmdline=interface,
+                                                      timeout=PROCESS_WAIT_TIMEOUT))
 
             for delegatee in delegatees:
                 # we can already cleanup the test delegatee interface here
@@ -1319,7 +1405,8 @@ class BasicInterfaceTest:
                     address = str(int(address) + 1)
 
                 # Check for running process
-                self.assertTrue(process_named_running(dhcp6c_process_name, cmdline=interface, timeout=10))
+                self.assertTrue(process_named_running(dhcp6c_process_name, cmdline=interface,
+                                                      timeout=PROCESS_WAIT_TIMEOUT))
 
             for delegatee in delegatees:
                 # we can already cleanup the test delegatee interface here

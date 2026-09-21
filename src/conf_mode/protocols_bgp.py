@@ -26,7 +26,6 @@ from vyos.configverify import verify_vrf
 from vyos.frrender import FRRender
 from vyos.frrender import get_frrender_dict
 from vyos.template import is_ip
-from vyos.template import is_interface
 from vyos.utils.dict import dict_search
 from vyos.utils.network import get_interface_vrf
 from vyos.utils.network import is_addr_assigned
@@ -196,7 +195,7 @@ def verify(config_dict):
                     raise ConfigError(f'Cannot delete VRF instance "{vrf}", ' \
                                       'unconfigure "import vrf" commands!')
         else:
-            # We are running in the default VRF context, thus we can not delete
+            # We are running in the default VRF context, thus we cannot delete
             # our main BGP instance if there are dependent BGP VRF instances.
             if 'dependent_vrfs' in bgp:
                 for vrf, vrf_options in bgp['dependent_vrfs'].items():
@@ -213,6 +212,26 @@ def verify(config_dict):
 
     if 'system_as' not in bgp:
         raise ConfigError('BGP system-as number must be defined!')
+
+    # FRR #9405 blocks "advertise-all-vni" in named VRFs if a default
+    # BGP instance is initialized first (regardless of default EVPN config).
+    # On boot the default instance starts first, so if a named VRF also has
+    # the flag FRR silently rejects it, causing config divergence. Block the
+    # combination here even when the VRF node is not part of the current commit.
+    # Could be removed when FRR fixes it upstream.
+    if not vrf:
+        for dep_vrf, dep_config in bgp.get('dependent_vrfs', {}).items():
+            if dep_vrf == 'default':
+                continue
+            dep_evpn = dict_search(
+                'protocols.bgp.address_family.l2vpn_evpn', dep_config
+            )
+            if dep_evpn and 'advertise_all_vni' in dep_evpn:
+                raise ConfigError(
+                    f'BGP EVPN "advertise-all-vni" is configured in named VRF "{dep_vrf}". '
+                    f'Remove it from the VRF before adding a default BGP instance, '
+                    f'or move it to the default BGP instance instead.'
+                )
 
     # Verify BMP
     if 'bmp' in bgp:
@@ -276,24 +295,24 @@ def verify(config_dict):
                 if len(peer_config['local_as']) > 1:
                     raise ConfigError(f'Only one local-as number can be specified for peer "{peer}"!')
 
-                # Neighbor local-as override can not be the same as the local-as
+                # Neighbor local-as override cannot be the same as the local-as
                 # we use for this BGP instance!
                 asn = list(peer_config['local_as'].keys())[0]
                 if asn == bgp['system_as']:
                     raise ConfigError('Cannot have local-as same as system-as number')
 
-                # Neighbor AS specified for local-as and remote-as can not be the same
+                # Neighbor AS specified for local-as and remote-as cannot be the same
                 if dict_search('remote_as', peer_config) == asn and neighbor != 'peer_group':
                      raise ConfigError(f'Neighbor "{peer}" has local-as specified which is '\
                                         'the same as remote-as, this is not allowed!')
 
             # ttl-security and ebgp-multihop can't be used in the same configuration
             if 'ebgp_multihop' in peer_config and 'ttl_security' in peer_config:
-                raise ConfigError('You can not set both ebgp-multihop and ttl-security hops')
+                raise ConfigError('You cannot set both ebgp-multihop and ttl-security hops')
 
             # interface and ebgp-multihop can't be used in the same configuration
             if 'ebgp_multihop' in peer_config and 'interface' in peer_config:
-                raise ConfigError(f'Ebgp-multihop can not be used with directly connected '\
+                raise ConfigError(f'Ebgp-multihop cannot be used with directly connected '\
                                   f'neighbor "{peer}"')
 
             # Check if neighbor has both override capability and strict capability match
@@ -361,12 +380,22 @@ def verify(config_dict):
                     vrf_error_msg = f' in VRF "{vrf}"!'
 
                 if is_ip(peer) and is_addr_assigned(peer, vrf):
-                    raise ConfigError(f'Can not configure local address as neighbor "{peer}"{vrf_error_msg}')
-                elif is_interface(peer):
+                    raise ConfigError(f'Cannot configure local address as neighbor "{peer}"{vrf_error_msg}')
+                elif not is_ip(peer):
+                    # T5526: Neighbor is not an IP address — treat as interface name
+                    # regardless of whether the interface currently exists on the system.
+                    # Checking physical existence would silently skip validation during
+                    # boot or config restore, allowing invalid config to reach FRR.
                     if 'peer_group' in peer_config:
-                        raise ConfigError(f'peer-group must be set under the interface node of "{peer}"')
+                        raise ConfigError(
+                            f'To assign a peer-group to an interface-based neighbor, use: '
+                            f'"set protocols bgp neighbor {peer} interface peer-group <name>"'
+                        )
                     if 'remote_as' in peer_config:
-                        raise ConfigError(f'remote-as must be set under the interface node of "{peer}"')
+                        raise ConfigError(
+                            f'To set remote-as for an interface-based neighbor, use: '
+                            f'"set protocols bgp neighbor {peer} interface remote-as <asn>"'
+                        )
                     if 'source_interface' in peer_config['interface']:
                         raise ConfigError(f'"source-interface" option not allowed for neighbor "{peer}"')
 
@@ -405,7 +434,7 @@ def verify(config_dict):
                                           'conditionally-advertise is in use!')
 
                     if {'exist_map', 'non_exist_map'} <= set(afi_config['conditionally_advertise']):
-                        raise ConfigError('Can not specify both exist-map and non-exist-map for ' \
+                        raise ConfigError('Cannot specify both exist-map and non-exist-map for ' \
                                           'conditionally-advertise!')
 
                     if 'exist_map' in afi_config['conditionally_advertise']:
@@ -455,7 +484,7 @@ def verify(config_dict):
 
     # Throw an error if a peer group is not configured for allow range
     for prefix in dict_search('listen.range', bgp) or []:
-        # we can not use dict_search() here as prefix contains dots ...
+        # we cannot use dict_search() here as prefix contains dots ...
         if 'peer_group' not in bgp['listen']['range'][prefix]:
             raise ConfigError(f'Listen range for prefix "{prefix}" has no peer group configured.')
 
@@ -580,12 +609,66 @@ def verify(config_dict):
 
             # Checks only required for L2VPN EVPN
             if afi in ['l2vpn_evpn']:
+                # T8223: FRR #9405 — only one BGP instance may hold "advertise-all-vni"
+                # at a time. When a default BGP instance coexists with a named VRF that
+                # has the flag, FRR silently rejects the VRF's copy on every boot because
+                # the default instance is always started first.
+                if 'advertise_all_vni' in afi_config:
+                    if vrf:
+                        # Named VRF: block whenever a default BGP instance exists.
+                        default_bgp = dict_search(
+                            'dependent_vrfs.default.protocols.bgp', bgp
+                        )
+                        if default_bgp is not None and 'deleted' not in default_bgp:
+                            raise ConfigError(
+                                f'BGP EVPN "advertise-all-vni" is not supported in named VRF "{vrf}" '
+                                f'when a default BGP instance exists. '
+                                f'Configure it in the default BGP instance instead.'
+                            )
+
+                    # Block if multiple BGP instances have advertise-all-vni simultaneously.
+                    advertise_all_vni_vrfs = [vrf if vrf else 'default']
+                    for dep_vrf, dep_config in bgp.get('dependent_vrfs', {}).items():
+                        dep_evpn = dict_search(
+                            'protocols.bgp.address_family.l2vpn_evpn', dep_config
+                        )
+                        if dep_evpn and 'advertise_all_vni' in dep_evpn:
+                            advertise_all_vni_vrfs.append(dep_vrf)
+                    if len(advertise_all_vni_vrfs) > 1:
+                        raise ConfigError(
+                            f'BGP EVPN "advertise-all-vni" cannot be configured in multiple '
+                            f'VRFs simultaneously: {", ".join(advertise_all_vni_vrfs)}.'
+                        )
+
                 if 'vni' in afi_config:
                     for vni, vni_config in afi_config['vni'].items():
                         if 'rd' in vni_config and 'advertise_all_vni' not in afi_config:
                             raise ConfigError('BGP EVPN "rd" requires "advertise-all-vni" to be set!')
                         if 'route_target' in vni_config and 'advertise_all_vni' not in afi_config:
                             raise ConfigError('BGP EVPN "route-target" requires "advertise-all-vni" to be set!')
+
+                # T8865: Detect conflict between VRF-level "vni" sub-block and global
+                # "advertise-all-vni". When advertise-all-vni is active in the default
+                # BGP instance, FRR already owns all VNIs discovered from the kernel.
+                # Attempting to create the same VNI again via a VRF BGP "vni" sub-block
+                # causes FRR to return "% Failed to create VNI" and perform an early exit
+                # from config processing.
+                if vrf and 'vni' in afi_config:
+                    default_bgp_evpn = dict_search(
+                        'dependent_vrfs.default.protocols.bgp.address_family.l2vpn_evpn',
+                        bgp,
+                    )
+                    if (
+                        default_bgp_evpn is not None
+                        and 'deleted' not in default_bgp_evpn
+                    ):
+                        if 'advertise_all_vni' in default_bgp_evpn:
+                            raise ConfigError(
+                                'BGP EVPN "vni" sub-configuration conflicts with '
+                                '"advertise-all-vni" in the default BGP instance. '
+                                'Remove "vni" from the VRF l2vpn-evpn configuration '
+                                'or disable "advertise-all-vni" for the default BGP.'
+                            )
 
     return None
 

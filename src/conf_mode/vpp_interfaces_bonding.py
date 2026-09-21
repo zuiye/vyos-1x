@@ -18,10 +18,14 @@
 
 from vyos.config import Config
 from vyos.configdict import get_interface_dict
+from vyos.configdict import has_vlan_subinterface_configured
+from vyos.configdict import is_node_changed
+from vyos.configdict import leaf_node_changed
 from vyos.configdep import set_dependents, call_dependents
 from vyos.configverify import verify_mtu_ipv6
 from vyos import ConfigError
 from vyos.utils.assertion import assert_mac
+from vyos.utils.dict import dict_search
 from vyos.utils.process import is_systemd_service_active
 
 from vyos.ifconfig import Interface
@@ -108,7 +112,28 @@ def get_config(config=None) -> dict:
         no_tag_node_value_mangle=True,
     )
 
+    iface_path = ['interfaces', 'vpp', 'bonding', ifname]
+    rebuild_required_nodes = ['mode', 'hash-policy', 'mac']
+    for node in rebuild_required_nodes:
+        if is_node_changed(conf, iface_path + [node]):
+            config.update({'rebuild_required': {}})
+
     config['bond_members'] = deps_bond_dict(conf)
+
+    # Members that get detached (removed from the bond, or temporarily
+    # detached and re-attached during a rebuild) keep promiscuous mode
+    # enabled if they have their own VLAN (vif/vif-s) sub-interfaces
+    # configured
+    removed_members = (
+        leaf_node_changed(conf, iface_path + ['member', 'interface']) or []
+    )
+    current_members = dict_search('member.interface', config, default=[])
+    vlan_candidates = set(removed_members + current_members)
+    config['vlan_members'] = [
+        member
+        for member in vlan_candidates
+        if has_vlan_subinterface_configured(conf, member)
+    ]
 
     # Dependency
     config['xconn_members'] = deps_xconnect_dict(conf)
@@ -199,7 +224,7 @@ def verify(config):
         mac = config['mac']
         try:
             assert_mac(mac, test_all_zero=False)
-        except:
+        except Exception:
             raise ConfigError(
                 f'Cannot use {mac}: it is a multicast MAC address. Please provide a unicast MAC address.'
             )
@@ -225,10 +250,12 @@ def apply(config):
 
     ifname = config.get('ifname')
     bond = VPPBondInterface(ifname, config)
-    bond.remove()
+
+    if 'deleted' in config or 'rebuild_required' in config:
+        bond.remove()
 
     if 'deleted' in config:
-        return
+        return None
 
     bond.update(config)
 

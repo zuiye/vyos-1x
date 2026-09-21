@@ -22,15 +22,18 @@ from sys import exit
 from vyos.config import Config
 from vyos.configdict import get_interface_dict
 from vyos.configdict import is_node_changed
+from vyos.configdict import is_vrf_changed
 from vyos.configdict import is_source_interface
 from vyos.configdep import set_dependents
 from vyos.configdep import call_dependents
+from vyos.configdep import called_as_dependent
 from vyos.configverify import verify_vrf
 from vyos.configverify import verify_address
 from vyos.configverify import verify_bridge_delete
 from vyos.configverify import verify_mtu_ipv6
 from vyos.configverify import verify_mirror_redirect
 from vyos.configverify import verify_bond_bridge_member
+from vyos.defaults import wireguard_fwmark_pref
 from vyos.ifconfig import WireGuardIf
 from vyos.utils.kernel import check_kmod
 from vyos.utils.network import check_port_availability
@@ -86,6 +89,10 @@ def get_config(config=None):
         wireguard['prev_fwmark'] = prev.get('fwmark')
         wireguard['prev_vrf'] = prev.get('vrf')
 
+    # Check vrf membership, to ensure firewall is updated
+    if is_vrf_changed(conf, ifname):
+        set_dependents('firewall', conf)
+
     return wireguard
 
 
@@ -108,7 +115,14 @@ def verify(wireguard):
     if 'private_key' not in wireguard:
         raise ConfigError('Wireguard private-key not defined')
 
-    if 'port' in wireguard and 'port_changed' in wireguard:
+    # T8921: Skip the port-availability check on a qos.py-triggered
+    # dependent re-run: by then this interface already holds the port
+    # itself, so the check would always false-positive as busy.
+    if (
+        'port' in wireguard
+        and 'port_changed' in wireguard
+        and not called_as_dependent()
+    ):
         listen_port = int(wireguard['port'])
         if check_port_availability(None, listen_port, protocol='udp') is not True:
             raise ConfigError(f'UDP port {listen_port} is busy or unavailable and '
@@ -174,7 +188,7 @@ def apply(wireguard):
             if table_id is not None:
                 for afi in ['-4', '-6']:
                     call(
-                        f'ip {afi} rule del pref 1998 fwmark {prev_fwmark} table {table_id}'
+                        f'ip {afi} rule del pref {wireguard_fwmark_pref} fwmark {prev_fwmark} table {table_id}'
                     )
 
     # Add ip rule to route fwmark-marked WireGuard tunnel packets into the
@@ -185,7 +199,7 @@ def apply(wireguard):
         table_id = get_vrf_tableid(wireguard['vrf'])
         for afi in ['-4', '-6']:
             call(
-                f'ip {afi} rule add pref 1998 fwmark {wireguard["fwmark"]} table {table_id}'
+                f'ip {afi} rule add pref {wireguard_fwmark_pref} fwmark {wireguard["fwmark"]} table {table_id}'
             )
 
     domain_resolver_usage = '/run/use-vyos-domain-resolver-interfaces-wireguard-' + wireguard['ifname']
@@ -205,6 +219,7 @@ def apply(wireguard):
             domain_action = 'stop'
     call(f'systemctl {domain_action} vyos-domain-resolver.service')
 
+    # run the dependents
     call_dependents()
 
     return None

@@ -26,7 +26,7 @@ from base_vyostest_shim import VyOSUnitTestSHIM
 from vyos.configsession import ConfigSessionError
 from vyos.ifconfig import Section
 from vyos.template import ip_from_cidr
-from vyos.utils.process import cmd
+from vyos.utils.process import cmdl
 from vyos.utils.file import read_file
 from vyos.utils.network import get_interface_config
 from vyos.utils.network import interface_exists
@@ -165,7 +165,7 @@ class BridgeInterfaceTest(BasicInterfaceTest.TestCase):
             for member in self._members:
                 self.cli_set(self._base_path + [interface, 'member', 'interface', member])
 
-        # check validate() - can not use the same member interfaces multiple times
+        # check validate() - cannot use the same member interfaces multiple times
         with self.assertRaises(ConfigSessionError):
             self.cli_commit()
         # only keep the first bond interface configuration
@@ -271,7 +271,7 @@ class BridgeInterfaceTest(BasicInterfaceTest.TestCase):
         def _check_vlan_filter(interface, vifs) -> None:
             configured_vlan_ids = []
 
-            bridge_json = cmd(f'bridge -j vlan show dev {interface}')
+            bridge_json = cmdl(['bridge', '-j', 'vlan', 'show', 'dev', interface])
             bridge_json = json.loads(bridge_json)
             self.assertIsNotNone(bridge_json)
 

@@ -24,7 +24,8 @@ from vyos.ifconfig import Section
 from vyos.configsession import ConfigSessionError
 from vyos.template import is_ipv6
 from vyos.utils.process import process_named_running
-from vyos.utils.process import cmd
+from vyos.utils.process import cmdl
+from vyos.utils.file import read_file
 from vyos.frrender import bgp_daemon
 
 ASN = '64512'
@@ -1018,6 +1019,145 @@ class TestProtocolsBGP(VyOSUnitTestSHIM.TestCase):
         for route_target in route_targets:
             self.assertIn(f'  ead-es-route-target export {route_target}', frrconfig)
 
+    def test_bgp_08_l2vpn_evpn_advertise_all_vni_restriction(self):
+        # T8223: FRR only allows advertise-all-vni in one BGP instance at a time
+        # (FRR issue #9405).
+        vrf = 'VRF-A'
+        vrf2 = 'VRF-B'
+        vrf_path = ['vrf', 'name', vrf]
+        vrf2_path = ['vrf', 'name', vrf2]
+
+        # advertise-all-vni in default BGP is valid
+        self.cli_set(base_path + ['address-family', 'l2vpn-evpn', 'advertise-all-vni'])
+        self.cli_commit()
+
+        # Verify FRR bgpd configuration
+        frrconfig = self.getFRRconfig(f'router bgp {ASN}', stop_section='^exit')
+        self.assertIn(f'router bgp {ASN}', frrconfig)
+        self.assertIn('  advertise-all-vni', frrconfig)
+
+        # delete advertise-all-vni
+        self.cli_delete(
+            base_path + ['address-family', 'l2vpn-evpn', 'advertise-all-vni']
+        )
+        self.cli_commit()
+
+        # advertise-all-vni in a named VRF is rejected when default BGP exists
+        self.cli_set(vrf_path + ['table', '1001'])
+        self.cli_set(vrf_path + ['protocols', 'bgp', 'system-as', ASN])
+        self.cli_set(
+            vrf_path
+            + ['protocols', 'bgp', 'address-family', 'l2vpn-evpn', 'advertise-all-vni']
+        )
+        with self.assertRaises(ConfigSessionError):
+            self.cli_commit()
+
+        self.cli_delete(base_path)
+        self.cli_delete(vrf_path)
+        self.cli_commit()
+
+        # reapply VRF and advertise-all-vni in VRF
+        self.cli_set(vrf_path + ['table', '1001'])
+        self.cli_set(vrf_path + ['protocols', 'bgp', 'system-as', ASN])
+        self.cli_set(
+            vrf_path
+            + ['protocols', 'bgp', 'address-family', 'l2vpn-evpn', 'advertise-all-vni']
+        )
+        self.cli_commit()
+
+        # Verify BGP VRF configuration
+        frr_vrf_config = self.getFRRconfig(
+            f'router bgp {ASN} vrf {vrf}', stop_section='^exit'
+        )
+        self.assertIn(f'router bgp {ASN} vrf {vrf}', frr_vrf_config)
+        self.assertIn(' advertise-all-vni', frr_vrf_config)
+
+        # two named VRFs cannot both have advertise-all-vni simultaneously
+        self.cli_set(vrf2_path + ['table', '1002'])
+        self.cli_set(vrf2_path + ['protocols', 'bgp', 'system-as', ASN])
+        self.cli_set(
+            vrf2_path
+            + ['protocols', 'bgp', 'address-family', 'l2vpn-evpn', 'advertise-all-vni']
+        )
+        with self.assertRaises(ConfigSessionError):
+            self.cli_commit()
+        self.cli_delete(vrf2_path)
+
+        # default BGP is rejected when a named VRF has advertise-all-vni
+        self.cli_set(base_path + ['system-as', ASN])
+        with self.assertRaises(ConfigSessionError):
+            self.cli_commit()
+
+        # delete advertise-all-vni from VRF and verify default BGP can be created
+        self.cli_delete(vrf_path + ['protocols', 'bgp', 'address-family'])
+        self.cli_commit()
+
+    def test_bgp_08_l2vpn_evpn_advertise_all_vni_conflicts_with_vrf_vni(self):
+        # T8865: Configuring a "vni" sub-block under VRF BGP l2vpn-evpn while
+        # "advertise-all-vni" is active in the default BGP instance causes FRR
+        # to return "% Failed to create VNI" and perform an early exit from config
+        # processing.
+
+        vrf1, vrf2, vrf3 = 'alfa', 'beta', 'gamma'
+        vni1, vni2, vni3 = '5050', '5051', '5052'
+        vrf1_path = ['vrf', 'name', vrf1]
+        vrf2_path = ['vrf', 'name', vrf2]
+        vrf3_path = ['vrf', 'name', vrf3]
+
+        # Set up VRFs with L3VNIs
+        self.cli_set(vrf1_path + ['vni', vni1])
+        self.cli_set(vrf1_path + ['table', '1001'])
+        self.cli_set(vrf2_path + ['vni', vni2])
+        self.cli_set(vrf2_path + ['table', '1002'])
+        self.cli_set(vrf3_path + ['vni', vni3])
+        self.cli_set(vrf3_path + ['table', '1003'])
+
+        # Configure default BGP with advertise-all-vni
+        self.cli_set(base_path + ['system-as', ASN])
+        self.cli_set(base_path + ['address-family', 'l2vpn-evpn', 'advertise-all-vni'])
+
+        # Configure VRF BGP instances
+        for vrf_path in (vrf1_path, vrf2_path, vrf3_path):
+            self.cli_set(vrf_path + ['protocols', 'bgp', 'system-as', ASN])
+            unicast_path = ['l2vpn-evpn', 'advertise', 'ipv4', 'unicast']
+            self.cli_set(
+                vrf_path + ['protocols', 'bgp', 'address-family'] + unicast_path
+            )
+
+        # Adding "vni" sub-block under any VRF l2vpn-evpn while advertise-all-vni
+        # is active globally must be rejected
+        vrf1_af_path = vrf1_path + ['protocols', 'bgp', 'address-family']
+        vrf1_vni_path = vrf1_af_path + ['l2vpn-evpn', 'vni']
+        self.cli_set(vrf1_vni_path + [vni1])
+        with self.assertRaises(ConfigSessionError):
+            self.cli_commit()
+
+        # Remove the conflicting vni sub-block - commit must now succeed
+        self.cli_delete(vrf1_vni_path)
+        self.cli_commit()
+
+        # Verify default BGP has advertise-all-vni
+        frrconfig = self.getFRRconfig(f'router bgp {ASN}', stop_section='^exit')
+        self.assertIn(f'router bgp {ASN}', frrconfig)
+        self.assertIn(' advertise-all-vni', frrconfig)
+
+        # Verify all three VRF BGP instances are present in FRR config - this is
+        # the key regression check: FRR must not early-exit and silently drop
+        # l2vpn-evpn config for vrf2 and vrf3
+        for vrf_name, vni_name in ((vrf1, vni1), (vrf2, vni2), (vrf3, vni3)):
+            with self.subTest(vrf_name=vrf_name):
+                frr_vrf_config = self.getFRRconfig(
+                    f'router bgp {ASN} vrf {vrf_name}', stop_section='^exit'
+                )
+                self.assertIn(f'router bgp {ASN} vrf {vrf_name}', frr_vrf_config)
+                self.assertIn(' address-family l2vpn evpn', frr_vrf_config)
+                # "vni" sub-block must NOT appear under any VRF BGP instance
+                self.assertNotIn(f' vni {vni_name}', frr_vrf_config)
+
+        # Cleanup
+        for path in (base_path, vrf1_path, vrf2_path, vrf3_path):
+            self.cli_delete(path)
+        self.cli_commit()
 
     def test_bgp_09_distance_and_flowspec(self):
         distance_external = '25'
@@ -1720,6 +1860,99 @@ class TestProtocolsBGP(VyOSUnitTestSHIM.TestCase):
         self.assertIn(f'router bgp {ASN}', frrconfig)
         self.assertIn(f' neighbor {neighbor} bfd strict hold-time {bfd_hold_time}', frrconfig)
 
+    def test_bgp_33_vpn_route_target_idempotency(self):
+        # T8990: VPNv4/VPNv6 inter-VRF route-leak config must be rendered using
+        # FRR's canonical "rt vpn" keyword (not the "route-target vpn" alias),
+        # and an equal import+export route-target must be collapsed into "both"
+        # - exactly as FRR stores it. Otherwise the generated config never
+        # matches FRR's running config, frr-reload re-applies the route-target
+        # on every commit, and the leaked routes are withdrawn/reinstalled
+        # (flap) on every - even unrelated - commit.
+        #
+        # This intentionally reads the generated FRR config file instead of
+        # getFRRconfig()/vtysh: vtysh returns FRR's already-canonicalized
+        # config ("rt vpn"), so it cannot detect us emitting the
+        # "route-target vpn" alias - which is the actual T8990 defect.
+        frr_conf = '/run/frr/config/vyos.frr.conf'
+        afi_path = base_path + ['address-family', 'ipv4-unicast']
+
+        self.cli_set(afi_path + ['export', 'vpn'])
+        self.cli_set(afi_path + ['import', 'vpn'])
+        self.cli_set(afi_path + ['rd', 'vpn', 'export', f'{ASN}:1'])
+
+        # symmetric route-target via "both"
+        self.cli_set(afi_path + ['route-target', 'vpn', 'both', f'{ASN}:100'])
+        self.cli_commit()
+        frrconfig = read_file(frr_conf)
+        self.assertIn(f'  rt vpn both {ASN}:100', frrconfig)
+        self.assertNotIn('route-target vpn', frrconfig)
+        self.cli_delete(afi_path + ['route-target', 'vpn', 'both'])
+
+        # symmetric route-target via equal import + export must collapse to
+        # "both" to match FRR's canonical rendering
+        self.cli_set(afi_path + ['route-target', 'vpn', 'export', f'{ASN}:100'])
+        self.cli_set(afi_path + ['route-target', 'vpn', 'import', f'{ASN}:100'])
+        self.cli_commit()
+        frrconfig = read_file(frr_conf)
+        self.assertIn(f'  rt vpn both {ASN}:100', frrconfig)
+        self.assertNotIn('route-target vpn', frrconfig)
+        self.cli_delete(afi_path + ['route-target', 'vpn', 'export'])
+        self.cli_delete(afi_path + ['route-target', 'vpn', 'import'])
+
+        # asymmetric route-target -> separate import/export lines
+        self.cli_set(afi_path + ['route-target', 'vpn', 'export', f'{ASN}:200'])
+        self.cli_set(afi_path + ['route-target', 'vpn', 'import', f'{ASN}:300'])
+        self.cli_commit()
+        frrconfig = read_file(frr_conf)
+        self.assertIn(f'  rt vpn export {ASN}:200', frrconfig)
+        self.assertIn(f'  rt vpn import {ASN}:300', frrconfig)
+        self.assertNotIn('route-target vpn', frrconfig)
+
+    def test_bgp_34_interface_neighbor(self):
+        peer_group = 'TESTPG'
+        interface = 'eth0'
+        self.cli_set(base_path + ['peer-group', peer_group, 'remote-as', ASN])
+
+        # Setting peer-group directly on an interface neighbor must be rejected
+        self.cli_set(base_path + ['neighbor', interface, 'peer-group', peer_group])
+        with self.assertRaises(ConfigSessionError):
+            self.cli_commit()
+        self.cli_delete(base_path + ['neighbor', interface, 'peer-group'])
+
+        # Correct syntax: peer-group under the interface sub-node must succeed
+        self.cli_set(
+            base_path + ['neighbor', interface, 'interface', 'peer-group', peer_group]
+        )
+        self.cli_commit()
+
+        # Remove remote-as from peer-group so the neighbor resolves it via interface node
+        self.cli_delete(base_path + ['peer-group', peer_group, 'remote-as'])
+
+        # remote-as set directly on an interface neighbor must be rejected
+        self.cli_set(base_path + ['neighbor', interface, 'remote-as', ASN])
+        with self.assertRaises(ConfigSessionError):
+            self.cli_commit()
+        self.cli_delete(base_path + ['neighbor', interface, 'remote-as'])
+
+        # Correct syntax: remote-as under the interface sub-node must succeed
+        self.cli_set(base_path + ['neighbor', interface, 'interface', 'remote-as', ASN])
+        self.cli_commit()
+        frrconfig = self.getFRRconfig(f'router bgp {ASN}', stop_section='^exit')
+        self.assertIn(
+            f' neighbor {interface} interface peer-group {peer_group}', frrconfig
+        )
+
+    def test_bgp_35_queue_limit(self):
+        input_queue = '20000'
+        output_queue = '30000'
+        self.cli_set(base_path + ['parameters', 'input-queue-limit', input_queue])
+        self.cli_set(base_path + ['parameters', 'output-queue-limit', output_queue])
+        self.cli_commit()
+
+        frrconfig = self.getFRRconfig('bgp', end_marker='')
+        self.assertIn(f'bgp input-queue-limit {input_queue}', frrconfig)
+        self.assertIn(f'bgp output-queue-limit {output_queue}', frrconfig)
+
     def test_bgp_99_bmp(self):
         target_name = 'instance-bmp'
         target_address = '127.0.0.1'
@@ -1731,6 +1964,7 @@ class TestProtocolsBGP(VyOSUnitTestSHIM.TestCase):
         mirror_buffer = '32000000'
         bmp_path = base_path + ['bmp']
         target_path = bmp_path + ['target', target_name]
+        source_iface = 'eth0'
 
         # by default the 'bmp' module not loaded for the bgpd expect Error
         self.cli_set(bmp_path)
@@ -1744,7 +1978,7 @@ class TestProtocolsBGP(VyOSUnitTestSHIM.TestCase):
         self.cli_commit()
 
         # restart bgpd to apply "-M bmp" and update PID
-        cmd(f'sudo kill -9 {self.daemon_pid}')
+        cmdl(['kill', '-9', str(self.daemon_pid)], sudo=True)
         # let the bgpd process recover
         sleep(10)
         # update daemon PID - this was a planned daemon restart
@@ -1758,6 +1992,7 @@ class TestProtocolsBGP(VyOSUnitTestSHIM.TestCase):
 
         # config other bmp options
         self.cli_set(target_path + ['address', target_address])
+        self.cli_set(target_path + ['source-interface', source_iface])
         self.cli_set(bmp_path + ['mirror-buffer-limit', mirror_buffer])
         self.cli_set(target_path + ['port', target_port])
         self.cli_set(target_path + ['min-retry', min_retry])
@@ -1778,7 +2013,21 @@ class TestProtocolsBGP(VyOSUnitTestSHIM.TestCase):
         self.assertIn(f'bmp monitor ipv6 unicast {monitor_ipv6}', frrconfig)
         self.assertIn(f'bmp monitor ipv4 unicast loc-rib', frrconfig)
         self.assertIn(f'bmp monitor ipv6 unicast loc-rib', frrconfig)
-        self.assertIn(f'bmp connect {target_address} port {target_port} min-retry {min_retry} max-retry {max_retry}', frrconfig)
+        self.assertIn(
+            f'bmp connect {target_address} port {target_port} min-retry {min_retry} max-retry {max_retry} source-interface {source_iface}',
+            frrconfig,
+        )
+
+        # verify source-interface is removed from FRR config after deletion
+        self.cli_delete(target_path + ['source-interface'])
+        self.cli_commit()
+
+        frrconfig = self.getFRRconfig(f'router bgp {ASN}', stop_section='^exit')
+        self.assertIn(
+            f'bmp connect {target_address} port {target_port} min-retry {min_retry} max-retry {max_retry}',
+            frrconfig,
+        )
+        self.assertNotIn('source-interface', frrconfig)
 
     def test_bgp_100_link_state(self):
         router_id = '127.0.0.1'
@@ -1795,6 +2044,42 @@ class TestProtocolsBGP(VyOSUnitTestSHIM.TestCase):
         # Verify FRR bgpd configuration
         frrconfig = self.getFRRconfig(f'router bgp {ASN}', stop_section='^exit')
         self.assertIn(f' address-family link-state', frrconfig)
+
+    def test_bgp_105_reject_bgp_referencing_incomplete_prefix_list(self):
+        # T8482: a peer-group referencing a prefix-list that itself fails
+        # verify() (missing "action") must not let the BGP commit succeed,
+        # and FRR must never receive the otherwise valid BGP configuration
+        # while the referenced policy object remains incomplete.
+        broken_prefix_list = 'pfx-foo-broken'
+        peer_group = 'foo'
+        peer = '192.0.2.100'
+
+        self.cli_set(['policy', 'prefix-list', broken_prefix_list, 'rule', '10', 'prefix', '10.0.0.0/24'])
+
+        self.cli_set(base_path + ['neighbor', peer, 'peer-group', peer_group])
+        self.cli_set(base_path + ['peer-group', peer_group, 'remote-as', '200'])
+        self.cli_set(base_path + ['peer-group', peer_group, 'address-family', 'ipv4-unicast',
+                                   'prefix-list', 'export', broken_prefix_list])
+
+        # Commit must fail - the referenced prefix-list is incomplete
+        with self.assertRaises(ConfigSessionError):
+            self.cli_commit()
+
+        # FRR must not see any BGP configuration - nor the still-invalid
+        # prefix-list itself - while the commit is broken
+        frrconfig = self.getFRRconfig()
+        self.assertNotIn('router bgp', frrconfig)
+        self.assertNotIn(f'ip prefix-list {broken_prefix_list}', frrconfig)
+
+        # Completing the prefix-list allows the very same BGP config to commit
+        self.cli_set(['policy', 'prefix-list', broken_prefix_list, 'rule', '10', 'action', 'permit'])
+        self.cli_commit()
+
+        frrconfig = self.getFRRconfig(f'router bgp {ASN}', stop_section='^exit')
+        self.assertIn(f'router bgp {ASN}', frrconfig)
+        self.assertIn(f' neighbor {peer_group} prefix-list {broken_prefix_list} out', frrconfig)
+
+        self.cli_delete(['policy', 'prefix-list', broken_prefix_list])
 
 if __name__ == '__main__':
     unittest.main(verbosity=2, failfast=VyOSUnitTestSHIM.TestCase.debug_on())

@@ -167,8 +167,8 @@ system {
         commit-revisions 100
     }
     console {
-        device ttyS0 {
-            speed 115200
+        device @SERIAL_DEVICE@ {
+            speed @SERIAL_SPEED@
         }
     }
     domain-name vyos.net
@@ -226,6 +226,9 @@ vrf {
                                 }
                             }
                         }
+                        advertise-all-vni
+                        vni 2000 {
+                        }
                     }
                 }
                 local-as 100
@@ -250,6 +253,9 @@ vrf {
                                 unicast {
                                 }
                             }
+                        }
+                        advertise-all-vni
+                        vni 4000 {
                         }
                     }
                 }

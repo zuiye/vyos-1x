@@ -3,7 +3,7 @@ name: "Perform CodeQL Analysis"
 on:
   push:
     branches:
-      - current
+      - rolling
       - circinus
       - sagitta
     paths:
@@ -13,7 +13,7 @@ on:
   pull_request:
     # The branches below must be a subset of the branches above
     branches:
-      - current
+      - rolling
       - circinus
       - sagitta
     paths:
@@ -30,7 +30,8 @@ permissions:
 
 jobs:
   codeql-analysis-call:
-    uses: vyos/.github/.github/workflows/codeql-analysis.yml@current
+    uses: vyos/.github/.github/workflows/codeql-analysis.yml@production
     secrets: inherit
     with:
-      languages: "['python']"
+      languages: "['python', 'c-cpp']"
+      build-mode: "none"

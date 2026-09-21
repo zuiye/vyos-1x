@@ -21,7 +21,7 @@ import os
 
 from vyos.configtree import ConfigTree
 from vyos.defaults import directories
-from vyos.utils.process import cmd
+from vyos.utils.process import cmdl
 
 vyos_certbot_dir = directories['certbot']
 
@@ -41,11 +41,11 @@ def migrate(config: ConfigTree) -> None:
         # Set default certname based on domain-name
         cert_name = 'https-' + domain_names[0].split('.')[0]
         # Overwrite certname from previous certbot calls if available
-        # We can not use python code like os.scandir due to filesystem permissions.
+        # We cannot use python code like os.scandir due to filesystem permissions.
         # This must be run as root
         certbot_live = f'{vyos_certbot_dir}/live/' # we need the trailing /
         if os.path.exists(certbot_live):
-            tmp = cmd(f'sudo find {certbot_live} -maxdepth 1 -type d')
+            tmp = cmdl(['find', certbot_live, '-maxdepth', '1', '-type', 'd'], sudo=True)
             tmp = tmp.split() # tmp = ['/config/auth/letsencrypt/live', '/config/auth/letsencrypt/live/router.vyos.net']
             tmp.remove(certbot_live)
             cert_name = tmp[0].replace(certbot_live, '')

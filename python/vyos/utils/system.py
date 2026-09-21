@@ -50,8 +50,12 @@ def sysctl_write(name: list[str], value: str | int) -> bool:
     # do not change anything if a value is already configured
     if sysctl_read(name) == value:
         return True
-    # return False if sysctl call failed
-    if run(['sysctl', '-wq', f'{key}={value}']).returncode != 0:
+    # return False if sysctl call failed - stderr is captured as the return
+    # code is the interface to the caller. A key may legitimately not exist,
+    # e.g. net.ipv4.neigh.default.gc_thresh* is not network namespace aware
+    # and thus not available when running inside a container
+    if run(['sysctl', '-wq', f'{key}={value}'],
+           capture_output=True).returncode != 0:
         return False
     # compare old and new values
     # sysctl may apply value, but its actual value will be
@@ -147,9 +151,9 @@ def get_load_averages():
     return res
 
 def get_secure_boot_state() -> bool:
-    from vyos.utils.process import cmd
+    from vyos.utils.process import cmdl
     from vyos.utils.boot import is_uefi_system
     if not is_uefi_system():
         return False
-    tmp = cmd('mokutil --sb-state', expect=[0, 255])
+    tmp = cmdl(['mokutil', '--sb-state'], expect=[0, 255])
     return bool('enabled' in tmp)

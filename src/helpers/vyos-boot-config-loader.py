@@ -26,8 +26,9 @@ from vyos.defaults import config_status
 from vyos.configsession import ConfigSession
 from vyos.configsession import ConfigSessionError
 from vyos.configtree import ConfigTree
-from vyos.utils.process import cmd
+from vyos.utils.process import cmdl
 from vyos.utils.file import write_file
+from vyos.utils.kernel import get_kernel_boot_arg
 
 STATUS_FILE = config_status
 TRACE_FILE = '/tmp/boot-config-trace'
@@ -44,11 +45,9 @@ else:
 LOG_FILE = LOG_DIR + '/vyos-boot-config-loader.log'
 
 try:
-    with open('/proc/cmdline', 'r') as f:
-        cmdline = f.read()
-    if 'vyos-debug' in cmdline:
+    if get_kernel_boot_arg('vyos-debug') is not None:
         os.environ['VYOS_DEBUG'] = 'yes'
-    if 'vyos-config-debug' in cmdline:
+    if get_kernel_boot_arg('vyos-config-debug') is not None:
         os.environ['VYOS_DEBUG'] = 'yes'
         trace_config = True
 except Exception as e:
@@ -103,8 +102,9 @@ def failsafe(config_file_name):
                                       'authentication',
                                       'encrypted-password'])
 
-    cmd(f"useradd --create-home --no-user-group --shell /bin/vbash --password '{passwd}' "\
-        "--groups frr,frrvty,vyattacfg,sudo,adm,dip,disk vyos")
+    cmdl(['useradd', '--create-home', '--no-user-group', '--shell', '/bin/vbash',
+        '--password', passwd,
+        '--groups', 'frr,frrvty,vyattacfg,sudo,adm,dip,disk', 'vyos'])
 
 if __name__ == '__main__':
     if len(sys.argv) < 2:

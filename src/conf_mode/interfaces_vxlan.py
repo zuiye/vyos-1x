@@ -23,6 +23,7 @@ from vyos.configdep import call_dependents
 from vyos.configdict import get_interface_dict
 from vyos.configdict import leaf_node_changed
 from vyos.configdict import is_node_changed
+from vyos.configdict import is_vrf_changed
 from vyos.configdict import node_changed
 from vyos.configverify import verify_address
 from vyos.configverify import verify_bridge_delete
@@ -89,6 +90,10 @@ def get_config(config=None):
     if 'static_arp' in vxlan:
         set_dependents('static_arp', conf)
 
+    # Check vrf membership, to ensure firewall is updated
+    if is_vrf_changed(conf, ifname):
+        set_dependents('firewall', conf)
+
     return vxlan
 
 def verify(vxlan):
@@ -114,7 +119,7 @@ def verify(vxlan):
 
     if dict_search('parameters.external', vxlan) != None:
         if 'vni' in vxlan:
-            raise ConfigError('Can not specify both "external" and "VNI"!')
+            raise ConfigError('Cannot specify both "external" and "VNI"!')
 
         if 'other_tunnels' in vxlan:
             # When multiple VXLAN interfaces are defined and "external" is used,
@@ -138,9 +143,10 @@ def verify(vxlan):
                                 f'CLI option is used and "vni-filter" is unset. '\
                                 f'Additional tunnels: {other_tunnels}')
 
-    if 'gpe' in vxlan and 'external' not in vxlan:
-        raise ConfigError(f'VXLAN-GPE is only supported when "external" '\
-                          f'CLI option is used.')
+    if 'gpe' in vxlan and dict_search('parameters.external', vxlan) is None:
+        raise ConfigError(
+            f'VXLAN-GPE is only supported when "external" ' f'CLI option is used.'
+        )
 
     if 'source_interface' in vxlan:
         # VXLAN adds at least an overhead of 50 byte - we need to check the
@@ -173,7 +179,7 @@ def verify(vxlan):
             protocol = 'ipv4'
 
     if 'remote' in vxlan:
-        error_msg = 'Can not mix both IPv4 and IPv6 for VXLAN underlay'
+        error_msg = 'Cannot mix both IPv4 and IPv6 for VXLAN underlay'
         for remote in vxlan['remote']:
             if is_ipv6(remote):
                 if protocol == 'ipv4':
@@ -257,8 +263,8 @@ def apply(vxlan):
         v = VXLANIf(**vxlan)
         v.update(vxlan)
 
-    if 'static_arp' in vxlan:
-        call_dependents()
+    # run the dependents
+    call_dependents()
 
     return None
 

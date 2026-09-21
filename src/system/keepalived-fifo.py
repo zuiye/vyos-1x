@@ -26,7 +26,7 @@ from queue import Queue
 from logging.handlers import SysLogHandler
 
 from vyos.configquery import ConfigTreeQuery
-from vyos.utils.process import cmd
+from vyos.utils.process import cmdl
 from vyos.utils.dict import dict_search
 from vyos.utils.commit import commit_in_progress
 
@@ -39,7 +39,7 @@ logger.addHandler(logs_handler_syslog)
 logger.setLevel(logging.DEBUG)
 
 mdns_running_file = '/run/mdns_vrrp_active'
-mdns_update_command = 'sudo /usr/libexec/vyos/conf_mode/service_mdns_repeater.py'
+mdns_update_command = '/usr/libexec/vyos/conf_mode/service_mdns_repeater.py'
 
 # class for all operations
 class KeepalivedFifo:
@@ -92,7 +92,7 @@ class KeepalivedFifo:
     def _run_command(self, command):
         logger.debug(f'Running the command: {command}')
         try:
-            cmd(command)
+            cmdl(command.split())
         except OSError as err:
             logger.error(f'Unable to execute command "{command}": {err}')
 
@@ -127,7 +127,7 @@ class KeepalivedFifo:
                         # check and run commands for VRRP instances
                         if n_type == 'INSTANCE':
                             if os.path.exists(mdns_running_file):
-                                cmd(mdns_update_command)
+                                cmdl(mdns_update_command.split(), sudo=True)
 
                             tmp = dict_search(f'group.{n_name}.transition_script.{n_state.lower()}', self.vrrp_config_dict)
                             if tmp != None:
@@ -135,7 +135,7 @@ class KeepalivedFifo:
                         # check and run commands for VRRP sync groups
                         elif n_type == 'GROUP':
                             if os.path.exists(mdns_running_file):
-                                cmd(mdns_update_command)
+                                cmdl(mdns_update_command.split(), sudo=True)
 
                             tmp = dict_search(f'sync_group.{n_name}.transition_script.{n_state.lower()}', self.vrrp_config_dict)
                             if tmp != None:
@@ -150,6 +150,10 @@ class KeepalivedFifo:
     def pipe_wait(self):
         logger.debug('Message reading start')
         self.pipe_read = os.open(self.pipe_path, os.O_RDONLY | os.O_NONBLOCK)
+        # keepalived may write more than we read in one call, and a read can
+        # land in the middle of a line. Hold the incomplete trailing line here
+        # and prepend it to the next read, so only whole lines are queued.
+        buffer = ''
         while self.stopme.is_set() is False:
             # sleep a bit to not produce 100% CPU load
             time.sleep(0.250)
@@ -157,11 +161,20 @@ class KeepalivedFifo:
                 # try to read a message from PIPE
                 message = os.read(self.pipe_read, 500)
                 if message:
-                    # split PIPE content by lines and put them into queue
-                    for line in message.decode().strip().splitlines():
-                        self.message_queue.put(line)
+                    buffer += message.decode()
+                    # split PIPE content by lines and put them into queue,
+                    # keeping the last (possibly incomplete) line for later
+                    lines = buffer.split('\n')
+                    buffer = lines.pop()
+                    queued = False
+                    for line in lines:
+                        line = line.strip()
+                        if line:
+                            self.message_queue.put(line)
+                            queued = True
                     # set new message flag to start processing
-                    self.message_event.set()
+                    if queued:
+                        self.message_event.set()
             except Exception as err:
                 # ignore the "Resource temporarily unavailable" error
                 if err.errno != 11:

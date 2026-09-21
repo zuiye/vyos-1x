@@ -15,7 +15,7 @@
 
 from vyos.ifconfig.interface import Interface
 from vyos.utils.dict import dict_search
-from vyos.utils.vti_updown_db import vti_updown_db_exists, open_vti_updown_db_readonly
+from vyos.utils.vti_updown_db import open_vti_updown_db_readonly
 
 @Interface.register
 class VTIIf(Interface):
@@ -44,18 +44,18 @@ class VTIIf(Interface):
         # not have a lookup key configuration - thus we shift the key by one
         # to also support a vti0 interface
         if_id = str(int(if_id) +1)
-        cmd = f'ip link add {self.ifname} type xfrm if_id {if_id}'
+        cmd = ['ip', 'link', 'add', self.ifname, 'type', 'xfrm', 'if_id', if_id]
         for vyos_key, iproute2_key in mapping.items():
             # dict_search will return an empty dict "{}" for valueless nodes like
             # "parameters.nolearning" - thus we need to test the nodes existence
             # by using isinstance()
             tmp = dict_search(vyos_key, self.config)
             if isinstance(tmp, dict):
-                cmd += f' {iproute2_key}'
+                cmd += [iproute2_key]
             elif tmp != None:
-                cmd += f' {iproute2_key} {tmp}'
+                cmd += [iproute2_key, str(tmp)]
 
-        self._cmd(cmd.format(**self.config))
+        self._cmdl(cmd)
 
         # interface is always A/D down. It needs to be enabled explicitly
         self.set_interface('admin_state', 'down')
@@ -64,14 +64,14 @@ class VTIIf(Interface):
         """
         Set interface administrative state to be 'up' or 'down'.
 
-        The interface will only be brought 'up' if ith is attached to an
+        The interface will only be brought 'up' if it is attached to an
         active ipsec site-to-site connection or remote access connection.
         """
         if state == 'down' or self.bypass_vti_updown_db:
             super().set_admin_state(state)
-        elif vti_updown_db_exists():
+        else:
             with open_vti_updown_db_readonly() as db:
-                if db.wantsInterfaceUp(self.ifname):
+                if db is not None and db.wantsInterfaceUp(self.ifname):
                     super().set_admin_state(state)
 
     def get_mac(self):

@@ -30,7 +30,9 @@ from vyos.configverify import verify_pki_ca_certificate
 from vyos.configverify import verify_pki_dh_parameters
 from vyos.configdiff import get_config_diff
 from vyos.defaults import api_config_state
-from vyos.pki import wrap_certificate
+from vyos.pki import encode_certificate
+from vyos.pki import find_chain
+from vyos.pki import load_certificate
 from vyos.pki import wrap_private_key
 from vyos.pki import wrap_dh_parameters
 from vyos.template import render
@@ -75,9 +77,13 @@ def get_config(config=None):
     # We have gathered the dict representation of the CLI, but there are default
     # options which we need to update into the dictionary retrieved.
     default_values = conf.get_config_defaults(**https.kwargs, recursive=True)
-    if 'api' not in https or 'graphql' not in https['api']:
+    if 'api' in https:
+        if 'graphql' not in https['api']:
+            del default_values['api']['graphql']
+        if 'rest' not in https['api']:
+            del default_values['api']['rest']
+    else:
         del default_values['api']
-
     # merge CLI and default dictionary
     https = config_dict_merge(default_values, https)
 
@@ -106,6 +112,14 @@ def verify(https):
     else:
         Warning('No certificate specified, using build-in self-signed certificates. '\
                 'Do not use them in a production environment!')
+    if dict_search('certificates.verify_client', https) is not None:
+        if dict_search('certificates.ca_certificate', https) is None:
+            raise ConfigError(
+                'CA certificate must be configured for mTLS client verification'
+            )
+    if dict_search('api.rest.authentication.oidc.jwks_url', https) is not None:
+        if dict_search('api.rest.authentication.oidc.issuer', https) is None:
+            raise ConfigError('OIDC issuer must be configured when jwks-url is set')
 
     # Check if server port is already in use by a different application
     listen_address = ['0.0.0.0']
@@ -113,11 +127,17 @@ def verify(https):
     if 'listen_address' in https:
         listen_address = https['listen_address']
 
-    for address in listen_address:
-        if not check_port_availability(address, port, 'tcp') and not is_listen_port_bind_service(port, 'nginx'):
-            raise ConfigError(f'TCP port "{port}" is used by another service!')
-
     verify_vrf(https)
+
+    vrf = https.get('vrf', None)
+    for address in listen_address:
+        if (not check_port_availability(address, port, 'tcp', vrf=vrf)
+            and not is_listen_port_bind_service(port, 'nginx')):
+            vrf_error_msg = ''
+            if vrf:
+                vrf_error_msg = f' in vrf "{vrf}"'
+            raise ConfigError(f'TCP port "{port}"{vrf_error_msg} is already ' \
+                               'used by another service!')
 
     # Verify API server settings, if present
     if 'api' in https:
@@ -139,11 +159,18 @@ def verify(https):
 
         # If only key-based methods are enabled,
         # fail the commit if no valid key configurations are found
-        if (not valid_keys_exist) and (not jwt_auth):
-            raise ConfigError('At least one HTTPS API key is required unless GraphQL token authentication is enabled!')
+        mtls_auth = dict_search('certificates.verify_client', https) is not None
+        if (not valid_keys_exist) and (not jwt_auth) and (not mtls_auth):
+            raise ConfigError(
+                'At least one HTTPS API key is required unless GraphQL token or mTLS authentication is enabled!'
+            )
 
         if (not valid_keys_exist) and jwt_auth:
             Warning(f'API keys are not configured: classic (non-GraphQL) API will be unavailable!')
+        if (not valid_keys_exist) and mtls_auth and not jwt_auth:
+            Warning(
+                'API keys are not configured: only mTLS client certificate authentication will be available for the REST API!'
+            )
 
     return None
 
@@ -170,12 +197,19 @@ def generate(https):
         cert_path = os.path.join(cert_dir, f'{cert_name}_cert.pem')
         key_path = os.path.join(cert_dir, f'{cert_name}_key.pem')
 
-        server_cert = str(wrap_certificate(pki_cert['certificate']))
+        # Build the full certificate chain (server certificate followed by any
+        # intermediate CA certificates up to the root) from the CA certificates
+        # available in the PKI. Serving the complete chain lets clients that do
+        # not yet trust the issuing intermediate CA validate the presented
+        # certificate. This mirrors the other PKI consumers (HAProxy, stunnel).
+        loaded_ca_certs = {
+            load_certificate(cert_data['certificate'])
+            for cert_data in dict_search('pki.ca', https, default={}).values()
+        }
 
-        # Append CA certificate if specified to form a full chain
-        if 'ca_certificate' in https['certificates']:
-            ca_cert = https['certificates']['ca_certificate']
-            server_cert += '\n' + str(wrap_certificate(https['pki']['ca'][ca_cert]['certificate']))
+        loaded_pki_cert = load_certificate(pki_cert['certificate'])
+        cert_full_chain = find_chain(loaded_pki_cert, loaded_ca_certs)
+        server_cert = '\n'.join(encode_certificate(c) for c in cert_full_chain)
 
         write_file(cert_path, server_cert, user=user, group=group, mode=0o644)
         write_file(key_path, wrap_private_key(pki_cert['private']['key']),
@@ -193,6 +227,31 @@ def generate(https):
                 tmp_path.update({'dh_file' : dh_path})
 
         https['certificates'].update(tmp_path)
+    # Write mTLS CA chain if verify-client is configured
+    if dict_search('certificates.verify_client', https) and dict_search(
+        'certificates.ca_certificate', https
+    ):
+        ca_name = https['certificates']['ca_certificate']
+        pki_ca = dict_search(f'pki.ca.{ca_name}', https)
+        if pki_ca:
+            # Write only the selected CA certificate to the nginx trust bundle.
+            # Using find_chain() would walk up to the root CA, allowing sibling
+            # intermediates under the same root to authenticate. Writing only the
+            # configured CA restricts the mTLS trust boundary to certificates
+            # issued directly by that CA.
+            selected_ca = load_certificate(pki_ca['certificate'])
+            mtls_ca_path = os.path.join(cert_dir, f'{ca_name}_mtls_ca.pem')
+            write_file(
+                mtls_ca_path,
+                encode_certificate(selected_ca),
+                user=user,
+                group=group,
+                mode=0o644,
+            )
+            https['certificates']['mtls_ca_path'] = mtls_ca_path
+            https['certificates']['verify_client'] = dict_search(
+                'certificates.verify_client', https
+            )
 
     render(config_file, 'https/nginx.default.j2', https)
     render(systemd_override, 'https/override.conf.j2', https)

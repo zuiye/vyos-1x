@@ -22,7 +22,7 @@ from datetime import datetime
 
 from vyos.utils.io import ask_yes_no
 from vyos.utils.process import call
-from vyos.utils.process import cmd
+from vyos.utils.process import cmdl
 from vyos.utils.process import DEVNULL
 from vyos.utils.disk import device_from_id
 
@@ -66,11 +66,12 @@ def list_partitions(disk: str):
 
 
 def delete_partition(disk: str, partition_idx: int):
-    cmd(f'parted /dev/{disk} rm {partition_idx}')
+    cmdl(['parted', f'/dev/{disk}', 'rm', str(partition_idx)])
 
 
 def format_disk_like(target: str, proto: str):
-    cmd(f'sfdisk -d /dev/{proto} | sfdisk --force /dev/{target}')
+    dump = cmdl(['sfdisk', '-d', f'/dev/{proto}'])
+    cmdl(['sfdisk', '--force', f'/dev/{target}'], input=dump)
 
 
 if __name__ == '__main__':
@@ -106,11 +107,11 @@ if __name__ == '__main__':
         exit(1)
 
     if target_disk not in eligible_target_disks:
-        print(f'Device {target_disk} can not be formatted')
+        print(f'Device {target_disk} cannot be formatted')
         exit(1)
 
     if proto_disk not in eligible_proto_disks:
-        print(f'Device {proto_disk} can not be used as a prototype for {target_disk}')
+        print(f'Device {proto_disk} cannot be used as a prototype for {target_disk}')
         exit(1)
 
     if is_busy(target_disk):

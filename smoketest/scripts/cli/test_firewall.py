@@ -93,16 +93,451 @@ class TestFirewall(VyOSUnitTestSHIM.TestCase):
         self.cli_set(['firewall', 'ipv4', 'name', 'smoketest', 'rule', '2', 'source', 'geoip', 'country-code', 'de'])
         self.cli_set(['firewall', 'ipv4', 'name', 'smoketest', 'rule', '2', 'source', 'geoip', 'country-code', 'fr'])
         self.cli_set(['firewall', 'ipv4', 'name', 'smoketest', 'rule', '2', 'source', 'geoip', 'inverse-match'])
+        self.cli_set(['firewall', 'ipv4', 'name', 'smoketest', 'rule', '3', 'action', 'drop'])
+        self.cli_set(['firewall', 'ipv4', 'name', 'smoketest', 'rule', '3', 'source', 'geoip', 'asn', '13335'])
+        self.cli_set(['firewall', 'ipv4', 'name', 'smoketest', 'rule', '4', 'action', 'accept'])
+        self.cli_set(['firewall', 'ipv4', 'name', 'smoketest', 'rule', '4', 'source', 'geoip', 'asn', '15169'])
+        self.cli_set(['firewall', 'ipv4', 'name', 'smoketest', 'rule', '4', 'source', 'geoip', 'inverse-match'])
 
         self.cli_commit()
 
         nftables_search = [
             ['ip saddr @GEOIP_CC_name_smoketest_1', 'drop'],
-            ['ip saddr != @GEOIP_CC_name_smoketest_2', 'accept']
+            ['ip saddr != @GEOIP_CC_name_smoketest_2', 'accept'],
+            ['ip saddr @GEOIP_ASN_name_smoketest_3', 'drop'],
+            ['ip saddr != @GEOIP_ASN_name_smoketest_4', 'accept']
         ]
 
         # -t prevents 1000+ GeoIP elements being returned
         self.verify_nftables(nftables_search, 'ip vyos_filter', args='-t')
+
+    def test_fib_type(self):
+        self.cli_set(
+            ['firewall', 'ipv4', 'name', 'smoketest', 'rule', '1', 'action', 'accept']
+        )
+        self.cli_set(
+            [
+                'firewall',
+                'ipv4',
+                'name',
+                'smoketest',
+                'rule',
+                '1',
+                'fib',
+                'lookup',
+                'destination-address',
+            ]
+        )
+        self.cli_set(
+            [
+                'firewall',
+                'ipv4',
+                'name',
+                'smoketest',
+                'rule',
+                '1',
+                'fib',
+                'match',
+                'route-type',
+                'local',
+            ]
+        )
+        self.cli_set(
+            ['firewall', 'ipv4', 'name', 'smoketest', 'rule', '2', 'action', 'drop']
+        )
+        self.cli_set(
+            [
+                'firewall',
+                'ipv4',
+                'name',
+                'smoketest',
+                'rule',
+                '2',
+                'fib',
+                'lookup',
+                'source-address',
+            ]
+        )
+        self.cli_set(
+            [
+                'firewall',
+                'ipv4',
+                'name',
+                'smoketest',
+                'rule',
+                '2',
+                'fib',
+                'match',
+                'route-type',
+                '!local',
+            ]
+        )
+
+        self.cli_set(
+            ['firewall', 'ipv6', 'name', 'smoketest', 'rule', '1', 'action', 'accept']
+        )
+        self.cli_set(
+            [
+                'firewall',
+                'ipv6',
+                'name',
+                'smoketest',
+                'rule',
+                '1',
+                'fib',
+                'lookup',
+                'destination-address',
+            ]
+        )
+        self.cli_set(
+            [
+                'firewall',
+                'ipv6',
+                'name',
+                'smoketest',
+                'rule',
+                '1',
+                'fib',
+                'match',
+                'route-type',
+                'local',
+            ]
+        )
+        self.cli_set(
+            ['firewall', 'ipv6', 'name', 'smoketest', 'rule', '2', 'action', 'drop']
+        )
+        self.cli_set(
+            [
+                'firewall',
+                'ipv6',
+                'name',
+                'smoketest',
+                'rule',
+                '2',
+                'fib',
+                'lookup',
+                'source-address',
+            ]
+        )
+        self.cli_set(
+            [
+                'firewall',
+                'ipv6',
+                'name',
+                'smoketest',
+                'rule',
+                '2',
+                'fib',
+                'match',
+                'route-type',
+                '!local',
+            ]
+        )
+        self.cli_set(
+            ['firewall', 'ipv6', 'name', 'smoketest', 'rule', '3', 'action', 'drop']
+        )
+        self.cli_set(
+            [
+                'firewall',
+                'ipv6',
+                'name',
+                'smoketest',
+                'rule',
+                '3',
+                'fib',
+                'lookup',
+                'destination-address',
+            ]
+        )
+        self.cli_set(
+            [
+                'firewall',
+                'ipv6',
+                'name',
+                'smoketest',
+                'rule',
+                '3',
+                'fib',
+                'match',
+                'route-type',
+                'prohibit',
+            ]
+        )
+
+        # prerouting raw runs before the kernel's FIB lookup decides
+        # local-delivery vs. forward, which is the main use case fib
+        # lookup/match was added for - cover it explicitly rather than
+        # only the named filter rules above
+        self.cli_set(
+            ['firewall', 'ipv4', 'prerouting', 'raw', 'rule', '1', 'action', 'notrack']
+        )
+        self.cli_set(
+            [
+                'firewall',
+                'ipv4',
+                'prerouting',
+                'raw',
+                'rule',
+                '1',
+                'fib',
+                'lookup',
+                'destination-address',
+            ]
+        )
+        self.cli_set(
+            [
+                'firewall',
+                'ipv4',
+                'prerouting',
+                'raw',
+                'rule',
+                '1',
+                'fib',
+                'match',
+                'route-type',
+                'local',
+            ]
+        )
+        self.cli_set(
+            ['firewall', 'ipv4', 'prerouting', 'raw', 'rule', '2', 'action', 'drop']
+        )
+        self.cli_set(
+            [
+                'firewall',
+                'ipv4',
+                'prerouting',
+                'raw',
+                'rule',
+                '2',
+                'fib',
+                'lookup',
+                'source-address',
+            ]
+        )
+        self.cli_set(
+            [
+                'firewall',
+                'ipv4',
+                'prerouting',
+                'raw',
+                'rule',
+                '2',
+                'fib',
+                'match',
+                'route-type',
+                '!local',
+            ]
+        )
+
+        self.cli_set(
+            ['firewall', 'ipv6', 'prerouting', 'raw', 'rule', '1', 'action', 'notrack']
+        )
+        self.cli_set(
+            [
+                'firewall',
+                'ipv6',
+                'prerouting',
+                'raw',
+                'rule',
+                '1',
+                'fib',
+                'lookup',
+                'destination-address',
+            ]
+        )
+        self.cli_set(
+            [
+                'firewall',
+                'ipv6',
+                'prerouting',
+                'raw',
+                'rule',
+                '1',
+                'fib',
+                'match',
+                'route-type',
+                'local',
+            ]
+        )
+        self.cli_set(
+            ['firewall', 'ipv6', 'prerouting', 'raw', 'rule', '2', 'action', 'drop']
+        )
+        self.cli_set(
+            [
+                'firewall',
+                'ipv6',
+                'prerouting',
+                'raw',
+                'rule',
+                '2',
+                'fib',
+                'lookup',
+                'source-address',
+            ]
+        )
+        self.cli_set(
+            [
+                'firewall',
+                'ipv6',
+                'prerouting',
+                'raw',
+                'rule',
+                '2',
+                'fib',
+                'match',
+                'route-type',
+                '!local',
+            ]
+        )
+
+        self.cli_commit()
+
+        nftables_search_v4 = [
+            ['fib daddr type local', 'accept'],
+            ['fib saddr type != local', 'drop'],
+        ]
+        nftables_search_v6 = [
+            ['fib daddr type local', 'accept'],
+            ['fib saddr type != local', 'drop'],
+            ['fib daddr type prohibit', 'drop'],
+        ]
+
+        self.verify_nftables_chain(
+            nftables_search_v4, 'ip vyos_filter', 'NAME_smoketest'
+        )
+        self.verify_nftables_chain(
+            nftables_search_v6, 'ip6 vyos_filter', 'NAME6_smoketest'
+        )
+
+        nftables_search_v4_raw = [
+            ['fib daddr type local', 'notrack'],
+            ['fib saddr type != local', 'drop'],
+        ]
+        nftables_search_v6_raw = [
+            ['fib daddr type local', 'notrack'],
+            ['fib saddr type != local', 'drop'],
+        ]
+
+        self.verify_nftables_chain(
+            nftables_search_v4_raw, 'ip vyos_filter', 'VYOS_PREROUTING_raw'
+        )
+        self.verify_nftables_chain(
+            nftables_search_v6_raw, 'ip6 vyos_filter', 'VYOS_IPV6_PREROUTING_raw'
+        )
+
+    def test_fib_type_incomplete(self):
+        self.cli_set(
+            ['firewall', 'ipv4', 'name', 'smoketest', 'rule', '1', 'action', 'accept']
+        )
+        self.cli_set(
+            [
+                'firewall',
+                'ipv4',
+                'name',
+                'smoketest',
+                'rule',
+                '1',
+                'fib',
+                'lookup',
+                'destination-address',
+            ]
+        )
+
+        with self.assertRaises(ConfigSessionError):
+            self.cli_commit()
+
+        self.cli_delete(
+            ['firewall', 'ipv4', 'name', 'smoketest', 'rule', '1', 'fib', 'lookup']
+        )
+        self.cli_set(
+            [
+                'firewall',
+                'ipv4',
+                'name',
+                'smoketest',
+                'rule',
+                '1',
+                'fib',
+                'match',
+                'route-type',
+                'local',
+            ]
+        )
+
+        with self.assertRaises(ConfigSessionError):
+            self.cli_commit()
+
+        # "fib match" set as a bare node with nothing underneath it: 'match' is
+        # present as a key, so it isn't caught by the simple presence check in
+        # verify_rule(), only by is_node_empty()
+        self.cli_delete(['firewall', 'ipv4', 'name', 'smoketest', 'rule', '1', 'fib'])
+        self.cli_set(
+            [
+                'firewall',
+                'ipv4',
+                'name',
+                'smoketest',
+                'rule',
+                '1',
+                'fib',
+                'lookup',
+                'destination-address',
+            ]
+        )
+        self.cli_set(
+            ['firewall', 'ipv4', 'name', 'smoketest', 'rule', '1', 'fib', 'match']
+        )
+
+        with self.assertRaises(ConfigSessionError):
+            self.cli_commit()
+
+    def test_fib_lookup_conflict(self):
+        self.cli_set(
+            ['firewall', 'ipv4', 'name', 'smoketest', 'rule', '1', 'action', 'accept']
+        )
+        self.cli_set(
+            [
+                'firewall',
+                'ipv4',
+                'name',
+                'smoketest',
+                'rule',
+                '1',
+                'fib',
+                'lookup',
+                'source-address',
+            ]
+        )
+        self.cli_set(
+            [
+                'firewall',
+                'ipv4',
+                'name',
+                'smoketest',
+                'rule',
+                '1',
+                'fib',
+                'lookup',
+                'destination-address',
+            ]
+        )
+        self.cli_set(
+            [
+                'firewall',
+                'ipv4',
+                'name',
+                'smoketest',
+                'rule',
+                '1',
+                'fib',
+                'match',
+                'route-type',
+                'local',
+            ]
+        )
+
+        with self.assertRaises(ConfigSessionError):
+            self.cli_commit()
 
     def test_groups(self):
         hostmap_path = ['system', 'static-host-mapping', 'host-name']
@@ -321,8 +756,6 @@ class TestFirewall(VyOSUnitTestSHIM.TestCase):
 
     def test_ipv4_advanced(self):
         name = 'smoketest-adv'
-        name2 = 'smoketest-adv2'
-        interface = 'eth0'
 
         self.cli_set(['firewall', 'ipv4', 'name', name, 'default-action', 'drop'])
         self.cli_set(['firewall', 'ipv4', 'name', name, 'default-log'])
@@ -408,7 +841,6 @@ class TestFirewall(VyOSUnitTestSHIM.TestCase):
 
     def test_ipv4_mask(self):
         name = 'smoketest-mask'
-        interface = 'eth0'
 
         self.cli_set(['firewall', 'group', 'address-group', 'mask_group', 'address', '1.1.1.1'])
 
@@ -433,6 +865,37 @@ class TestFirewall(VyOSUnitTestSHIM.TestCase):
             ['daddr & 0.0.255.255 == 0.0.1.2'],
             ['saddr & 0.0.255.255 != 0.0.3.4'],
             ['saddr & 0.0.255.255 == @A_mask_group']
+        ]
+
+        self.verify_nftables(nftables_search, 'ip vyos_filter')
+
+    def test_mac_mask(self):
+        name = 'smoketest-mac-mask'
+        mac_address = '00:53:00:00:00:01'
+        mac_mask = 'ff:ff:ff:00:00:00'
+
+        self.cli_set(['firewall', 'ipv4', 'name', name, 'default-action', 'drop'])
+
+        self.cli_set(['firewall', 'ipv4', 'name', name, 'rule', '1', 'action', 'drop'])
+        self.cli_set(['firewall', 'ipv4', 'name', name, 'rule', '1', 'destination', 'mac-address', mac_address])
+        self.cli_set(['firewall', 'ipv4', 'name', name, 'rule', '1', 'destination', 'mac-address-mask', mac_mask])
+
+        self.cli_set(['firewall', 'ipv4', 'name', name, 'rule', '2', 'action', 'accept'])
+        self.cli_set(['firewall', 'ipv4', 'name', name, 'rule', '2', 'source', 'mac-address', f'!{mac_address}'])
+        self.cli_set(['firewall', 'ipv4', 'name', name, 'rule', '2', 'source', 'mac-address-mask', mac_mask])
+
+        # mac-address-mask requires mac-address
+        self.cli_set(['firewall', 'ipv4', 'name', name, 'rule', '3', 'action', 'drop'])
+        self.cli_set(['firewall', 'ipv4', 'name', name, 'rule', '3', 'source', 'mac-address-mask', mac_mask])
+        with self.assertRaises(ConfigSessionError):
+            self.cli_commit()
+        self.cli_delete(['firewall', 'ipv4', 'name', name, 'rule', '3'])
+
+        self.cli_commit()
+
+        nftables_search = [
+            [f'daddr & {mac_mask} == {mac_address}'],
+            [f'saddr & {mac_mask} != {mac_address}']
         ]
 
         self.verify_nftables(nftables_search, 'ip vyos_filter')
@@ -637,7 +1100,6 @@ class TestFirewall(VyOSUnitTestSHIM.TestCase):
 
     def test_ipv6_mask(self):
         name = 'v6-smoketest-mask'
-        interface = 'eth0'
 
         self.cli_set(['firewall', 'group', 'ipv6-address-group', 'mask_group', 'address', '::beef'])
 
@@ -1143,8 +1605,13 @@ class TestFirewall(VyOSUnitTestSHIM.TestCase):
         self.cli_set(['vrf', 'name', 'VRF-1', 'table', '101'])
         self.cli_set(['vrf', 'name', 'VRF-2', 'table', '102'])
         self.cli_set(['interfaces', 'ethernet', 'eth0', 'vrf', 'VRF-1'])
-        self.cli_set(['interfaces', 'vti', 'vti1', 'vrf', 'VRF-2'])
+        self.cli_set(['interfaces', 'ethernet', 'eth0', 'vif', '10', 'vrf', 'VRF-1'])
+        self.cli_set(['interfaces', 'ethernet', 'eth3', 'vif-s', '10', 'vrf', 'VRF-1'])
+        self.cli_set(['interfaces', 'ethernet', 'eth3', 'vif-s', '20', 'vif-c', '30', 'vrf', 'VRF-1'])
+        self.cli_set(['interfaces', 'vti', 'vti1', 'vrf', 'VRF-1'])
+        self.cli_set(['interfaces', 'vti', 'vti2', 'vrf', 'VRF-2'])
 
+        # commit the config
         self.cli_commit()
 
         nftables_search = [
@@ -1155,8 +1622,10 @@ class TestFirewall(VyOSUnitTestSHIM.TestCase):
             ['chain VYOS_ZONE_FORWARD'],
             ['type filter hook forward priority filter + 1'],
             ['oifname { "eth1", "eth2" }', 'counter packets', 'jump VZONE_ZONE1'],
+            ['oifname { "eth0", "vti1", "eth0.10", "eth3.10", "eth3.20.30" }', 'counter packets', 'jump VZONE_ZONE1'],
             ['oifname "VRF-1"', 'counter packets', 'jump VZONE_ZONE1'],
             ['oifname "vtun66"', 'counter packets', 'jump VZONE_ZONE2'],
+            ['oifname "vti2"', 'counter packets', 'jump VZONE_ZONE2'],
             ['oifname "VRF-2"', 'counter packets', 'jump VZONE_ZONE2'],
             ['chain VYOS_ZONE_LOCAL'],
             ['type filter hook input priority filter + 1'],
@@ -1190,8 +1659,10 @@ class TestFirewall(VyOSUnitTestSHIM.TestCase):
             ['chain VYOS_ZONE_FORWARD'],
             ['type filter hook forward priority filter + 1'],
             ['oifname { "eth1", "eth2" }', 'counter packets', 'jump VZONE_ZONE1'],
+            ['oifname { "eth0", "vti1", "eth0.10", "eth3.10", "eth3.20.30" }', 'counter packets', 'jump VZONE_ZONE1'],
             ['oifname "VRF-1"', 'counter packets', 'jump VZONE_ZONE1'],
             ['oifname "vtun66"', 'counter packets', 'jump VZONE_ZONE2'],
+            ['oifname "vti2"', 'counter packets', 'jump VZONE_ZONE2'],
             ['oifname "VRF-2"', 'counter packets', 'jump VZONE_ZONE2'],
             ['chain VYOS_ZONE_LOCAL'],
             ['type filter hook input priority filter + 1'],
@@ -1203,6 +1674,7 @@ class TestFirewall(VyOSUnitTestSHIM.TestCase):
             ['counter packets', 'drop', 'comment "zone_LOCAL default-action drop"'],
             ['chain VZONE_LOCAL_OUT'],
             ['oifname "vtun66"', 'counter packets', 'jump NAME6_LOCAL_to_ZONE2_v6'],
+            ['oifname "vti2"', 'counter packets', 'jump NAME6_LOCAL_to_ZONE2_v6'],
             ['oifname "VRF-2"', 'counter packets', 'jump NAME6_LOCAL_to_ZONE2_v6'],
             ['counter packets', 'drop', 'comment "zone_LOCAL default-action drop"'],
             ['chain VZONE_ZONE1'],
@@ -1215,6 +1687,29 @@ class TestFirewall(VyOSUnitTestSHIM.TestCase):
             ['counter packets', 'drop', 'comment "zone_ZONE2 default-action drop"']
         ]
 
+        self.verify_nftables(nftables_search, 'ip vyos_filter')
+        self.verify_nftables(nftables_search_v6, 'ip6 vyos_filter')
+
+        # change memberships in vrf plus delete and add subifs
+        self.cli_set(['interfaces', 'vti', 'vti1', 'vrf', 'VRF-2'])
+        self.cli_delete(['interfaces', 'ethernet', 'eth0', 'vif', '10'])
+        self.cli_delete(['interfaces', 'ethernet', 'eth3', 'vif-s', '10'])
+        self.cli_delete(['interfaces', 'ethernet', 'eth3', 'vif-s', '20', 'vif-c', '30'])
+        self.cli_set(['interfaces', 'ethernet', 'eth0', 'vif', '20', 'vrf', 'VRF-1'])
+        self.cli_set(['interfaces', 'ethernet', 'eth3', 'vif-s', '20', 'vrf', 'VRF-1'])
+        self.cli_set(['interfaces', 'ethernet', 'eth3', 'vif-s', '20', 'vif-c', '40', 'vrf', 'VRF-1'])
+        self.cli_commit()
+
+        # make som verifications to ensure the interface swapped vrf
+        nftables_search = [
+            ['oifname { "eth0", "eth0.20", "eth3.20", "eth3.20.40" }', 'counter packets', 'jump VZONE_ZONE1'],
+            ['oifname { "vti1", "vti2" }', 'counter packets', 'jump VZONE_ZONE2'],
+        ]
+
+        nftables_search_v6 = [
+            ['oifname { "eth0", "eth0.20", "eth3.20", "eth3.20.40" }', 'counter packets', 'jump VZONE_ZONE1'],
+            ['oifname { "vti1", "vti2" }', 'counter packets', 'jump VZONE_ZONE2'],
+        ]
         self.verify_nftables(nftables_search, 'ip vyos_filter')
         self.verify_nftables(nftables_search_v6, 'ip6 vyos_filter')
 
@@ -1471,6 +1966,7 @@ class TestFirewall(VyOSUnitTestSHIM.TestCase):
         # Setup base config for test
         self.cli_set(['firewall', 'group', 'remote-group', 'group01', 'url', 'http://127.0.0.1:80/list.txt'])
         self.cli_set(['firewall', 'group', 'remote-group', 'group01', 'description', 'Example Group 01'])
+        self.cli_set(['firewall', 'group', 'remote-group', 'group01', 'interval', '4h'])
         self.cli_set(['firewall', 'ipv4', 'input', 'filter', 'rule', '10', 'action', 'drop'])
         self.cli_set(['firewall', 'ipv4', 'input', 'filter', 'rule', '10', 'protocol', 'tcp'])
         self.cli_set(['firewall', 'ipv4', 'input', 'filter', 'rule', '10', 'destination', 'group', 'remote-group', 'group01'])
@@ -1493,6 +1989,15 @@ class TestFirewall(VyOSUnitTestSHIM.TestCase):
             self.cli_commit()
         self.cli_discard()
 
+        # Test remote-group interval must be between 60 seconds and 4 weeks
+        self.cli_set(
+            ['firewall', 'group', 'remote-group', 'group01', 'interval', '30s']
+        )
+
+        with self.assertRaises(ConfigSessionError):
+            self.cli_commit()
+        self.cli_discard()
+
         # Test remote-group cannot be set alongside address in rules
         self.cli_set(['firewall', 'ipv4', 'input', 'filter', 'rule', '10', 'destination', 'address', '127.0.0.1'])
 
@@ -1505,6 +2010,9 @@ class TestFirewall(VyOSUnitTestSHIM.TestCase):
         # Setup base config for test
         self.cli_set(['firewall', 'group', 'remote-group', 'group01', 'url', 'http://127.0.0.1:80/list.txt'])
         self.cli_set(['firewall', 'group', 'remote-group', 'group01', 'description', 'Example Group 01'])
+        self.cli_set(
+            ['firewall', 'group', 'remote-group', 'group01', 'interval', '120']
+        )
         self.cli_set(['firewall', 'ipv6', 'input', 'filter', 'rule', '10', 'action', 'drop'])
         self.cli_set(['firewall', 'ipv6', 'input', 'filter', 'rule', '10', 'protocol', 'tcp'])
         self.cli_set(['firewall', 'ipv6', 'input', 'filter', 'rule', '10', 'destination', 'group', 'remote-group', 'group01'])
@@ -1623,6 +2131,44 @@ class TestFirewall(VyOSUnitTestSHIM.TestCase):
         ]
 
         self.verify_nftables(nftables_search, 'ip6 vyos_filter')
+
+    def test_last_used(self):
+        self.cli_set(['firewall', 'ipv4', 'forward', 'filter', 'rule', '1', 'action', 'accept'])
+        self.cli_set(['firewall', 'ipv4', 'forward', 'filter', 'rule', '1', 'last-used'])
+        self.cli_commit()
+
+        nftables_search = [
+            ['last used'],
+        ]
+        self.verify_nftables(nftables_search, 'ip vyos_filter')
+
+    def test_protocol_normalization(self):
+        # Protocol cannot be ipv6-icmp on IPv4
+        self.cli_set(['firewall', 'ipv4', 'input', 'filter', 'rule', '1', 'action', 'accept'])
+        self.cli_set(['firewall', 'ipv4', 'input', 'filter', 'rule', '1', 'protocol', '58'])
+
+        with self.assertRaises(ConfigSessionError):
+            self.cli_commit()
+
+        self.cli_discard()
+
+        # Protocol must be TCP if flags are set
+        self.cli_set(['firewall', 'ipv4', 'input', 'filter', 'rule', '1', 'action', 'accept'])
+        self.cli_set(['firewall', 'ipv4', 'input', 'filter', 'rule', '1', 'protocol', '6'])
+        self.cli_set(['firewall', 'ipv4', 'input', 'filter', 'rule', '1', 'tcp', 'flags', 'syn'])
+
+        # Protocol must be GRE if GRE specific fields are set
+        self.cli_set(['firewall', 'ipv4', 'input', 'filter', 'rule', '2', 'action', 'accept'])
+        self.cli_set(['firewall', 'ipv4', 'input', 'filter', 'rule', '2', 'protocol', '47'])
+        self.cli_set(['firewall', 'ipv4', 'input', 'filter', 'rule', '2', 'gre', 'flags', 'key', 'unset'])
+
+        self.cli_commit()
+
+        nftables_search = [
+            ['tcp flags & syn == syn'],
+            ['gre flags & 4 == 0'],
+        ]
+        self.verify_nftables(nftables_search, 'ip vyos_filter')
 
 
 if __name__ == '__main__':

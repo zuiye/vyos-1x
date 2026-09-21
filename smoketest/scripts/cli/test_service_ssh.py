@@ -24,7 +24,7 @@ from base_vyostest_shim import VyOSUnitTestSHIM
 from vyos.configsession import ConfigSessionError
 from vyos.defaults import config_files
 from vyos.utils.auth import get_local_passwd_entries
-from vyos.utils.process import cmd
+from vyos.utils.process import cmdl
 from vyos.utils.process import is_systemd_service_running
 from vyos.utils.process import process_named_running
 from vyos.utils.file import read_file
@@ -159,7 +159,7 @@ class TestServiceSSH(VyOSUnitTestSHIM.TestCase):
         self.assertTrue(os.path.isfile(key_ed25519))
 
         # Established SSH connections remains running after service is stopped.
-        # We can not use process_named_running here - we rather need to check
+        # We cannot use process_named_running here - we rather need to check
         # that the systemd service is no longer running
         self.assertFalse(is_systemd_service_running(PROCESS_NAME))
         # always forward to base class
@@ -253,8 +253,7 @@ class TestServiceSSH(VyOSUnitTestSHIM.TestCase):
         self.cli_commit()
 
         # Check for process in VRF
-        tmp = cmd(f'ip vrf pids {vrf}')
-        self.assertIn(PROCESS_NAME, tmp)
+        self.verify_process_in_vrf(PROCESS_NAME, vrf)
 
     def test_ssh_vrf_multi(self):
         # Check if SSH service can be bound to multiple VRFs
@@ -276,8 +275,7 @@ class TestServiceSSH(VyOSUnitTestSHIM.TestCase):
 
         # Check for process in VRF
         for vrf in vrfs:
-            tmp = cmd(f'ip vrf pids {vrf}')
-            self.assertIn(PROCESS_NAME, tmp)
+            self.verify_process_in_vrf(PROCESS_NAME, vrf)
 
     def test_ssh_login(self):
         # Perform SSH login and command execution with a predefined user. The
@@ -299,7 +297,7 @@ class TestServiceSSH(VyOSUnitTestSHIM.TestCase):
         output, error = self.ssh_send_cmd(test_command, test_user, test_pass)
         # verify login
         self.assertFalse(error)
-        self.assertEqual(output, cmd(test_command))
+        self.assertEqual(output, cmdl(test_command.split()))
 
         # Login with invalid credentials
         with self.assertRaises(paramiko.ssh_exception.AuthenticationException):
@@ -461,7 +459,7 @@ class TestServiceSSH(VyOSUnitTestSHIM.TestCase):
                                           key_filename=key_filename)
         # Verify login
         self.assertFalse(error)
-        self.assertEqual(output, cmd(test_command))
+        self.assertEqual(output, cmdl(test_command.split()))
 
         # Enable user principal name - logins only allowed if certificate contains
         # said principal name
@@ -478,7 +476,7 @@ class TestServiceSSH(VyOSUnitTestSHIM.TestCase):
                                           key_filename=key_filename)
         # Verify login
         self.assertFalse(error)
-        self.assertEqual(output, cmd(test_command))
+        self.assertEqual(output, cmdl(test_command.split()))
 
         self.cli_delete(trusted_user_ca_path)
         self.cli_delete(user_auth_base)

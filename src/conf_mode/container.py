@@ -17,10 +17,8 @@
 import os
 
 from decimal import Decimal
-from hashlib import sha256
 from ipaddress import ip_address
 from ipaddress import ip_network
-from json import dumps as json_write
 
 import psutil
 from vyos.base import Warning
@@ -29,14 +27,13 @@ from vyos.configdict import dict_merge
 from vyos.configdict import node_changed
 from vyos.configdict import is_node_changed
 from vyos.configverify import verify_vrf
+from vyos.container import get_container_host_ifname
 from vyos.container import restart_network
 from vyos.utils.configfs import delete_cli_node
 from vyos.utils.configfs import add_cli_node
 from vyos.utils.cpu import get_core_count
-from vyos.utils.file import write_file
 from vyos.utils.dict import dict_search
-from vyos.utils.process import call
-from vyos.utils.process import cmd
+from vyos.utils.process import cmdl
 from vyos.utils.process import run
 from vyos.utils.network import gen_mac
 from vyos.utils.network import get_host_identity
@@ -55,18 +52,18 @@ airbag.enable()
 config_containers = '/etc/containers/containers.conf'
 config_registry = '/etc/containers/registries.conf'
 config_storage = '/etc/containers/storage.conf'
-systemd_unit_path = '/run/systemd/system'
+quadlet_unit_path = '/run/containers/systemd'
 
 
-def _cmd(command):
+def _cmdl(command):
     if os.path.exists('/tmp/vyos.container.debug'):
         print(command)
-    return cmd(command)
+    return cmdl(command)
 
 
 def network_exists(name):
     # Check explicit name for network, returns True if network exists
-    c = _cmd(f'podman network ls --quiet --filter name=^{name}$')
+    c = _cmdl(['podman', 'network', 'ls', '--quiet', '--filter', f'name=^{name}$'])
     return bool(c)
 
 
@@ -122,6 +119,7 @@ def verify(container):
         net_dict = {}
         net_dict['mac'] = {}
         net_dict['address'] = {}
+        net_dict['host_ifname'] = {}
 
         for name, container_config in container['name'].items():
             # Container image is a mandatory option
@@ -158,6 +156,19 @@ def verify(container):
                 if network_name not in container.get('network', {}):
                     raise ConfigError(f'Container network "{network_name}" does not exist!')
 
+                # T7736: two distinct (long) container names could truncate to
+                # the same host_interface_name - not applicable to macvlan networks,
+                # they attach without a paired host veth
+                network_type = dict_search(f'{network_name}.type', container['network'])
+                if dict_search('macvlan', network_type) is None:
+                    host_ifname = get_container_host_ifname(name)
+                    if host_ifname in net_dict['host_ifname']:
+                        raise ConfigError(
+                            f'Container "{name}" and "{net_dict["host_ifname"][host_ifname]}" '
+                            f'both generate the host interface name "{host_ifname}" - please '
+                            f'use less similar container names!')
+                    net_dict['host_ifname'][host_ifname] = name
+
                 if 'name_server' in container_config and 'no_name_server' not in container['network'][network_name]:
                     raise ConfigError(f'Setting name server has no effect when attached container network has DNS enabled!')
 
@@ -177,22 +188,22 @@ def verify(container):
                             try:
                                 network = [x for x in container['network'][network_name]['prefix'] if is_ipv4(x)][0]
                                 cnt_ipv4 += 1
-                            except:
+                            except Exception:
                                 raise ConfigError(f'Network "{network_name}" does not contain an IPv4 prefix!')
                         elif is_ipv6(address):
                             try:
                                 network = [x for x in container['network'][network_name]['prefix'] if is_ipv6(x)][0]
                                 cnt_ipv6 += 1
-                            except:
+                            except Exception:
                                 raise ConfigError(f'Network "{network_name}" does not contain an IPv6 prefix!')
 
                         # Specified container IP address must belong to network prefix
                         if ip_address(address) not in ip_network(network):
                             raise ConfigError(f'Used container address "{address}" not in network "{network}"!')
 
-                        # We can not use the first IP address of a network prefix as this is used by podman
+                        # We cannot use the first IP address of a network prefix as this is used by podman
                         if ip_address(address) == ip_network(network)[1]:
-                            raise ConfigError(f'IP address "{address}" can not be used for a container, ' \
+                            raise ConfigError(f'IP address "{address}" cannot be used for a container, ' \
                                               'reserved for the container engine!')
 
                         if address in net_dict['address'].keys():
@@ -268,7 +279,7 @@ def verify(container):
             if 'allow_host_networks' not in container_config and 'network' not in container_config:
                 raise ConfigError(f'Must either set "network" or "allow-host-networks" for container "{name}"!')
 
-            # Can not set both allow-host-networks and network at the same time
+            # Cannot set both allow-host-networks and network at the same time
             if {'allow_host_networks', 'network'} <= set(container_config):
                 raise ConfigError(
                     f'"allow-host-networks" and "network" for "{name}" cannot be both configured at the same time!')
@@ -337,12 +348,12 @@ def verify(container):
             # Verify VRF exists
             verify_vrf(network_config)
 
-    # A network attached to a container can not be deleted
+    # A network attached to a container cannot be deleted
     if {'network_remove', 'name'} <= set(container):
         for network in container['network_remove']:
             for c, c_config in container['name'].items():
                 if 'network' in c_config and network in c_config['network']:
-                    raise ConfigError(f'Can not remove network "{network}", used by container "{c}"!')
+                    raise ConfigError(f'Cannot remove network "{network}", used by container "{c}"!')
 
     if 'registry' in container:
         for registry, registry_config in container['registry'].items():
@@ -360,60 +371,184 @@ def verify(container):
 
     return None
 
+def generate_network_options(name, network_config):
+    out = [
+        f'NetworkName={name}',
+        'Internal=false',
+        'IPAMDriver=host-local',
+    ]
 
-def generate_run_arguments(name, container_config, host_ident):
-    image = container_config['image']
-    cpu_quota = container_config['cpu_quota']
-    memory = container_config['memory']
-    shared_memory = container_config['shared_memory']
-    restart = container_config['restart']
-    log_driver = container_config['log_driver']
+    ifname = f'pod-{name}'
+    driver = 'bridge'
 
-    # Add sysctl options
-    sysctl_opt = ''
-    if 'sysctl' in container_config and 'parameter' in container_config['sysctl']:
-        for k, v in container_config['sysctl']['parameter'].items():
-            sysctl_opt += f" --sysctl \"{k}={v['value']}\""
+    type_config = dict_search('type', network_config)
 
-    # Add capability options. Should be in uppercase
-    capabilities = ''
+    if dict_search('macvlan', type_config):
+        ifname = dict_search('macvlan.parent', type_config)
+        driver = 'macvlan'
+        macvlan_mode = dict_search('macvlan.mode', type_config)
+        out.append(f'Options=mode={macvlan_mode}')
+
+    out.append(f'Driver={driver}')
+    out.append(f'PodmanArgs=--interface-name={ifname}')
+
+    if 'no_name_server' in network_config:
+        out.append('DisableDNS=true')
+
+    mtu = network_config['mtu'] if 'mtu' in network_config else '1500'
+    out.append(f'Options=mtu={mtu}')
+
+    ipv6 = False
+
+    for prefix in network_config['prefix']:
+        v6 = is_ipv6(prefix)
+        gateway4, gateway6 = None, None
+        if 'gateway' in network_config:
+            for gw in network_config['gateway']:
+                if is_ipv6(gw):
+                    gateway6 = gw
+                else:
+                    gateway4 = gw
+
+        if v6 and not gateway6:
+            gateway6 = inc_ip(prefix, 1)
+        elif not gateway4:
+            gateway4 = inc_ip(prefix, 1)
+
+        out.append(f'Subnet={prefix}')
+        out.append('Gateway=' + (gateway6 if v6 else gateway4))
+
+        if v6:
+            ipv6 = True
+
+    if ipv6:
+        out.append('IPv6=true')
+
+    return out
+
+def generate_quadlet_options(name, container_config, host_ident, network_config):
+    out = [
+        f'ContainerName={name}',
+        f'Image={container_config["image"]}',
+        f'LogDriver={container_config["log_driver"]}',
+        f'PodmanArgs=--memory={container_config["memory"]}m',
+        f'ShmSize={container_config["shared_memory"]}m',
+        f'StopTimeout={container_config["stop_timeout"]}',
+        f'PodmanArgs=--cpus={container_config["cpu_quota"]}',
+        'PodmanArgs=--interactive',
+        'PodmanArgs=--tty',
+    ]
+
+    if 'allow_host_cgroups' in container_config:
+        out.append('PodmanArgs=--cgroupns host')
+
+    if 'allow_host_networks' in container_config:
+        out.append('Network=host')
+
+    if 'allow_host_pid' in container_config:
+        out.append('PodmanArgs=--pid host')
+
     if 'capability' in container_config:
         for cap in container_config['capability']:
             cap = cap.upper().replace('-', '_')
-            capabilities += f' --cap-add={cap}'
+            out.append(f'AddCapability={cap}')
 
-    # Grant root capabilities to the container
-    privileged = ''
-    if 'privileged' in container_config:
-        privileged = '--privileged'
+    if 'command' in container_config:
+        command = container_config['command'].strip()
 
-    # Add a host device to the container /dev/x:/dev/x
-    device = ''
+        if 'arguments' in container_config:
+            command += ' ' + container_config['arguments'].strip()
+
+        out.append(f'Exec={command}')
+
     if 'device' in container_config:
         for dev, dev_config in container_config['device'].items():
             source_dev = dev_config['source']
             dest_dev = dev_config['destination']
-            device += f' --device={source_dev}:{dest_dev}'
+            out.append(f'AddDevice={source_dev}:{dest_dev}')
 
-    # Check/set environment options "-e foo=bar"
-    env_opt = ''
+    if 'entrypoint' in container_config:
+        entrypoint = container_config['entrypoint']
+        out.append(f'Entrypoint={entrypoint}')
+
     if 'environment' in container_config:
         for k, v in container_config['environment'].items():
-            env_opt += f" --env \"{k}={v['value']}\""
+            out.append(f'Environment={k}="{v["value"]}"')
 
-    # Check/set label options "--label foo=bar"
-    label = ''
-    if 'label' in container_config:
-        for k, v in container_config['label'].items():
-            label += f" --label \"{k}={v['value']}\""
+    if 'health_check' in container_config:
+        if 'command' in container_config['health_check']:
+            health_cmd = container_config['health_check']['command']
+            out.append(f'HealthCmd={health_cmd}')
+        if 'interval' in container_config['health_check']:
+            health_int = container_config['health_check']['interval']
+            if health_int != 'disable':
+                health_int = f'{health_int}s'
+            out.append(f'HealthInterval={health_int}')
+        if 'timeout' in container_config['health_check']:
+            health_to = container_config['health_check']['timeout']
+            out.append(f'HealthTimeout={health_to}s')
+        if 'retry' in container_config['health_check']:
+            health_rt = container_config['health_check']['retry']
+            out.append(f'HealthRetries={health_rt}')
+    else:
+        out.append('PodmanArgs=--no-healthcheck')
 
-    hostname = ''
     if 'host_name' in container_config:
         hostname = container_config['host_name']
-        hostname = f'--hostname {hostname}'
+        out.append(f'HostName={hostname}')
 
-    # Publish ports
-    port = ''
+    if 'label' in container_config:
+        for k, v in container_config['label'].items():
+            out.append(f'Label={k}="{v["value"]}"')
+
+    if 'name_server' in container_config:
+        for ns in container_config['name_server']:
+            out.append(f'DNS={ns}')
+
+    if 'network' in container_config:
+        for network in container_config['network']:
+            addr_info = ''
+            network_opts = []
+
+            if 'address' in container_config['network'][network]:
+                addr_info = ''.join(container_config['network'][network]['address'])
+                for address in container_config['network'][network]['address']:
+                    prefix = 'ip' if is_ipv4(address) else 'ip6'
+                    network_opts.append(f'{prefix}={address}')
+
+            get_mac = dict_search(f'network.{network}.mac', container_config)
+            if get_mac == 'auto' or get_mac is None:
+                mac_add = gen_mac(name, addr_info, host_ident)
+            else:
+                mac_add = get_mac
+
+            network_opts.append(f'mac={mac_add}')
+
+            # T7736: give the host-side veth a name that can never collide
+            # with a VyOS "virtual-ethernet vethN" interface.
+            type_config = dict_search(f'{network}.type', network_config)
+            is_macvlan = dict_search('macvlan', type_config) is not None
+            if not is_macvlan:
+                ifname = get_container_host_ifname(name)
+                network_opts.append(f'host_interface_name={ifname}')
+
+            opts_str = (':' + ','.join(network_opts)) if network_opts else ''
+            out.append(f'Network=vyos-{network}.network{opts_str}')
+
+            # Replace mac-auto with the generated mac address
+            if get_mac == 'auto':
+                mac_config_path = [
+                    'container',
+                    'name',
+                    name,
+                    'network',
+                    network,
+                    'mac',
+                ]
+
+                delete_cli_node(mac_config_path)
+                add_cli_node(mac_config_path, value=mac_add)
+
     if 'port' in container_config:
         protocol = ''
         for portmap in container_config['port']:
@@ -425,131 +560,39 @@ def generate_run_arguments(name, container_config, host_ident):
             # If listen_addresses is not empty, include them in the publish command
             if listen_addresses:
                 for listen_address in listen_addresses:
-                    port += f' --publish {bracketize_ipv6(listen_address)}:{sport}:{dport}/{protocol}'
+                    out.append(f'PublishPort={bracketize_ipv6(listen_address)}:{sport}:{dport}/{protocol}')
             else:
                 # If listen_addresses is empty, just include the standard publish command
-                port += f' --publish {sport}:{dport}/{protocol}'
+                out.append(f'PublishPort={sport}:{dport}/{protocol}')
 
-    # Set uid and gid
-    uid = ''
-    if 'uid' in container_config:
-        uid = container_config['uid']
-        if 'gid' in container_config:
-            uid += ':' + container_config['gid']
-        uid = f'--user {uid}'
+    if 'privileged' in container_config:
+        out.append('PodmanArgs=--privileged')
 
-    # Bind volume
-    volume = ''
-    if 'volume' in container_config:
-        for vol, vol_config in container_config['volume'].items():
-            svol = vol_config['source']
-            dvol = vol_config['destination']
-            mode = vol_config['mode']
-            prop = vol_config['propagation']
-            volume += f' --volume {svol}:{dvol}:{mode},{prop}'
+    if 'sysctl' in container_config and 'parameter' in container_config['sysctl']:
+        for k, v in container_config['sysctl']['parameter'].items():
+            out.append(f'Sysctl={k}="{v["value"]}"')
 
-    # Mount tmpfs
-    tmpfs = ''
     if 'tmpfs' in container_config:
         for tmpfs_config in container_config['tmpfs'].values():
             dest = tmpfs_config['destination']
             size = tmpfs_config['size']
-            tmpfs += f' --mount=type=tmpfs,tmpfs-size={size}M,destination={dest}'
+            out.append(f'Mount=type=tmpfs,tmpfs-size={size}M,destination={dest}')
 
-    host_pid = ''
-    if 'allow_host_pid' in container_config:
-      host_pid = '--pid host'
+    if 'uid' in container_config:
+        uid = container_config['uid']
+        if 'gid' in container_config:
+            uid += ':' + container_config['gid']
+        out.append(f'User={uid}')
 
-    name_server = []
-    if 'name_server' in container_config:
-        for ns in container_config['name_server']:
-            name_server.append(f'--dns {ns}')
-    if name_server:
-        name_server = ' '.join(name_server)
-    else:
-        name_server = ''
+    if 'volume' in container_config:
+        for _, vol_config in container_config['volume'].items():
+            svol = vol_config['source']
+            dvol = vol_config['destination']
+            mode = vol_config['mode']
+            prop = vol_config['propagation']
+            out.append(f'Volume={svol}:{dvol}:{mode},{prop}')
 
-    container_base_cmd = f'--detach --interactive --tty --replace {capabilities} {privileged} --cpus {cpu_quota} {sysctl_opt} ' \
-                         f'--memory {memory}m --shm-size {shared_memory}m --memory-swap 0 --restart {restart} --log-driver={log_driver} ' \
-                         f'--name {name} {hostname} {device} {port} {name_server} {volume} {tmpfs} {env_opt} {label} {uid} {host_pid}'
-
-    entrypoint = ''
-    if 'entrypoint' in container_config:
-        # it needs to be json-formatted with single quote on the outside
-        entrypoint = json_write(container_config['entrypoint'].split()).replace('"', "&quot;")
-        entrypoint = f'--entrypoint &apos;{entrypoint}&apos;'
-
-    healthcheck = ' --no-healthcheck'
-    if 'health_check' in container_config:
-        healthcheck = ''
-        if 'command' in container_config['health_check']:
-            health_cmd = container_config['health_check']['command']
-            healthcheck += f' --health-cmd="{health_cmd}"'
-        if 'interval' in container_config['health_check']:
-            health_int = container_config['health_check']['interval']
-            if health_int != 'disable':
-                health_int = f'{health_int}s'
-            healthcheck += f' --health-interval={health_int}'
-        if 'timeout' in container_config['health_check']:
-            health_to = container_config['health_check']['timeout']
-            healthcheck += f' --health-timeout={health_to}s'
-        if 'retry' in container_config['health_check']:
-            health_rt = container_config['health_check']['retry']
-            healthcheck += f' --health-retries={health_rt}'
-
-    command = ''
-    if 'command' in container_config:
-        command = container_config['command'].strip()
-
-    command_arguments = ''
-    if 'arguments' in container_config:
-        command_arguments = container_config['arguments'].strip()
-
-    net = ''
-    if 'allow_host_networks' in container_config:
-        net = '--net host'
-    else:
-        ip_param = ''
-        addr_info = ''
-        networks = ",".join(container_config['network'])
-        for network in container_config['network']:
-            network_name = network
-            if 'address' not in container_config['network'][network]:
-                continue
-            for address in container_config['network'][network]['address']:
-                if is_ipv6(address):
-                    ip_param += f' --ip6 {address}'
-                else:
-                    ip_param += f' --ip {address}'
-
-            addr_info = ''.join(container_config['network'][network]['address'])
-
-        get_mac = dict_search(f'network.{network_name}.mac', container_config)
-        if get_mac == 'auto' or get_mac is None:
-            mac_add = gen_mac(name, addr_info, host_ident)
-        else:
-            mac_add = get_mac
-
-        mac_address = f'--mac-address {mac_add}'
-
-        # Replace mac-auto with the generated mac address
-        if get_mac == 'auto':
-            mac_config_path = [
-                'container',
-                'name',
-                name,
-                'network',
-                network_name,
-                'mac',
-            ]
-
-            delete_cli_node(mac_config_path)
-            add_cli_node(mac_config_path, value=mac_add)
-
-        net = f'--net {networks} {ip_param} {mac_address}'
-
-    return f'{container_base_cmd} {healthcheck} {net} {entrypoint} {image} {command} {command_arguments}'.strip()
-
+    return out
 
 def generate(container):
     # bail out early - looks like removal from running config
@@ -559,81 +602,27 @@ def generate(container):
                 os.unlink(file)
         return None
 
-    if 'network' in container:
-        for network, network_config in container['network'].items():
-            type_config = dict_search('type', network_config)
-            if dict_search('macvlan', type_config):
-                net_interface = dict_search('macvlan.parent', type_config)
-                driver = 'macvlan'
-                mode = dict_search('macvlan.mode', type_config)
-            elif dict_search('bridge', type_config) is not None:
-                net_interface = f'pod-{network}'
-                driver = 'bridge'
-            else:
-                net_interface = f'pod-{network}'
-                driver = 'bridge'
-            tmp = {
-                'name': network,
-                'id': sha256(f'{network}'.encode()).hexdigest(),
-                'driver': driver,
-                'network_interface': net_interface,
-                'subnets': [],
-                'ipv6_enabled': False,
-                'internal': False,
-                'dns_enabled': True,
-                'ipam_options': {
-                    'driver': 'host-local'
-                },
-                'options': {
-                    **({'mode': mode} if driver == 'macvlan' else {}),
-                    'mtu': '1500'
-                }
-            }
-
-            if 'no_name_server' in network_config:
-                tmp['dns_enabled'] = False
-
-            if 'mtu' in network_config:
-                tmp['options']['mtu'] = network_config['mtu']
-
-            for prefix in network_config['prefix']:
-                gateway4, gateway6 = None, None
-                if dict_search('gateway', network_config):
-                    for gw in network_config['gateway']:
-                        if is_ipv6(gw):
-                            gateway6 = gw
-                        else:
-                            gateway4 = gw
-
-                if is_ipv6(prefix) and not gateway6:
-                    gateway6 = inc_ip(prefix, 1)
-                elif not gateway4:
-                    gateway4 = inc_ip(prefix, 1)
-
-                if is_ipv6(prefix):
-                    tmp['ipv6_enabled'] = True
-                    net = {'subnet': prefix, 'gateway': gateway6}
-                else:
-                    net = {'subnet': prefix, 'gateway': gateway4}
-
-                tmp['subnets'].append(net)
-
-            write_file(f'/etc/containers/networks/{network}.json', json_write(tmp, indent=2))
-
     render(config_containers, 'container/containers.conf.j2', container)
     render(config_registry, 'container/registries.conf.j2', container)
     render(config_storage, 'container/storage.conf.j2', container)
 
+    if 'network' in container:
+        for network, network_config in container['network'].items():
+            file_path = os.path.join(quadlet_unit_path, f'vyos-{network}.network')
+            opts = generate_network_options(network, network_config)
+            render(file_path, 'container/quadlet-network.j2', {'name': network, 'opts': opts})
+
     if 'name' in container:
         host_ident = get_host_identity()
+        network_config = container.get('network', {})
         for name, container_config in container['name'].items():
             if 'disable' in container_config:
                 continue
 
-            file_path = os.path.join(systemd_unit_path, f'vyos-container-{name}.service')
-            run_args = generate_run_arguments(name, container_config, host_ident)
-            render(file_path, 'container/systemd-unit.j2', {'name': name, 'run_args': run_args, },
-                   formater=lambda _: _.replace("&quot;", '"').replace("&apos;", "'"))
+            file_path = os.path.join(quadlet_unit_path, f'vyos-container-{name}.container')
+            quadlet_opts = generate_quadlet_options(name, container_config, host_ident, network_config)
+            restart = container_config['restart']
+            render(file_path, 'container/quadlet-unit.j2', {'name': name, 'opts': quadlet_opts, 'restart': restart})
 
     return None
 
@@ -642,21 +631,18 @@ def apply(container):
     # Delete old containers if needed. We can't delete running container
     # Option "--force" allows to delete containers with any status
     if 'container_remove' in container:
-        for name in container['container_remove']:
-            file_path = os.path.join(systemd_unit_path, f'vyos-container-{name}.service')
-            call(f'systemctl stop vyos-container-{name}.service')
-            if os.path.exists(file_path):
-                os.unlink(file_path)
-
-    call('systemctl daemon-reload')
+        quadlet_paths = [f'vyos-container-{name}.container' for name in container['container_remove']]
+        run(['podman', 'quadlet', 'rm', '-f'] + quadlet_paths)
 
     # Delete old networks if needed
     if 'network_remove' in container:
-        for network in container['network_remove']:
-            call(f'podman network rm {network} >/dev/null 2>&1')
+        quadlet_paths = [f'vyos-{name}.network' for name in container['network_remove']]
+        run(['podman', 'quadlet', 'rm', '-f'] + quadlet_paths)
+        run(['podman', 'network', 'rm'] + container['network_remove']) # `quadlet rm` does not remove the instance
+
+    run(['systemctl', 'daemon-reload'])
 
     # Add container
-    disabled_new = False
     if 'name' in container:
         for name, container_config in container['name'].items():
             image = container_config['image']
@@ -668,20 +654,13 @@ def apply(container):
 
             if 'disable' in container_config:
                 # check if there is a container by that name running
-                tmp = _cmd('podman ps -a --format "{{.Names}}"')
+                tmp = _cmdl(['podman', 'ps', '-a', '--format', '{{.Names}}'])
                 if name in tmp:
-                    file_path = os.path.join(systemd_unit_path, f'vyos-container-{name}.service')
-                    call(f'systemctl stop vyos-container-{name}.service')
-                    if os.path.exists(file_path):
-                        disabled_new = True
-                        os.unlink(file_path)
+                    run(['podman', 'quadlet', 'rm', '-f', f'vyos-container-{name}.container'])
                 continue
 
             if 'container_restart' in container and name in container['container_restart']:
-                cmd(f'systemctl restart vyos-container-{name}.service')
-
-    if disabled_new:
-        call('systemctl daemon-reload')
+                cmdl(['systemctl', 'restart', f'vyos-container-{name}'])
 
     # Re-Start network and assign it to given VRF if requested.
     restart_network(container)

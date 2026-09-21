@@ -19,7 +19,7 @@ import sys
 import time
 from argparse import ArgumentParser
 from shutil import copyfile
-from vyos.utils.file import read_file
+from vyos.utils.kernel import get_kernel_boot_arg
 
 from vyos.migrate import ConfigMigrate
 from vyos.migrate import ConfigMigrateError
@@ -47,13 +47,13 @@ if not os.access(config_file, os.R_OK):
 
 if out_file is None:
     if not os.access(config_file, os.W_OK):
-        print(f"Config file '{config_file}' not writeable")
+        print(f"Config file '{config_file}' not writable")
         sys.exit(1)
 else:
     try:
         open(out_file, 'w').close()
     except OSError:
-        print(f"Output file '{out_file}' not writeable")
+        print(f"Output file '{out_file}' not writable")
         sys.exit(1)
 
 config_migrate = ConfigMigrate(config_file, force=force, output_file=out_file)
@@ -80,6 +80,5 @@ if backup is not None and not config_migrate.config_modified:
 
 # T1771: add knob on Kernel command-line to simulate failed config migrator run
 # used to test if the automatic image reboot works.
-kernel_cmdline = read_file('/proc/cmdline')
-if 'vyos-fail-migration' in kernel_cmdline.split():
+if get_kernel_boot_arg('vyos-fail-migration') is not None:
     sys.exit(1)

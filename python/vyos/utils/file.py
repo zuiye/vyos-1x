@@ -31,23 +31,26 @@ def file_is_persistent(path):
     absolute = os.path.abspath(os.path.dirname(path))
     return re.match(location,absolute)
 
-def read_file(fname, defaultonfailure=None, sudo=False):
+_unset = object()
+
+def read_file(fname, defaultonfailure=_unset, sudo=False):
     """
     read the content of a file, stripping any end characters (space, newlines)
-    should defaultonfailure be not None, it is returned on failure to read
+    should defaultonfailure be given (including None), it is returned on
+    failure to read instead of raising
     """
     try:
         # Some files can only be read by root - emulate sudo cat call
         if sudo:
-            from vyos.utils.process import cmd
-            data = cmd(['sudo', 'cat', fname])
+            from vyos.utils.process import cmdl
+            data = cmdl(['cat', fname], sudo=True)
         else:
             # If not sudo, just read the file
             with open(fname, 'r') as f:
                 data = f.read()
         return data.strip()
     except Exception as e:
-        if defaultonfailure is not None:
+        if defaultonfailure is not _unset:
             return defaultonfailure
         raise e
 

@@ -7,6 +7,7 @@
 #include <include/firewall/hop-limit.xml.i>
 #include <include/firewall/icmp.xml.i>
 #include <include/firewall/icmpv6.xml.i>
+#include <include/firewall/last-used.xml.i>
 #include <include/firewall/limit.xml.i>
 #include <include/firewall/log.xml.i>
 #include <include/firewall/log-options.xml.i>
@@ -26,6 +27,7 @@
   </properties>
   <children>
     #include <include/firewall/mac-address.xml.i>
+    #include <include/firewall/mac-address-mask.xml.i>
     #include <include/firewall/address-inet.xml.i>
     #include <include/firewall/address-mask-inet.xml.i>
     #include <include/firewall/port.xml.i>
@@ -46,6 +48,7 @@
   </properties>
   <children>
     #include <include/firewall/mac-address.xml.i>
+    #include <include/firewall/mac-address-mask.xml.i>
     #include <include/firewall/address-inet.xml.i>
     #include <include/firewall/address-mask-inet.xml.i>
     #include <include/firewall/port.xml.i>

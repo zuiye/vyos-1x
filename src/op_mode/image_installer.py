@@ -47,6 +47,7 @@ from vyos.config_mgmt import unsaved_commits
 from vyos.defaults import base_dir
 from vyos.defaults import directories
 from vyos.defaults import activation_hint
+from vyos.defaults import KDUMP_DEFAULT_MEMORY_AUTO
 from vyos.flavor import get_image_serial_console
 from vyos.remote import download
 from vyos.system import disk
@@ -69,7 +70,7 @@ from vyos.utils.io import select_entry
 from vyos.utils.file import chmod_2775
 from vyos.utils.file import read_file
 from vyos.utils.file import write_file
-from vyos.utils.process import cmd
+from vyos.utils.process import cmdl
 from vyos.utils.process import run
 from vyos.utils.process import rc_cmd
 from vyos.version import get_version_data
@@ -98,7 +99,7 @@ MSG_INFO_INSTALL_RAID_FOUND_DISKS: str = 'Would you like to configure RAID-1 mir
 MSG_INFO_INSTALL_RAID_CHOOSE_DISKS: str = 'Would you like to choose two disks for RAID-1 mirroring?'
 MSG_INFO_INSTALL_DISK_CONFIRM: str = 'Installation will delete all data on the drive. Continue?'
 MSG_INFO_INSTALL_RAID_CONFIRM: str = 'Installation will delete all data on both drives. Continue?'
-MSG_INFO_INSTALL_PARTITONING: str = 'Creating partition table...'
+MSG_INFO_INSTALL_PARTITIONING: str = 'Creating partition table...'
 MSG_INPUT_CONFIG_FOUND: str = 'An active configuration was found. Would you like to copy it to the new image?'
 MSG_INPUT_CONFIG_CHOICE: str = 'The following config files are available for boot:'
 MSG_INPUT_CONFIG_CHOOSE: str = 'Which file would you like as boot config?'
@@ -244,7 +245,7 @@ def create_partitions(target_disk: str, target_size: int,
     else:
         rootfs_size: int = available_size
 
-    print(MSG_INFO_INSTALL_PARTITONING)
+    print(MSG_INFO_INSTALL_PARTITIONING)
     raid.clear()
     disk.disk_cleanup(target_disk)
     disk_details: disk.DiskDetails = disk.parttable_create(target_disk,
@@ -525,9 +526,11 @@ def get_cli_kernel_options(config_file: str) -> list:
     config = ConfigTree(read_file(config_file))
     config_dict = loads(config.to_json())
     cmdline_options = []
-    kernel_options = dict_search('system.option.kernel', config_dict)
-    if kernel_options is None:
+
+    options = dict_search('system.option', config_dict)
+    if options is None:
         return cmdline_options
+    kernel_options = options.get('kernel', {})
 
     k_cpu_opts = kernel_options.get('cpu', {})
     k_memory_opts = kernel_options.get('memory', {})
@@ -591,6 +594,17 @@ def get_cli_kernel_options(config_file: str) -> list:
             if count:
                 cmdline_options.append(f'hugepages={count}')
 
+    # Crash kernel memory reservation for the capture kernel
+    kdump_memory = options.get('kdump', {}).get('memory')
+    if kdump_memory:
+        if kdump_memory == 'auto':
+            # Tiered auto-sizing based on total system RAM
+            kdump_memory = KDUMP_DEFAULT_MEMORY_AUTO
+        else:
+            # Append suffix (megabytes) to right format
+            kdump_memory = f'{kdump_memory}M'
+        cmdline_options.append(f'crashkernel={kdump_memory}')
+
     return cmdline_options
 
 def configure_authentication(config_file: str, password: str) -> None:
@@ -600,7 +614,7 @@ def configure_authentication(config_file: str, password: str) -> None:
         config_file (str): path of target config file
         password (str): plaintext password
 
-    N.B. this can not be deferred by simply setting the plaintext password
+    N.B. this cannot be deferred by simply setting the plaintext password
     and relying on the config mode script to process at boot, as the config
     will not automatically be saved in that case, thus leaving the
     plaintext exposed
@@ -658,6 +672,10 @@ def configure_serial_console(config_file: str, console_type: str) -> None:
     # serial was defined by user.
     if console_type == 'S':
         config.set(base + [device, 'kernel'])
+    if console_type == 'K':
+        # remove any residual setting from flavor file image build
+        if config.exists(base + [device, 'kernel']):
+            config.delete(base + [device, 'kernel'])
 
     with open(config_file, 'w') as f:
         f.write(config.to_string())
@@ -697,9 +715,10 @@ def download_file(local_file: str, remote_path: str, vrf: str,
         download(local_file, remote_path, progressbar=progressbar,
                  check_space=check_space, raise_error=True)
     else:
-        vrf_cmd = f'ip vrf exec {vrf} {external_download_script} \
-                    --local-file {local_file} --remote-path {remote_path}'
-        cmd(vrf_cmd, env=environ)
+        cmdl([external_download_script,
+              '--local-file', local_file,
+              '--remote-path', remote_path],
+             env=environ, vrf=vrf)
 
 def image_fetch(image_path: str, vrf: str = None,
                 no_prompt: bool = False) -> Path:
@@ -718,10 +737,7 @@ def image_fetch(image_path: str, vrf: str = None,
 
     # Latest version gets url from configured "system update-check url"
     if image_path == 'latest':
-        command = external_latest_image_url_script
-        if vrf:
-            command = f'ip vrf exec {vrf} {command}'
-        code, output = rc_cmd(command, env=environ)
+        code, output = rc_cmd(external_latest_image_url_script, vrf=vrf, env=environ)
         if code:
             print(output)
             exit(MSG_INFO_INSTALL_EXIT)
@@ -805,6 +821,18 @@ def copy_ssh_known_hosts() -> bool:
         'from your current configuration?'
     )
     return known_hosts_files and ask_yes_no(msg, default=True)
+
+
+def copy_bash_history() -> bool:
+    """Ask user to copy Bash history
+
+    Returns:
+        bool: user's decision
+    """
+
+    history_files = get_bash_history_files()
+    msg = 'Would you like to copy Bash history?'
+    return bool(history_files) and ask_yes_no(msg, default=False)
 
 
 def console_hint() -> str:
@@ -891,7 +919,7 @@ def validate_compatibility(iso_path: str, force: bool = False) -> None:
     """
     current_data = get_version_data()
     current_flavor = current_data.get('flavor')
-    current_architecture = current_data.get('architecture') or cmd('dpkg --print-architecture')
+    current_architecture = current_data.get('architecture') or cmdl(['dpkg', '--print-architecture'])
 
     new_data = get_version_data(f'{iso_path}/version.json')
     new_flavor = new_data.get('flavor')
@@ -1110,35 +1138,61 @@ def install_image() -> None:
         exit(1)
 
 
-def get_known_hosts_files(for_root=True, for_users=True) -> list:
-    """Collect all existing `known_hosts` files for root and/or users under /home"""
+def _get_users_relative_paths(
+    relative_paths: list, for_root=True, for_users=True
+) -> list:
+    """
+    Retrieve a list of file paths based on given relative paths, optionally
+    including files from the root directory and user home directories.
+    """
 
     files = []
 
     if for_root:
-        base_files = ('/root/.ssh/known_hosts', '/etc/ssh/ssh_known_hosts')
-        for file_path in base_files:
-            root_known_hosts = Path(file_path)
-            if root_known_hosts.exists():
-                files.append(root_known_hosts)
+        for relative_path in relative_paths:
+            file_path = Path('/root') / relative_path
+            if file_path.exists():
+                files.append(file_path)
 
     if for_users:  # for each non-system user
         for user in get_local_users():
             home_dir = Path(get_user_home_dir(user))
             if home_dir.exists():
-                known_hosts = home_dir / '.ssh' / 'known_hosts'
-                if known_hosts.exists():
-                    files.append(known_hosts)
+                for relative_path in relative_paths:
+                    file_path = home_dir / relative_path
+                    if file_path.exists():
+                        files.append(file_path)
+
+    return [file_path.absolute() for file_path in files]
+
+
+def get_known_hosts_files(for_root=True, for_users=True) -> list:
+    """Collect all existing `known_hosts` files for root and/or users under /home"""
+
+    files = _get_users_relative_paths(
+        ['.ssh/known_hosts'],
+        for_root=for_root,
+        for_users=for_users,
+    )
+
+    if for_root:
+        # Add also additional global 'ssh_known_hosts' file
+        root_known_hosts = Path('/etc/ssh/ssh_known_hosts')
+        if root_known_hosts.exists():
+            files.append(root_known_hosts)
 
     return files
 
 
+def _mkdir_and_copy_file(source_path: Path, target_path: Path):
+    """Create the target directory if it doesn't exist and copy a file from source to target"""
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    copy(source_path, target_path)
+
+
 def migrate_known_hosts(target_dir: str):
     """Copy `known_hosts` for root and all users to the new image directory"""
-
-    def _mkdir_and_copy_file(known_hosts_file, target_known_hosts):
-        target_known_hosts.parent.mkdir(parents=True, exist_ok=True)
-        copy(known_hosts_file, target_known_hosts)
 
     # Copy root only files using default path
     known_hosts_files = get_known_hosts_files(for_root=True, for_users=False)
@@ -1157,6 +1211,36 @@ def migrate_known_hosts(target_dir: str):
         base_dir = Path(f'{target_dir}/var/.users_backups/{username}')
         target_known_hosts = base_dir / '.ssh' / 'known_hosts'
         _mkdir_and_copy_file(known_hosts_file, target_known_hosts)
+
+
+def get_bash_history_files(for_root=True, for_users=True) -> list:
+    """Collect all existing `.bash_history` files for root and/or users under /home"""
+
+    return _get_users_relative_paths(
+        ['.bash_history'],
+        for_root=for_root,
+        for_users=for_users,
+    )
+
+
+def migrate_bash_history(target_dir: str):
+    """Copy `.bash_history` for root and all users to the new image directory"""
+
+    # Copy root's history using its default path
+    history_files = get_bash_history_files(for_root=True, for_users=False)
+    for history_file in history_files:
+        target_history = Path(f'{target_dir}{history_file}')
+        _mkdir_and_copy_file(history_file, target_history)
+
+    # Preserve non-root users' bash history the same way known_hosts
+    # is backed up: under /var/.users_backups/{user}, since regular
+    # user home directories are not otherwise migrated.
+    history_files = get_bash_history_files(for_root=False, for_users=True)
+    for history_file in history_files:
+        username = history_file.parent.name
+        base_dir = Path(f'{target_dir}/var/.users_backups/{username}')
+        target_history = base_dir / '.bash_history'
+        _mkdir_and_copy_file(history_file, target_history)
 
 
 @compat.grub_cfg_update
@@ -1284,18 +1368,27 @@ def add_image(image_path: str, vrf: str = None, username: str = '',
             chmod_2775(target_config_dir)
             Path(f'{target_config_dir}/.vyatta_config').touch()
 
-        target_ssh_dir: str = f'{root_dir}/boot/{image_name}/rw/etc/ssh/'
+        # Default persistence directory
+        target_persist_dir: str = f'{root_dir}/boot/{image_name}/rw'
+
         if no_prompt or copy_ssh_host_keys():
             print('Copying SSH host keys')
+            target_ssh_dir: str = f'{target_persist_dir}/etc/ssh/'
             Path(target_ssh_dir).mkdir(parents=True)
             host_keys: list[str] = glob('/etc/ssh/ssh_host*')
             for host_key in host_keys:
                 copy(host_key, target_ssh_dir)
 
-        target_ssh_known_hosts_dir: str = f'{root_dir}/boot/{image_name}/rw'
         if no_prompt or copy_ssh_known_hosts():
             print('Copying SSH known_hosts files')
+            target_ssh_known_hosts_dir: str = target_persist_dir
             migrate_known_hosts(target_ssh_known_hosts_dir)
+
+        # By default we should disable auto-copy under '--no-prompt' mode
+        if no_prompt is False and copy_bash_history():
+            print('Copying bash history')
+            target_history_dir: str = target_persist_dir
+            migrate_bash_history(target_history_dir)
 
         # copy system image and kernel files
         print('Copying system image files')

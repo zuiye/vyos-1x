@@ -14,13 +14,14 @@
 # License along with this library.  If not, see <http://www.gnu.org/licenses/>.
 
 import os
+import shlex
 
 from inspect import signature
 from inspect import _empty
 
 from vyos.ifconfig.section import Section
 from vyos.utils.process import popen
-from vyos.utils.process import cmd
+from vyos.utils.process import cmdl
 from vyos.utils.file import read_file
 from vyos.utils.file import write_file
 from vyos import debug
@@ -50,27 +51,25 @@ class Control(Section):
     def _popen(self, command):
         return popen(command, self.debug)
 
-    def _cmd(self, command, env=None):
-        import re
-        if 'netns' in self.config:
-            # This command must be executed from default netns 'ip link set dev X netns X'
-            # exclude set netns cmd from netns to avoid:
-            # failed to run command: ip netns exec ns01 ip link set dev veth20 netns ns01
-            pattern = r'ip link set dev (\S+) netns (\S+)'
-            matches = re.search(pattern, command)
-            if matches and matches.group(2) == self.config['netns']:
-                # Command already includes netns and matches desired namespace:
-                command = command
-            else:
-                command = f'ip netns exec {self.config["netns"]} {command}'
-        return cmd(command, self.debug, env=env)
+    def _cmdl(self, command, env=None):
+        if not isinstance(command, list):
+            raise TypeError(f'_cmdl() requires a list, got {type(command).__name__}')
+        netns = self.config.get('netns')
+        vrf   = self.config.get('vrf')
+        # 'ip link set dev <ifname> netns <netns>' moves the interface into the
+        # namespace and must execute from the default netns — skip wrapping.
+        if (netns and command[:4] == ['ip', 'link', 'set', 'dev']
+                and 'netns' in command
+                and command[command.index('netns') + 1] == netns):
+            netns = None
+        return cmdl(command, self.debug, env=env, netns=netns, vrf=vrf)
 
     def _get_command(self, config, name):
         """
         Using the defined names, set data write to sysfs.
         """
         cmd = self._command_get[name]['shellcmd'].format(**config)
-        return self._command_get[name].get('format', lambda _: _)(self._cmd(cmd))
+        return self._command_get[name].get('format', lambda _: _)(self._cmdl(shlex.split(cmd)))
 
     def _values(self, name, validate, value):
         """
@@ -121,7 +120,7 @@ class Control(Section):
         config = {**config, **{'value': value}}
 
         cmd = self._command_set[name]['shellcmd'].format(**config)
-        return self._command_set[name].get('format', lambda _: _)(self._cmd(cmd))
+        return self._command_set[name].get('format', lambda _: _)(self._cmdl(shlex.split(cmd)))
 
     _sysfs_get = {}
     _sysfs_set = {}
@@ -175,13 +174,13 @@ class Control(Section):
         if convert:
             value = convert(value)
 
-        commited = self._write_sysfs(
+        committed = self._write_sysfs(
             self._sysfs_set[name]['location'].format(**config), value)
-        if not commited:
+        if not committed:
             errmsg = self._sysfs_set.get('errormsg', '')
             if errmsg:
                 raise TypeError(errmsg.format(**config))
-        return commited
+        return committed
 
     def get_interface(self, name):
         if name in self._sysfs_get:

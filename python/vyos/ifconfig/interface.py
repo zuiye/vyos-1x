@@ -16,7 +16,6 @@
 import os
 import re
 import json
-import jmespath
 
 from copy import deepcopy
 from glob import glob
@@ -26,17 +25,11 @@ from ipaddress import IPv6Interface
 from netifaces import ifaddresses # pylint: disable = no-name-in-module
 from socket import AF_INET
 from socket import AF_INET6
-from netaddr import EUI
-from netaddr import mac_unix_expanded
 
 from vyos.configdict import list_diff
 from vyos.configdict import dict_merge
 from vyos.configdict import get_vlan_ids
 from vyos.defaults import directories
-from vyos.pki import find_chain
-from vyos.pki import encode_certificate
-from vyos.pki import load_certificate
-from vyos.pki import wrap_private_key
 from vyos.template import is_ipv4
 from vyos.template import is_ipv6
 from vyos.template import render
@@ -50,6 +43,7 @@ from vyos.utils.network import is_netns_interface
 from vyos.utils.process import is_systemd_service_active
 from vyos.utils.process import stop_systemd_unit
 from vyos.utils.process import run
+from vyos.utils.process import cmdl
 from vyos.utils.file import read_file
 from vyos.utils.file import write_file
 from vyos.utils.network import is_intf_addr_assigned
@@ -66,6 +60,18 @@ from vyos.ifconfig.operational import Operational
 from vyos.ifconfig import Section
 
 link_local_prefix = 'fe80::/64'
+
+def _jmes_search(expression, data):
+    """jmespath.search with a deferred import.
+
+    The lookups below live in lambdas evaluated at call time, so importing
+    jmespath at module scope would put it on the vyos.ifconfig import path for
+    no reason.
+    """
+    import jmespath
+
+    return jmespath.search(expression, data)
+
 
 class Interface(Control):
     # This is the class which will be used to create
@@ -91,39 +97,39 @@ class Interface(Control):
     _command_get = {
         'admin_state': {
             'shellcmd': 'ip -json link show dev {ifname}',
-            'format': lambda j: 'up' if 'UP' in jmespath.search('[*].flags | [0]', json.loads(j)) else 'down',
+            'format': lambda j: 'up' if 'UP' in _jmes_search('[*].flags | [0]', json.loads(j)) else 'down',
         },
         'alias': {
             'shellcmd': 'ip -json -detail link list dev {ifname}',
-            'format': lambda j: jmespath.search('[*].ifalias | [0]', json.loads(j)) or '',
+            'format': lambda j: _jmes_search('[*].ifalias | [0]', json.loads(j)) or '',
         },
         'ifindex': {
             'shellcmd': 'ip -json -detail link list dev {ifname}',
-            'format': lambda j: jmespath.search('[*].ifindex | [0]', json.loads(j)) or '',
+            'format': lambda j: _jmes_search('[*].ifindex | [0]', json.loads(j)) or '',
         },
         'mac': {
             'shellcmd': 'ip -json -detail link list dev {ifname}',
-            'format': lambda j: jmespath.search('[*].address | [0]', json.loads(j)),
+            'format': lambda j: _jmes_search('[*].address | [0]', json.loads(j)),
         },
         'min_mtu': {
             'shellcmd': 'ip -json -detail link list dev {ifname}',
-            'format': lambda j: jmespath.search('[*].min_mtu | [0]', json.loads(j)),
+            'format': lambda j: _jmes_search('[*].min_mtu | [0]', json.loads(j)),
         },
         'max_mtu': {
             'shellcmd': 'ip -json -detail link list dev {ifname}',
-            'format': lambda j: jmespath.search('[*].max_mtu | [0]', json.loads(j)),
+            'format': lambda j: _jmes_search('[*].max_mtu | [0]', json.loads(j)),
         },
         'mtu': {
             'shellcmd': 'ip -json -detail link list dev {ifname}',
-            'format': lambda j: jmespath.search('[*].mtu | [0]', json.loads(j)),
+            'format': lambda j: _jmes_search('[*].mtu | [0]', json.loads(j)),
         },
         'oper_state': {
             'shellcmd': 'ip -json -detail link list dev {ifname}',
-            'format': lambda j: jmespath.search('[*].operstate | [0]', json.loads(j)),
+            'format': lambda j: _jmes_search('[*].operstate | [0]', json.loads(j)),
         },
         'vrf': {
             'shellcmd': 'ip -json -detail link list dev {ifname}',
-            'format': lambda j: jmespath.search('[?linkinfo.info_slave_kind == `vrf`].master | [0]', json.loads(j)),
+            'format': lambda j: _jmes_search('[?linkinfo.info_slave_kind == `vrf`].master | [0]', json.loads(j)),
         },
     }
 
@@ -355,7 +361,7 @@ class Interface(Control):
             # In case a subclass does not define it, we use get to set the default to True
             if self.config.get('create', True):
                 self._create()
-            # If we can not connect to the interface then let the caller know
+            # If we cannot connect to the interface then let the caller know
             # as the class could not be correctly initialised
             else:
                 raise Exception(f'interface "{ifname}" not found!')
@@ -372,10 +378,9 @@ class Interface(Control):
         if self.exists(f'{self.ifname}', netns=netns):
             return
 
-        cmd = f'ip link add dev {self.ifname}'
-        if type: cmd += f' type {type}'
-        if 'netns' in self.config: cmd = f'ip netns exec {netns} {cmd}'
-        self._cmd(cmd)
+        cmd = ['ip', 'link', 'add', 'dev', self.ifname]
+        if type: cmd += ['type', type]
+        self._cmdl(cmd)
 
     def remove(self, skip_delete=False):
         """
@@ -388,13 +393,27 @@ class Interface(Control):
         >>> i = Interface('eth0')
         >>> i.remove()
         """
+        # T7813: VLAN sub-interfaces must be de-configured before this interface
+        # is torn down, otherwise a running DHCP client can neither talk to the
+        # server nor return its lease. Deleting an interface implicitly deletes
+        # all its VLAN children in the Kernel, thus start with the deepest
+        # interface (vif-c) and work the way up to the vif interfaces.
+        for vlan in sorted(
+            Section.sub_interfaces(self.ifname), key=lambda x: x.count('.'), reverse=True
+        ):
+            # A previous iteration may have already removed this interface as a
+            # side effect - do not re-create it when instantiating Interface()
+            if not Interface.exists(vlan):
+                continue
+            Interface(vlan).remove()
+
         # Stop WPA supplicant if EAPoL was in use
         netns = self.config['netns'] if 'netns' in self.config else None
         stop_systemd_unit(f'wpa_supplicant-wired@{self.ifname}', netns=netns)
 
         # remove all assigned IP addresses from interface - this is a bit redundant
         # as the kernel will remove all addresses on interface deletion, but we
-        # can not delete ALL interfaces, see below.
+        # cannot delete ALL interfaces, see below.
         #
         # This will internally stop DHCP(v6) if running
         self.flush_addrs()
@@ -422,25 +441,28 @@ class Interface(Control):
         # NOTE (Improvement):
         # after interface removal no other commands should be allowed
         # to be called and instead should raise an Exception:
-        cmd = 'ip link del dev {ifname}'.format(**self.config)
+        cmd = ['ip', 'link', 'del', 'dev', self.ifname]
         # for delete we can't get data from self.config{'netns'}
         netns = get_interface_namespace(self.ifname)
-        if netns: cmd = f'ip netns exec {netns} {cmd}'
-        return self._cmd(cmd)
+        if netns: cmd = ['ip', 'netns', 'exec', netns] + cmd
+        return self._cmdl(cmd)
 
     def _nft_check_and_run(self, nft_command):
+        # nft_command: list[str]
         # Check if deleting is possible first to avoid raising errors
-        _, err = self._popen(f'nft --check {nft_command} 2>/dev/null')
+        _, err = self._popen(f'nft --check {" ".join(nft_command)} 2>/dev/null')
         if not err:
             # Remove map element
-            self._cmd(f'nft {nft_command}')
+            self._cmdl(['nft'] + nft_command)
 
     def _del_interface_from_ct_iface_map(self):
-        nft_command = f'delete element inet vrf_zones ct_iface_map {{ \'"{self.ifname}"\' }}'
+        nft_command = ['delete', 'element', 'inet', 'vrf_zones', 'ct_iface_map',
+                        '{', f'"{self.ifname}"', '}']
         self._nft_check_and_run(nft_command)
 
     def _add_interface_to_ct_iface_map(self, vrf_table_id: int):
-        nft_command = f'add element inet vrf_zones ct_iface_map {{ \'"{self.ifname}"\' : {vrf_table_id} }}'
+        nft_command = ['add', 'element', 'inet', 'vrf_zones', 'ct_iface_map',
+                        '{', f'"{self.ifname}"', ':', str(vrf_table_id), '}']
         self._nft_check_and_run(nft_command)
 
     def get_ifindex(self):
@@ -530,7 +552,11 @@ class Interface(Control):
         from hashlib import sha256
 
         # Get processor ID number
-        cpu_id = self._cmd('sudo dmidecode -t 4 | grep ID | head -n1 | sed "s/.*ID://;s/ //g"')
+        cpu_id = ''
+        for line in self._cmdl(['sudo', 'dmidecode', '-t', '4']).splitlines():
+            if 'ID' in line:
+                cpu_id = re.sub(r'.*ID:', '', line).replace(' ', '')
+                break
 
         # XXX: T3894 - it seems not all systems have eth0 - get a list of all
         # available Ethernet interfaces on the system (without VLAN subinterfaces)
@@ -545,6 +571,11 @@ class Interface(Control):
         sha.update(cpu_id.encode())
         sha.update(first_mac.encode())
         sha.update(self.ifname.encode())
+        # Imported here rather than at module scope: netaddr is only needed
+        # by this one method.
+        from netaddr import EUI
+        from netaddr import mac_unix_expanded
+
         # take the most significant 48 bits from the SHA256 string
         tmp = sha.hexdigest()[:12]
         # Convert pseudo random string into EUI format which now represents a
@@ -590,7 +621,7 @@ class Interface(Control):
 
         # Check if interface exists in network namespace
         if is_netns_interface(self.ifname, netns):
-            self._cmd(f'ip netns exec {netns} ip link del dev {self.ifname}')
+            cmdl(['ip', 'link', 'del', 'dev', self.ifname], self.debug, netns=netns)
             return True
         return False
 
@@ -602,7 +633,7 @@ class Interface(Control):
         >>> from vyos.ifconfig import Interface
         >>> Interface('dum0').set_netns('foo')
         """
-        self._cmd(f'ip link set dev {self.ifname} netns {netns}')
+        self._cmdl(['ip', 'link', 'set', 'dev', self.ifname, 'netns', netns])
         return True
 
     def get_vrf(self):
@@ -698,13 +729,13 @@ class Interface(Control):
         return self.set_interface('ipv6_cache_tmo', tmo)
 
     def _cleanup_mss_rules(self, table, ifname):
-        commands = []
-        results = self._cmd(f'nft -a list chain {table} VYOS_TCP_MSS').split("\n")
+        # table: list[str], e.g. ['raw'] or ['ip6', 'raw']
+        results = self._cmdl(['nft', '-a', 'list', 'chain'] + table + ['VYOS_TCP_MSS']).split("\n")
         for line in results:
             if f'oifname "{ifname}"' in line:
                 handle_search = re.search('handle (\d+)', line)
                 if handle_search:
-                    self._cmd(f'nft delete rule {table} VYOS_TCP_MSS handle {handle_search[1]}')
+                    self._cmdl(['nft', 'delete', 'rule'] + table + ['VYOS_TCP_MSS', 'handle', handle_search[1]])
 
     def set_tcp_ipv4_mss(self, mss):
         """
@@ -721,14 +752,15 @@ class Interface(Control):
         if 'netns' in self.config:
             return None
 
-        self._cleanup_mss_rules('raw', self.ifname)
-        nft_prefix = 'nft add rule raw VYOS_TCP_MSS'
-        base_cmd = f'oifname "{self.ifname}" tcp flags & (syn|rst) == syn'
+        self._cleanup_mss_rules(['raw'], self.ifname)
+        nft_prefix = ['nft', 'add', 'rule', 'raw', 'VYOS_TCP_MSS']
+        base_cmd = ['oifname', f'"{self.ifname}"', 'tcp', 'flags', '&', '(syn|rst)', '==', 'syn']
         if mss == 'clamp-mss-to-pmtu':
-            self._cmd(f"{nft_prefix} '{base_cmd} tcp option maxseg size set rt mtu'")
+            self._cmdl(nft_prefix + base_cmd + ['tcp', 'option', 'maxseg', 'size', 'set', 'rt', 'mtu'])
         elif int(mss) > 0:
             low_mss = str(int(mss) + 1)
-            self._cmd(f"{nft_prefix} '{base_cmd} tcp option maxseg size {low_mss}-65535 tcp option maxseg size set {mss}'")
+            self._cmdl(nft_prefix + base_cmd + ['tcp', 'option', 'maxseg', 'size',
+                       f'{low_mss}-65535', 'tcp', 'option', 'maxseg', 'size', 'set', str(mss)])
 
     def set_tcp_ipv6_mss(self, mss):
         """
@@ -745,14 +777,15 @@ class Interface(Control):
         if 'netns' in self.config:
             return None
 
-        self._cleanup_mss_rules('ip6 raw', self.ifname)
-        nft_prefix = 'nft add rule ip6 raw VYOS_TCP_MSS'
-        base_cmd = f'oifname "{self.ifname}" tcp flags & (syn|rst) == syn'
+        self._cleanup_mss_rules(['ip6', 'raw'], self.ifname)
+        nft_prefix = ['nft', 'add', 'rule', 'ip6', 'raw', 'VYOS_TCP_MSS']
+        base_cmd = ['oifname', f'"{self.ifname}"', 'tcp', 'flags', '&', '(syn|rst)', '==', 'syn']
         if mss == 'clamp-mss-to-pmtu':
-            self._cmd(f"{nft_prefix} '{base_cmd} tcp option maxseg size set rt mtu'")
+            self._cmdl(nft_prefix + base_cmd + ['tcp', 'option', 'maxseg', 'size', 'set', 'rt', 'mtu'])
         elif int(mss) > 0:
             low_mss = str(int(mss) + 1)
-            self._cmd(f"{nft_prefix} '{base_cmd} tcp option maxseg size {low_mss}-65535 tcp option maxseg size set {mss}'")
+            self._cmdl(nft_prefix + base_cmd + ['tcp', 'option', 'maxseg', 'size',
+                       f'{low_mss}-65535', 'tcp', 'option', 'maxseg', 'size', 'set', str(mss)])
 
     def set_arp_filter(self, arp_filter):
         """
@@ -850,12 +883,12 @@ class Interface(Control):
         return self.set_interface('ipv4_directed_broadcast', forwarding)
 
     def _cleanup_ipv4_source_validation_rules(self, ifname):
-        results = self._cmd(f'nft -a list chain ip raw vyos_rpfilter').split("\n")
+        results = self._cmdl(['nft', '-a', 'list', 'chain', 'ip', 'raw', 'vyos_rpfilter']).split("\n")
         for line in results:
             if f'iifname "{ifname}"' in line:
                 handle_search = re.search('handle (\d+)', line)
                 if handle_search:
-                    self._cmd(f'nft delete rule ip raw vyos_rpfilter handle {handle_search[1]}')
+                    self._cmdl(['nft', 'delete', 'rule', 'ip', 'raw', 'vyos_rpfilter', 'handle', handle_search[1]])
 
     def set_ipv4_source_validation(self, mode):
         """
@@ -870,21 +903,22 @@ class Interface(Control):
             return None
 
         self._cleanup_ipv4_source_validation_rules(self.ifname)
-        nft_prefix = f'nft insert rule ip raw vyos_rpfilter iifname "{self.ifname}"'
+        nft_prefix = ['nft', 'insert', 'rule', 'ip', 'raw', 'vyos_rpfilter',
+                      'iifname', f'"{self.ifname}"']
         if mode in ['strict', 'loose']:
-            self._cmd(f"{nft_prefix} counter return")
+            self._cmdl(nft_prefix + ['counter', 'return'])
         if mode == 'strict':
-            self._cmd(f"{nft_prefix} fib saddr . iif oif 0 counter drop")
+            self._cmdl(nft_prefix + ['fib', 'saddr', '.', 'iif', 'oif', '0', 'counter', 'drop'])
         elif mode == 'loose':
-            self._cmd(f"{nft_prefix} fib saddr oif 0 counter drop")
+            self._cmdl(nft_prefix + ['fib', 'saddr', 'oif', '0', 'counter', 'drop'])
 
     def _cleanup_ipv6_source_validation_rules(self, ifname):
-        results = self._cmd(f'nft -a list chain ip6 raw vyos_rpfilter').split("\n")
+        results = self._cmdl(['nft', '-a', 'list', 'chain', 'ip6', 'raw', 'vyos_rpfilter']).split("\n")
         for line in results:
             if f'iifname "{ifname}"' in line:
                 handle_search = re.search('handle (\d+)', line)
                 if handle_search:
-                    self._cmd(f'nft delete rule ip6 raw vyos_rpfilter handle {handle_search[1]}')
+                    self._cmdl(['nft', 'delete', 'rule', 'ip6', 'raw', 'vyos_rpfilter', 'handle', handle_search[1]])
 
     def set_ipv6_source_validation(self, mode):
         """
@@ -899,13 +933,14 @@ class Interface(Control):
             return None
 
         self._cleanup_ipv6_source_validation_rules(self.ifname)
-        nft_prefix = f'nft insert rule ip6 raw vyos_rpfilter iifname "{self.ifname}"'
+        nft_prefix = ['nft', 'insert', 'rule', 'ip6', 'raw', 'vyos_rpfilter',
+                      'iifname', f'"{self.ifname}"']
         if mode in ['strict', 'loose']:
-            self._cmd(f"{nft_prefix} counter return")
+            self._cmdl(nft_prefix + ['counter', 'return'])
         if mode == 'strict':
-            self._cmd(f"{nft_prefix} fib saddr . iif oif 0 counter drop")
+            self._cmdl(nft_prefix + ['fib', 'saddr', '.', 'iif', 'oif', '0', 'counter', 'drop'])
         elif mode == 'loose':
-            self._cmd(f"{nft_prefix} fib saddr oif 0 counter drop")
+            self._cmdl(nft_prefix + ['fib', 'saddr', 'oif', '0', 'counter', 'drop'])
 
     def set_ipv6_accept_ra(self, accept_ra):
         """
@@ -969,15 +1004,13 @@ class Interface(Control):
         """
         Set the interface identifier for IPv6 autoconf.
         """
-        cmd = f'ip token set {identifier} dev {self.ifname}'
-        self._cmd(cmd)
+        self._cmdl(['ip', 'token', 'set', identifier, 'dev', self.ifname])
 
     def del_ipv6_interface_identifier(self):
         """
         Delete the interface identifier for IPv6 autoconf.
         """
-        cmd = f'ip token delete dev {self.ifname}'
-        self._cmd(cmd)
+        self._cmdl(['ip', 'token', 'delete', 'dev', self.ifname])
 
     def set_ipv6_forwarding(self, forwarding):
         """
@@ -1310,11 +1343,10 @@ class Interface(Control):
         elif addr == 'dhcpv6':
             self.set_dhcpv6(True, vrf_changed=vrf_changed)
         elif not is_intf_addr_assigned(self.ifname, addr, netns=netns):
-            netns_cmd  = f'ip netns exec {netns}' if netns else ''
-            tmp = f'{netns_cmd} ip addr add {addr} dev {self.ifname}'
+            tmp = ['ip', 'addr', 'add', addr, 'dev', self.ifname]
             # Add broadcast address for IPv4
-            if is_ipv4(addr): tmp += ' brd +'
-            self._cmd(tmp)
+            if is_ipv4(addr): tmp += ['brd', '+']
+            self._cmdl(tmp)
         else:
             return False
 
@@ -1359,8 +1391,7 @@ class Interface(Control):
         elif addr == 'dhcpv6':
             self.set_dhcpv6(False)
         elif is_intf_addr_assigned(self.ifname, addr, netns=netns):
-            netns_cmd  = f'ip netns exec {netns}' if netns else ''
-            self._cmd(f'{netns_cmd} ip addr del {addr} dev {self.ifname}')
+            self._cmdl(['ip', 'addr', 'del', addr, 'dev', self.ifname])
         else:
             return False
 
@@ -1384,10 +1415,8 @@ class Interface(Control):
             return
 
         netns = get_interface_namespace(self.ifname)
-        netns_cmd = f'ip netns exec {netns}' if netns else ''
-        cmd = f'{netns_cmd} ip addr flush dev {self.ifname}'
         # flush all addresses
-        self._cmd(cmd)
+        cmdl(['ip', 'addr', 'flush', 'dev', self.ifname], self.debug, netns=netns)
 
     def flush_ipv6_slaac_addrs(self) -> list:
         """
@@ -1398,7 +1427,6 @@ class Interface(Control):
         Will return a list of flushed IPv6 addresses.
         """
         netns = get_interface_namespace(self.ifname)
-        netns_cmd = f'ip netns exec {netns}' if netns else ''
         tmp = get_interface_address(self.ifname)
         if not tmp or 'addr_info' not in tmp:
             return
@@ -1417,8 +1445,7 @@ class Interface(Control):
                 # Flush IPv6 addresses installed by router advertisement
                 ra_addr = f"{addr_info['local']}/{addr_info['prefixlen']}"
                 flushed.append(ra_addr)
-                cmd = f'{netns_cmd} ip -6 addr del dev {self.ifname} {ra_addr}'
-                self._cmd(cmd)
+                cmdl(['ip', '-6', 'addr', 'del', 'dev', self.ifname, ra_addr], self.debug, netns=netns)
         return flushed
 
     def flush_ipv6_slaac_routes(self, ra_addrs: list=[]) -> None:
@@ -1434,9 +1461,8 @@ class Interface(Control):
             connected.append(str(IPv6Interface(addr).network))
 
         netns = get_interface_namespace(self.ifname)
-        netns_cmd = f'ip netns exec {netns}' if netns else ''
 
-        tmp = self._cmd(f'{netns_cmd} ip -j -6 route show dev {self.ifname}')
+        tmp = cmdl(['ip', '-j', '-6', 'route', 'show', 'dev', self.ifname], self.debug, netns=netns)
         tmp = json.loads(tmp)
         # Parse interface routes. Example data:
         # {'dst': 'default', 'gateway': 'fe80::250:56ff:feb3:cdba',
@@ -1446,11 +1472,11 @@ class Interface(Control):
             # If it's a default route received from RA, delete it
             if (dict_search('dst', route) == 'default' and
                 dict_search('protocol', route) == 'ra'):
-                self._cmd(f'{netns_cmd} ip -6 route del default via {route["gateway"]} dev {self.ifname}')
+                cmdl(['ip', '-6', 'route', 'del', 'default', 'via', route['gateway'], 'dev', self.ifname], self.debug, netns=netns)
             # Remove connected prefixes received from RA
             if dict_search('dst', route) in connected:
                 # If it's a connected prefix, delete it
-                self._cmd(f'{netns_cmd} ip -6 route del {route["dst"]} dev {self.ifname}')
+                cmdl(['ip', '-6', 'route', 'del', route['dst'], 'dev', self.ifname], self.debug, netns=netns)
 
         return None
 
@@ -1502,16 +1528,13 @@ class Interface(Control):
 
                 # Remove redundant VLANs from the system
                 for vlan in list_diff(cur_vlan_ids, add_vlan):
-                    cmd = f'bridge vlan del dev {self.ifname} vid {vlan} master'
-                    self._cmd(cmd)
+                    self._cmdl(['bridge', 'vlan', 'del', 'dev', self.ifname, 'vid', str(vlan), 'master'])
 
                 for vlan in allowed_vlan_ids:
-                    cmd = f'bridge vlan add dev {self.ifname} vid {vlan} master'
-                    self._cmd(cmd)
+                    self._cmdl(['bridge', 'vlan', 'add', 'dev', self.ifname, 'vid', str(vlan), 'master'])
                 # Setting native VLAN to system
                 if native_vlan_id:
-                    cmd = f'bridge vlan add dev {self.ifname} vid {native_vlan_id} pvid untagged master'
-                    self._cmd(cmd)
+                    self._cmdl(['bridge', 'vlan', 'add', 'dev', self.ifname, 'vid', str(native_vlan_id), 'pvid', 'untagged', 'master'])
 
     def set_dhcp(self, enable: bool, vrf_changed: bool=False):
         """
@@ -1547,7 +1570,7 @@ class Interface(Control):
             render(dhclient_config_file, 'dhcp-client/ipv4.j2', self.config)
 
             # Reload systemd unit definitions as some options are dynamically generated
-            self._cmd('systemctl daemon-reload')
+            self._cmdl(['systemctl', 'daemon-reload'])
 
             netns = self.config['netns'] if 'netns' in self.config else None
             # When the DHCP client is restarted a brief outage will occur, as
@@ -1557,7 +1580,7 @@ class Interface(Control):
             if (vrf_changed or
                 ('dhcp_options_changed' in self.config) or
                 (not is_systemd_service_active(systemd_service, netns=netns))):
-                return self._cmd(f'systemctl restart {systemd_service}')
+                return self._cmdl(['systemctl', 'restart', systemd_service])
         else:
             netns = self.config['netns'] if 'netns' in self.config else None
             stop_systemd_unit(systemd_service, netns=netns)
@@ -1592,7 +1615,7 @@ class Interface(Control):
 
         config_base = directories['dhcp6_client_dir']
         config_file = f'{config_base}/dhcp6c.{self.ifname}.conf'
-        script_file = f'/etc/wide-dhcpv6/dhcp6c.{self.ifname}.script' # can not live under /run b/c of noexec mount option
+        script_file = f'/etc/wide-dhcpv6/dhcp6c.{self.ifname}.script' # cannot live under /run b/c of noexec mount option
         systemd_override_file = f'/run/systemd/system/dhcp6c@{self.ifname}.service.d/10-override.conf'
         systemd_service = f'dhcp6c@{self.ifname}.service'
 
@@ -1607,7 +1630,7 @@ class Interface(Control):
             render(script_file, 'dhcp-client/dhcp6c-script.j2', config, permission=0o755)
 
             # Reload systemd unit definitions as some options are dynamically generated
-            self._cmd('systemctl daemon-reload')
+            self._cmdl(['systemctl', 'daemon-reload'])
 
             netns = self.config['netns'] if 'netns' in self.config else None
             # We must ignore any return codes. This is required to enable
@@ -1710,13 +1733,22 @@ class Interface(Control):
 
     def set_eapol(self) -> None:
         """ Take care about EAPoL supplicant daemon """
-
         # XXX: wpa_supplicant works on the source interface
         cfg_dir = '/run/wpa_supplicant'
         wpa_supplicant_conf = f'{cfg_dir}/{self.ifname}.conf'
         eapol_action='stop'
 
         if 'eapol' in self.config:
+            # Imported here rather than at module scope: vyos.pki imports the
+            # whole cryptography stack, which every consumer of vyos.ifconfig
+            # would otherwise pay for on import. set_eapol() itself runs on
+            # every ethernet/bond update, so keep it inside this guard too.
+            # vyos/config.py and vyos/configverify.py defer vyos.pki the same way.
+            from vyos.pki import find_chain
+            from vyos.pki import encode_certificate
+            from vyos.pki import load_certificate
+            from vyos.pki import wrap_private_key
+
             # The default is a fallback to hw_id which is not present for any interface
             # other then an ethernet interface. Thus we emulate hw_id by reading back the
             # Kernel assigned MAC address
@@ -1756,7 +1788,7 @@ class Interface(Control):
             eapol_action='reload-or-restart'
 
         # start/stop WPA supplicant service
-        self._cmd(f'systemctl {eapol_action} wpa_supplicant-wired@{self.ifname}')
+        self._cmdl(['systemctl', eapol_action, f'wpa_supplicant-wired@{self.ifname}'])
 
         if 'eapol' not in self.config:
             # delete configuration on interface removal
@@ -2131,15 +2163,18 @@ class VLANIf(Interface):
         if 'vlan_id' not in self.config:
             self.config['vlan_id'] = self.ifname.split('.')[-1]
 
-        cmd = 'ip link add link {source_interface} name {ifname} type vlan id {vlan_id}'
+        cmd = ['ip', 'link', 'add', 'link', self.config['source_interface'],
+               'name', self.ifname, 'type', 'vlan', 'id', str(self.config['vlan_id'])]
         if 'protocol' in self.config:
-            cmd += ' protocol {protocol}'
+            cmd += ['protocol', self.config['protocol']]
         if 'ingress_qos' in self.config:
-            cmd += ' ingress-qos-map {ingress_qos}'
+            # ingress_qos is a space-separated list of "from:to" mappings -
+            # each one is its own argument to iproute2
+            cmd += ['ingress-qos-map'] + self.config['ingress_qos'].split()
         if 'egress_qos' in self.config:
-            cmd += ' egress-qos-map {egress_qos}'
+            cmd += ['egress-qos-map'] + self.config['egress_qos'].split()
 
-        self._cmd(cmd.format(**self.config))
+        self._cmdl(cmd)
 
         # interface is always A/D down. It needs to be enabled explicitly
         self.set_admin_state('down')
@@ -2159,7 +2194,7 @@ class VLANIf(Interface):
         lower_interface = glob(f'/sys/class/net/{self.ifname}/lower*/flags')[0]
         with open(lower_interface, 'r') as f:
             flags = f.read()
-        # If parent is not up - bail out as we can not bring up the VLAN.
+        # If parent is not up - bail out as we cannot bring up the VLAN.
         # Flags are defined in kernel source include/uapi/linux/if.h
         if not int(flags, 16) & 1:
             return None

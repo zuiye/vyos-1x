@@ -24,7 +24,10 @@ from vyos.configdep import set_dependents
 from vyos.configdep import call_dependents
 from vyos.configdict import get_interface_dict
 from vyos.configdict import is_node_changed
+from vyos.configdict import is_vrf_changed
+from vyos.configdict import node_changed
 from vyos.configdict import get_flowtable_interfaces
+from vyos.configdiff import Diff
 from vyos.configverify import verify_address
 from vyos.configverify import verify_dhcpv6
 from vyos.configverify import verify_interface_exists
@@ -45,8 +48,11 @@ from vyos.utils.dict import dict_search
 from vyos.utils.dict import dict_to_paths_values
 from vyos.utils.dict import dict_set
 from vyos.utils.dict import dict_delete
+from vyos.utils.network import get_vrf_tableid
 from vyos.utils.process import is_systemd_service_running
+from vyos.vpp.config_deps import deps_bond_dict
 from vyos.vpp.config_verify import verify_vpp_remove_interface
+from vyos.vpp.config_verify import verify_vpp_mac_change_supported
 from vyos.vpp.control_vpp import VPPControl
 from vyos import ConfigError
 from vyos import airbag
@@ -159,7 +165,7 @@ def get_config(config=None):
             max_mtu = EthernetIf(ifname).get_max_mtu()
             if max_mtu < int(ethernet['mtu']):
                 ethernet['mtu'] = str(max_mtu)
-        except:
+        except Exception:
             pass
 
     if 'is_bond_member' in ethernet:
@@ -173,6 +179,31 @@ def get_config(config=None):
 
     tmp = is_node_changed(conf, base + [ifname, 'evpn'])
     if tmp: ethernet.update({'frr_dict' : get_frrender_dict(conf)})
+
+    # T9228: Some NIC drivers do not support changing all settings we offer on
+    # the CLI. The warning telling the user about the missing driver support is
+    # emitted while applying the configuration - which happens on every commit
+    # touching this interface. Record which nodes have been changed so the
+    # warning is only displayed if the node in question was altered, and not on
+    # any unrelated change like an interface description or IP address.
+    tmp = node_changed(
+        conf,
+        base + [ifname, 'offload'],
+        key_mangling=('-', '_'),
+        expand_nodes=Diff.ADD | Diff.DELETE,
+    )
+    if tmp:
+        ethernet.update({'offload_changed': tmp})
+
+    for node, key in {
+        'disable-flow-control': 'flow_control_changed',
+        'ring-buffer': 'ring_buffer_changed',
+        'interrupt-coalescing': 'coalesce_changed',
+        'switchdev': 'switchdev_changed',
+    }.items():
+        tmp = is_node_changed(conf, base + [ifname, node])
+        if tmp:
+            ethernet.update({key: {}})
 
     ethernet['flowtable_interfaces'] = get_flowtable_interfaces(conf)
 
@@ -190,10 +221,15 @@ def get_config(config=None):
             get_first_key=True,
             no_tag_node_value_mangle=True,
         )
+        ethernet['vpp_bond_members'] = deps_bond_dict(conf)
 
     # Protocols static arp dependency
     if 'static_arp' in ethernet:
         set_dependents('static_arp', conf)
+
+    # Check vrf membership, to ensure firewall is updated
+    if is_vrf_changed(conf, ifname):
+        set_dependents('firewall', conf)
 
     return ethernet
 
@@ -394,6 +430,11 @@ def verify(ethernet):
     verify_ring_buffer(ethernet, ethtool)
     verify_offload(ethernet, ethtool)
     verify_mac_change(ethernet, ethtool)
+    if (
+        'mac' in ethernet
+        and dict_search(f'vpp.settings.interface.{ifname}', ethernet) is not None
+    ):
+        verify_vpp_mac_change_supported(ifname)
     verify_coalesce(ethernet, ethtool)
 
     if 'is_bond_member' in ethernet:
@@ -441,27 +482,40 @@ def apply(ethernet):
         e.remove()
     else:
         e.update(ethernet)
-    if 'static_arp' in ethernet:
-        call_dependents()
+
+    # run the dependents
+    call_dependents()
 
     vpp_iface_config = dict_search(f'vpp.settings.interface.{ifname}', ethernet)
     if vpp_iface_config is not None and is_systemd_service_running('vpp.service'):
         vpp_api = VPPControl()
 
-        # Enable ip4-dhcp-client-detect feature for DHCP-configured interfaces.
-        # This feature is required for VPP to process DHCP packets and assign addresses.
-        if 'dhcp' in ethernet.get('address', []):
-            vpp_api.enable_dhcp_client(ifname)
-        else:
-            vpp_api.disable_dhcp_client(ifname)
+        # Enable ip4-dhcp-client-detect/ip6-icmp-ra-punt features for
+        # DHCP/DHCPv6/autoconf-configured interfaces. These features are
+        # required for VPP to process DHCP(v6) packets and assign addresses.
+        # Applies to the interface itself and its VLAN sub-interfaces
+        # (vif, vif_s).vif-c (Q-in-Q) is intentionally excluded, as it is
+        # not currently functional under VPP.
+        dhcp_targets = [(ifname, ethernet)]
+        dhcp_targets += [
+            (vif['ifname'], vif) for vif in ethernet.get('vif', {}).values()
+        ]
+        dhcp_targets += [
+            (vif_s['ifname'], vif_s) for vif_s in ethernet.get('vif_s', {}).values()
+        ]
 
-        # Enable ip6-icmp-ra-punt feature for DHCPv6-configured interfaces.
-        if 'dhcpv6' in ethernet.get('address', []) or (
-            'autoconf' in ethernet.get('ipv6', {}).get('address', {})
-        ):
-            vpp_api.enable_icmpv6_ra_punt(ifname)
-        else:
-            vpp_api.disable_icmpv6_ra_punt(ifname)
+        for dhcp_ifname, dhcp_config in dhcp_targets:
+            if 'dhcp' in dhcp_config.get('address', []):
+                vpp_api.enable_dhcp_client(dhcp_ifname)
+            else:
+                vpp_api.disable_dhcp_client(dhcp_ifname)
+
+            if 'dhcpv6' in dhcp_config.get('address', []) or (
+                'autoconf' in dhcp_config.get('ipv6', {}).get('address', {})
+            ):
+                vpp_api.enable_icmpv6_ra_punt(dhcp_ifname)
+            else:
+                vpp_api.disable_icmpv6_ra_punt(dhcp_ifname)
 
         # If the interface is managed by the VPP DPDK driver, synchronize runtime
         # parameters between Linux and the corresponding VPP LCP interface
@@ -473,7 +527,44 @@ def apply(ethernet):
             mtu = e.get_mtu()
             vpp_api.set_iface_mtu(lcp_name, mtu)
 
+        sync_vpp_lcp_vrf_tables(ethernet, vpp_api)
+
+        # VPP requires promiscuous mode to pass VLAN-tagged traffic;
+        # also keep it enabled for VPP bond members
+        needs_promisc = (
+            'vif' in ethernet
+            or 'vif_s' in ethernet
+            or ifname in ethernet.get('vpp_bond_members')
+        )
+        vpp_api.set_promisc(ifname, enable=needs_promisc)
+
     return None
+
+
+def sync_vpp_lcp_vrf_tables(ethernet: dict, vpp_api: VPPControl) -> None:
+    """Synchronize VyOS VRF assignment to VPP IP FIB table binding."""
+
+    def iter_vpp_lcp_vrf_targets() -> list[tuple[str, int]]:
+        interfaces = [ethernet['ifname']]
+        for vif in ethernet.get('vif', {}).values():
+            interfaces.append(vif['ifname'])
+        for vif_s in ethernet.get('vif_s', {}).values():
+            interfaces.append(vif_s['ifname'])
+            for vif_c in vif_s.get('vif_c', {}).values():
+                interfaces.append(vif_c['ifname'])
+        return [(iface, get_vrf_tableid(iface) or 0) for iface in interfaces]
+
+    lcp_vpp_ifaces = {
+        pair.get('vpp_name_hw')
+        for pair in vpp_api.lcp_pairs_list()
+        if pair.get('vpp_name_hw')
+    }
+
+    for ifname, table_id in iter_vpp_lcp_vrf_targets():
+        if ifname not in lcp_vpp_ifaces:
+            continue
+
+        vpp_api.move_interface_to_ip_table_preserve_addresses(ifname, table_id)
 
 if __name__ == '__main__':
     try:

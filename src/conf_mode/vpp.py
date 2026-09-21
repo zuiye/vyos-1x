@@ -62,6 +62,7 @@ from vyos.vpp.config_verify import (
     verify_routes_count,
     verify_vpp_main_heap_size,
     verify_vpp_buffers,
+    verify_vpp_mac_change_supported,
 )
 from vyos.vpp.config_resource_checks import memory
 from vyos.vpp.config_filter import iface_filter_eth
@@ -96,6 +97,10 @@ override_drivers: dict[str, str] = {
 
 # drivers that does not use PCIe addresses
 not_pci_drv: list[str] = ['hv_netvsc']
+
+# drivers that are fundamentally incompatible with VPP/DPDK — no PMD exists and
+# they expose no PCI address, so allow-unsupported-nics cannot rescue them
+incompatible_drv: list[str] = ['vif']
 
 # drivers that support interrupt RX mode for DPDK and XDP
 drivers_support_interrupt: dict[str, list] = {
@@ -390,6 +395,12 @@ def get_config(config=None):
                     EthtoolGDrvinfo(iface).driver
                 )
 
+                # Record whether a custom MAC is configured, so verify() can
+                # reject it up front on drivers that cannot apply it.
+                config['settings']['interface'][iface]['mac_configured'] = conf.exists(
+                    ['interfaces', 'ethernet', iface, 'mac']
+                )
+
                 # filter unsupported config nodes
                 iface_filter_eth(conf, iface)
                 set_dependents('ethernet', conf, iface)
@@ -578,6 +589,12 @@ def verify(config):
         if iface not in ethernet_ifaces:
             raise ConfigError(f'Interface {iface} does not exist or is not Ethernet!')
 
+    # An interface added to VPP with a custom MAC its driver cannot apply would
+    # fail to come up in the dataplane - reject it here instead.
+    for iface, iface_config in config['settings']['interface'].items():
+        if iface_config.get('mac_configured'):
+            verify_vpp_mac_change_supported(iface)
+
     # Resource usage checks
     cpu_cores = int(config['settings']['resource_allocation']['cpu_cores'])
     verify_vpp_minimum_cpus()
@@ -596,6 +613,12 @@ def verify(config):
 
     # ensure DPDK/XDP settings are properly configured
     for iface, iface_config in config['settings']['interface'].items():
+        orig_driver = dict_search(f'persist_config.{iface}.original_driver', config)
+        if orig_driver and orig_driver in incompatible_drv:
+            raise ConfigError(
+                f'Interface "{iface}" driver "{orig_driver}" is not supported by VPP/DPDK.'
+            )
+
         if not _is_device_allowed(config, iface):
             raise ConfigError(
                 f'NIC used by "{iface}" is not validated for VPP on VyOS. '
@@ -645,10 +668,9 @@ def verify(config):
         if rx_mode and rx_mode != 'polling':
             # By default drivers operate in polling mode. Not all NIC drivers support
             # RX mode interrupt and adaptive
-            driver = config.get('persist_config').get(iface).get('original_driver')
             if (
-                driver not in drivers_support_interrupt
-                or iface_config['driver'] not in drivers_support_interrupt[driver]
+                orig_driver not in drivers_support_interrupt
+                or iface_config['driver'] not in drivers_support_interrupt[orig_driver]
             ):
                 raise ConfigError(
                     f'RX mode {rx_mode} is not supported for interface {iface}'
